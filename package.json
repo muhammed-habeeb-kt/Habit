@@ -45,7 +45,8 @@
     "lint": "node ./node_modules/eslint/bin/eslint.js .",
     "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
     "eas": "node ./node_modules/eas-cli/bin/run",
-    "reset-project": "node ./scripts/reset-project.js"
+    "reset-project": "node ./scripts/reset-project.js",
+    "eas-build-pre-install": "rm -f package-lock.json && npm install --package-lock-only --include=dev"
   },
   "private": true
 }
