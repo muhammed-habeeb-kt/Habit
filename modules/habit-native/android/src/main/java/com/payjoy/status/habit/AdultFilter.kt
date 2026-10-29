@@ -1,0 +1,94 @@
+package com.payjoy.status.habit
+
+import java.net.URLDecoder
+
+/**
+ * Offline matcher for adult domains and keywords.
+ *
+ * Domains match the host itself or any subdomain (m.example.com matches example.com).
+ * Keywords match whole words only, so "class" never trips "ass".
+ */
+object AdultFilter {
+  @Volatile private var domains: Set<String> = emptySet()
+  @Volatile private var keywordRegex: Regex? = null
+
+  private val hostRegex = Regex(
+    "(?i)(?<![\\p{L}\\p{N}@._-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,24})(?![\\p{L}\\p{N}-])"
+  )
+
+  @Synchronized
+  fun update(domainList: List<String>, keywordList: List<String>) {
+    val normalized = domainList.asSequence()
+      .map { normalizeDomain(it) }
+      .filter { it.isNotEmpty() }
+      .toSet()
+    domains = normalized
+    keywordRegex = buildKeywordRegex(keywordList)
+  }
+
+  fun isReady(): Boolean = domains.isNotEmpty() || keywordRegex != null
+
+  /** Returns the matched host or "kw:<keyword>", or null when the text is clean. */
+  fun match(text: String): String? {
+    if (text.isBlank()) return null
+    val haystack = if (text.contains('%')) decodeSafe(text) else text
+
+    val domainSet = domains
+    if (domainSet.isNotEmpty()) {
+      for (result in hostRegex.findAll(haystack)) {
+        val host = result.groupValues[1].lowercase().trimEnd('.')
+        if (isBlockedHost(host, domainSet)) return host
+      }
+    }
+
+    val regex = keywordRegex ?: return null
+    val found = regex.find(haystack) ?: return null
+    return "kw:" + found.value.lowercase()
+  }
+
+  private fun isBlockedHost(host: String, set: Set<String>): Boolean {
+    if (set.contains(host)) return true
+    var candidate = host
+    var dot = candidate.indexOf('.')
+    while (dot >= 0) {
+      candidate = candidate.substring(dot + 1)
+      if (set.contains(candidate)) return true
+      dot = candidate.indexOf('.')
+    }
+    return false
+  }
+
+  private fun normalizeDomain(value: String): String {
+    var domain = value.trim().lowercase()
+    for (prefix in listOf("https://", "http://", "www.")) {
+      if (domain.startsWith(prefix)) domain = domain.substring(prefix.length)
+    }
+    val cut = domain.indexOfAny(charArrayOf('/', '?', '#', ':', ' '))
+    if (cut >= 0) domain = domain.substring(0, cut)
+    return domain.trim('.')
+  }
+
+  private fun decodeSafe(text: String): String {
+    return try {
+      URLDecoder.decode(text.replace("+", "%2B"), "UTF-8")
+    } catch (error: Throwable) {
+      text
+    }
+  }
+
+  private fun buildKeywordRegex(list: List<String>): Regex? {
+    val cleaned = list.asSequence()
+      .map { it.trim().lowercase() }
+      .filter { it.isNotEmpty() }
+      .distinct()
+      .sortedByDescending { it.length }
+      .toList()
+    if (cleaned.isEmpty()) return null
+    val body = cleaned.joinToString("|") { Regex.escape(it) }
+    return try {
+      Regex("(?<![\\p{L}\\p{N}])($body)(?![\\p{L}\\p{N}])", RegexOption.IGNORE_CASE)
+    } catch (error: Throwable) {
+      null
+    }
+  }
+}

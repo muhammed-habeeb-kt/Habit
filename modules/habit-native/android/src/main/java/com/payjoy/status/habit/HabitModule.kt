@@ -1,0 +1,289 @@
+package com.payjoy.status.habit
+
+import android.Manifest
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import android.util.Log
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import expo.modules.kotlin.modules.Module
+import expo.modules.kotlin.modules.ModuleDefinition
+
+/**
+ * The only door between JS and the native guard. JS can read a snapshot of state and
+ * request actions; it can never write protection state directly.
+ */
+class HabitModule : Module() {
+  private val appCtx: Context
+    get() = requireNotNull(appContext.reactContext) { "React context is unavailable" }
+
+  override fun definition() = ModuleDefinition {
+    Name("HabitNative")
+    Events("onAttemptsChanged", "onStateChanged")
+
+    OnCreate {
+      val ctx = appContext.reactContext ?: return@OnCreate
+      try {
+        HabitStore.init(ctx)
+        HabitStore.ensureFilter(ctx)
+        HabitUnlock.tick(ctx)
+        HabitStore.onAttemptsChanged = { count ->
+          sendEvent("onAttemptsChanged", mapOf("count" to count))
+        }
+        HabitStore.onStateChanged = {
+          sendEvent("onStateChanged", emptyMap<String, Any?>())
+        }
+        val unlock = HabitStore.unlockState(ctx)
+        if (HabitStore.state(ctx).protectionEnabled || unlock.cooldown != null || unlock.offWindow != null) {
+          HabitForegroundService.start(ctx)
+        }
+      } catch (error: Throwable) {
+        Log.w(TAG, "Module init failed: ${error.message}")
+      }
+    }
+
+    OnDestroy {
+      HabitStore.onAttemptsChanged = null
+      HabitStore.onStateChanged = null
+    }
+
+    AsyncFunction("getSnapshot") {
+      HabitStore.snapshot(appCtx)
+    }
+
+    AsyncFunction("setProtectionEnabled") { enabled: Boolean ->
+      HabitUnlock.setProtectionEnabled(appCtx, enabled)
+      HabitStore.snapshot(appCtx)
+    }
+
+    AsyncFunction("setMode") { mode: String ->
+      HabitUnlock.setMode(appCtx, mode)
+      HabitStore.snapshot(appCtx)
+    }
+
+    AsyncFunction("requestUnlockTimer") {
+      HabitUnlock.requestTimerUnlock(appCtx)
+      HabitStore.snapshot(appCtx)
+    }
+
+    AsyncFunction("cancelUnlockTimer") {
+      HabitUnlock.cancelTimerUnlock(appCtx)
+      HabitStore.snapshot(appCtx)
+    }
+
+    AsyncFunction("startCharacterChallenge") { length: Int ->
+      HabitUnlock.startChallenge(appCtx, length)
+    }
+
+    AsyncFunction("submitCharacterChallenge") { challengeId: String, typed: String ->
+      HabitUnlock.submitChallenge(appCtx, challengeId, typed)
+    }
+
+    AsyncFunction("startFaceUnlock") {
+      FaceUnlock.start(appCtx)
+    }
+
+    AsyncFunction("submitFacePhoto") { uri: String ->
+      FaceUnlock.submit(appCtx, uri)
+    }
+
+    AsyncFunction("cancelFaceUnlock") {
+      FaceUnlock.cancel()
+      true
+    }
+
+    AsyncFunction("setFastCooldown") { enabled: Boolean ->
+      HabitUnlock.setFastCooldown(appCtx, enabled)
+    }
+
+    AsyncFunction("debugExitStrict") {
+      HabitUnlock.debugExitStrict(appCtx)
+      HabitStore.snapshot(appCtx)
+    }
+
+    AsyncFunction("publishLists") { domainsJson: String, keywordsJson: String ->
+      HabitStore.publishLists(appCtx, domainsJson, keywordsJson)
+    }
+
+    AsyncFunction("setOnboardingCompleted") { completed: Boolean ->
+      HabitStore.setOnboardingCompleted(appCtx, completed)
+      HabitStore.snapshot(appCtx)
+    }
+
+    AsyncFunction("isAccessibilityEnabled") {
+      HabitAccessibilityService.isEnabled(appCtx)
+    }
+
+    AsyncFunction("isDeviceAdminActive") {
+      HabitDeviceAdmin.isActive(appCtx)
+    }
+
+    AsyncFunction("activateDeviceAdmin") {
+      requestDeviceAdmin()
+    }
+
+    AsyncFunction("areNotificationsEnabled") {
+      isNotificationAllowed()
+    }
+
+    AsyncFunction("requestNotificationPermission") {
+      requestNotificationPermissionInternal()
+    }
+
+    AsyncFunction("openAccessibilitySettings") {
+      openIntent(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    }
+
+    AsyncFunction("openNotificationSettings") {
+      openNotificationSettingsInternal()
+    }
+
+    AsyncFunction("openAppDetails") {
+      openAppDetailsInternal()
+    }
+
+    AsyncFunction("openBatterySettings") {
+      openBatterySettingsInternal()
+    }
+
+    AsyncFunction("openAutostartSettings") {
+      openAutostartSettingsInternal()
+    }
+  }
+
+  private fun requestDeviceAdmin(): Boolean {
+    if (HabitDeviceAdmin.isActive(appCtx)) return true
+    val activity = appContext.currentActivity ?: return false
+    return try {
+      activity.runOnUiThread {
+        try {
+          activity.startActivity(HabitDeviceAdmin.requestIntent(activity))
+        } catch (error: Throwable) {
+          Log.w(TAG, "Device admin request failed: ${error.message}")
+        }
+      }
+      true
+    } catch (error: Throwable) {
+      Log.w(TAG, "Device admin request failed: ${error.message}")
+      false
+    }
+  }
+
+  private fun isNotificationAllowed(): Boolean {
+    return try {
+      NotificationManagerCompat.from(appCtx).areNotificationsEnabled()
+    } catch (error: Throwable) {
+      false
+    }
+  }
+
+  private fun requestNotificationPermissionInternal(): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return isNotificationAllowed()
+    val activity = appContext.currentActivity
+    if (activity == null) {
+      openNotificationSettingsInternal()
+      return false
+    }
+    val granted = ContextCompat.checkSelfPermission(
+      activity,
+      Manifest.permission.POST_NOTIFICATIONS
+    ) == PackageManager.PERMISSION_GRANTED
+    if (!granted) {
+      activity.runOnUiThread {
+        try {
+          activity.requestPermissions(
+            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+            NOTIFICATION_REQUEST_CODE
+          )
+        } catch (error: Throwable) {
+          Log.w(TAG, "Notification request failed: ${error.message}")
+        }
+      }
+    }
+    return granted
+  }
+
+  private fun openNotificationSettingsInternal(): Boolean {
+    return try {
+      val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+          .putExtra(Settings.EXTRA_APP_PACKAGE, appCtx.packageName)
+      } else {
+        appDetailsIntent()
+      }
+      openIntent(intent)
+    } catch (error: Throwable) {
+      openAppDetailsInternal()
+    }
+  }
+
+  private fun openAppDetailsInternal(): Boolean {
+    return openIntent(appDetailsIntent())
+  }
+
+  private fun appDetailsIntent(): Intent {
+    return Intent(
+      Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+      Uri.fromParts("package", appCtx.packageName, null)
+    )
+  }
+
+  private fun openBatterySettingsInternal(): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      if (isBatteryOptimizationIgnored()) return true
+      val direct = Intent(
+        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+        Uri.parse("package:${appCtx.packageName}")
+      )
+      if (openIntent(direct)) return true
+      if (openIntent(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))) return true
+    }
+    return openAppDetailsInternal()
+  }
+
+  private fun isBatteryOptimizationIgnored(): Boolean {
+    return try {
+      val manager = appCtx.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+      manager.isIgnoringBatteryOptimizations(appCtx.packageName)
+    } catch (error: Throwable) {
+      false
+    }
+  }
+
+  private fun openAutostartSettingsInternal(): Boolean {
+    if (!Build.MANUFACTURER.equals("xiaomi", ignoreCase = true)) {
+      // Non-Xiaomi devices: the app details screen is where the battery settings live.
+      if (openIntent(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))) return true
+      return openAppDetailsInternal()
+    }
+    val autostart = Intent().setComponent(
+      ComponentName(
+        "com.miui.securitycenter",
+        "com.miui.permcenter.autostart.AutoStartManagementActivity"
+      )
+    )
+    if (openIntent(autostart)) return true
+    return openAppDetailsInternal()
+  }
+
+  private fun openIntent(intent: Intent): Boolean {
+    return try {
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      appCtx.startActivity(intent)
+      true
+    } catch (error: Throwable) {
+      Log.w(TAG, "Could not open settings: ${error.message}")
+      false
+    }
+  }
+
+  companion object {
+    private const val TAG = "HabitModule"
+    private const val NOTIFICATION_REQUEST_CODE = 4211
+  }
+}
