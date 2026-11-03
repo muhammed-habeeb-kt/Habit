@@ -25,6 +25,23 @@ jobs:
           java-version: 17
           cache: gradle
 
+      # The debug build writes several GB of CMake artefacts (one tree per ABI
+      # and per native module). The runner only ships ~14 GB free, and running
+      # out of space is what made the linker abort with "Bus error" and the
+      # react-native-reanimated AAR step fail to add its .so files.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/boost \
+            /usr/local/lib/android/sdk/emulator \
+            /usr/local/lib/android/sdk/system-images \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Install dependencies
         run: npm install
 
@@ -37,7 +54,10 @@ jobs:
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          # Every native module honours this property, so only arm64-v8a is
+          # compiled instead of all four ABIs. That cuts the native build's
+          # disk and memory footprint by roughly 4x on the shared runner.
+          ./gradlew assembleDebug --no-daemon -PreactNativeArchitectures=arm64-v8a
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
