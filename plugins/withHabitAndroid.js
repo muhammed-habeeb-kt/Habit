@@ -8,7 +8,8 @@
  *  - Foreground service (specialUse) + persistent notification
  *  - Boot receiver (restart protection after reboot / app update)
  *  - DeviceAdminReceiver (declared, not activated until Aggressive mode)
- *  - Permissions: notifications, exact alarms, camera, boot, foreground, wake lock
+ *  - Permissions: notifications, exact alarms, camera, boot, foreground, wake lock,
+ *    package visibility (QUERY_ALL_PACKAGES + MAIN intent query)
  */
 const {
   AndroidConfig,
@@ -37,6 +38,9 @@ const PERMISSIONS = [
   'android.permission.WAKE_LOCK',
   'android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
   'android.permission.VIBRATE',
+  // Android 11+ package visibility: needed so the Apps screen can list every
+  // installed package (third-party and system) instead of a filtered subset.
+  'android.permission.QUERY_ALL_PACKAGES',
 ];
 
 const ACCESSIBILITY_PERMISSION = 'android.permission.BIND_ACCESSIBILITY_SERVICE';
@@ -111,6 +115,30 @@ const withHabitManifest = (config) =>
     ];
     if (!queries.some((q) => q.package)) {
       queries.push({ package: browserPackages.map((name) => ({ $: { 'android:name': name } })) });
+    }
+    // Declare the MAIN/LAUNCHER intent query so Android 11-15 (incl. Android 14 /
+    // HyperOS) exposes every app with a launcher entry, even if a store review
+    // strips QUERY_ALL_PACKAGES.
+    const hasLauncherIntent = queries.some((q) =>
+      (q.intent || []).some((intent) => {
+        const hasMain = (intent.action || []).some(
+          (action) => action.$['android:name'] === 'android.intent.action.MAIN'
+        );
+        const hasLauncher = (intent.category || []).some(
+          (category) => category.$['android:name'] === 'android.intent.category.LAUNCHER'
+        );
+        return hasMain && hasLauncher;
+      })
+    );
+    if (!hasLauncherIntent) {
+      queries.push({
+        intent: [
+          {
+            action: [{ $: { 'android:name': 'android.intent.action.MAIN' } }],
+            category: [{ $: { 'android:name': 'android.intent.category.LAUNCHER' } }],
+          },
+        ],
+      });
     }
     manifest.manifest.queries = queries;
 

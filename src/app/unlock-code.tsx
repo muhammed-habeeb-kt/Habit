@@ -1,0 +1,743 @@
+import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { router } from 'expo-router';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Modal,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
+import {
+  NeuCard,
+  NeuWell,
+  PrimaryGlowButton,
+  SecondaryRaisedButton,
+} from '@/components/neumorphic';
+import { FontNames, Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
+import {
+  startCharacterChallenge,
+  submitCharacterChallenge,
+  type CharacterChallenge,
+} from '@/native/habit';
+
+const SLAB_LENGTHS = [100, 200, 300] as const;
+type SlabLength = (typeof SLAB_LENGTHS)[number];
+
+const TOKEN_LENGTH = 10;
+
+type Mistake = {
+  wrongChar: string;
+  expectedChar: string;
+  nextChallenge: CharacterChallenge;
+};
+
+function normalize(value: string): string {
+  return value.replace(/\s+/g, '');
+}
+
+function tokenize(text: string): string[] {
+  const tokens: string[] = [];
+  for (let index = 0; index < text.length; index += TOKEN_LENGTH) {
+    tokens.push(text.slice(index, index + TOKEN_LENGTH));
+  }
+  return tokens;
+}
+
+export default function UnlockCodeScreen() {
+  const [length, setLength] = useState<SlabLength>(200);
+  const [challenge, setChallenge] = useState<CharacterChallenge | null>(null);
+  const [typed, setTyped] = useState('');
+  const [feedback, setFeedback] = useState<string | null>(null);
+  const [mistake, setMistake] = useState<Mistake | null>(null);
+  const [starting, setStarting] = useState(false);
+  const submitting = useRef(false);
+  const startingChallenge = useRef(false);
+  const bootstrapped = useRef(false);
+
+  const beginChallenge = useCallback(async (nextLength: SlabLength) => {
+    if (startingChallenge.current) return;
+    startingChallenge.current = true;
+    setStarting(true);
+    setFeedback(null);
+    try {
+      const next = await startCharacterChallenge(nextLength);
+      if (!next) {
+        setChallenge(null);
+        setFeedback('Could not start a challenge right now. Wait a moment, then try again.');
+        return;
+      }
+      setChallenge(next);
+      setTyped('');
+    } finally {
+      startingChallenge.current = false;
+      setStarting(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (bootstrapped.current) return;
+    bootstrapped.current = true;
+    void beginChallenge(200);
+  }, [beginChallenge]);
+
+  const selectLength = (nextLength: SlabLength) => {
+    if (starting) return;
+    setLength(nextLength);
+    setTyped('');
+    void beginChallenge(nextLength);
+  };
+
+  const sendAttempt = useCallback(
+    async (value: string, challengeId: string, mismatch?: { wrongChar: string; expectedChar: string }) => {
+      if (submitting.current) return;
+      submitting.current = true;
+      try {
+        const result = await submitCharacterChallenge(challengeId, value);
+        if (!result) return;
+        if (result.success) {
+          setChallenge(null);
+          setTyped('');
+          setFeedback(null);
+          setMistake(null);
+          Alert.alert('Unlocked', 'Strict mode is off and protection is paused.', [
+            { text: 'OK', onPress: () => router.dismissTo('/') },
+          ]);
+          return;
+        }
+        setTyped('');
+        if (result.text && result.challengeId) {
+          const nextChallenge: CharacterChallenge = {
+            challengeId: result.challengeId,
+            text: result.text,
+            length: result.length,
+          };
+          if (mismatch) {
+            setMistake({ ...mismatch, nextChallenge });
+          } else {
+            setChallenge(nextChallenge);
+          }
+        } else {
+          setChallenge(null);
+          setFeedback('Too many mistakes. Unlock attempts are paused for a moment.');
+        }
+      } finally {
+        submitting.current = false;
+      }
+    },
+    []
+  );
+
+  const handleChange = (value: string) => {
+    if (!challenge || mistake) return;
+    const growth = value.length - typed.length;
+    if (growth > 5) {
+      setTyped('');
+      setFeedback('Pasting is not allowed — type the string character by character.');
+      return;
+    }
+    setTyped(value);
+    const normalized = normalize(value);
+    if (normalized.length === 0) return;
+    const correctPrefix = challenge.text.startsWith(normalized);
+    if (!correctPrefix) {
+      const index = normalized.split('').findIndex((char, i) => char !== challenge.text[i]);
+      void sendAttempt(normalized, challenge.challengeId, {
+        wrongChar: normalized[index] ?? '',
+        expectedChar: challenge.text[index] ?? '',
+      });
+      return;
+    }
+    if (normalized.length >= challenge.length) {
+      void sendAttempt(normalized, challenge.challengeId);
+    }
+  };
+
+  const tryAgain = () => {
+    if (mistake) {
+      setChallenge(mistake.nextChallenge);
+    }
+    setTyped('');
+    setFeedback(null);
+    setMistake(null);
+  };
+
+  const leaveLocked = () => {
+    setMistake(null);
+    setTyped('');
+    router.dismissTo('/');
+  };
+
+  const typedLength = normalize(typed).length;
+  const targetLength = challenge?.length ?? length;
+  const percent =
+    targetLength > 0 ? Math.round((Math.min(typedLength, targetLength) / targetLength) * 100) : 0;
+  const tokens = challenge ? tokenize(challenge.text) : [];
+
+  return (
+    <View style={styles.screen}>
+      <SafeAreaView style={styles.safe} edges={['top', 'left', 'right', 'bottom']}>
+        <ScrollView
+          contentContainerStyle={styles.content}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled">
+          <View style={styles.header}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Go back"
+              onPress={() => router.back()}
+              style={({ pressed }) => [styles.backButton, pressed && styles.pressed]}>
+              <MaterialCommunityIcons name="chevron-left" size={26} color={Palette.textPrimary} />
+            </Pressable>
+            <Text style={styles.headerTitle}>Type to Unlock</Text>
+          </View>
+
+          <View style={styles.selectorTrack}>
+            {SLAB_LENGTHS.map((option) => {
+              const active = option === length;
+              return (
+                <Pressable
+                  key={option}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active }}
+                  onPress={() => selectLength(option)}
+                  style={({ pressed }) => [
+                    styles.selectorCard,
+                    active && styles.selectorCardActive,
+                    pressed && styles.pressed,
+                  ]}>
+                  <View style={styles.selectorValueRow}>
+                    <Text
+                      style={[
+                        styles.selectorValue,
+                        active && styles.selectorValueActive,
+                      ]}>
+                      {option}
+                    </Text>
+                    {active && <View style={styles.selectorDot} />}
+                  </View>
+                  <Text
+                    style={[
+                      styles.selectorCaption,
+                      active && styles.selectorCaptionActive,
+                    ]}>
+                    CHARACTERS
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          <NeuCard style={styles.challengeCard}>
+            <View style={styles.challengeHeader}>
+              <View style={styles.challengeLabelRow}>
+                <MaterialCommunityIcons
+                  name="lock-outline"
+                  size={14}
+                  color={Palette.textSecondary}
+                />
+                <Text style={styles.challengeLabel}>TARGET CHALLENGE STREAM</Text>
+              </View>
+              <View style={styles.strictBadge}>
+                <Text style={styles.strictBadgeLabel}>STRICT VERIFICATION</Text>
+              </View>
+            </View>
+
+            {challenge ? (
+              <View style={styles.tokenGrid}>
+                {tokens.map((token, index) => {
+                  const start = index * TOKEN_LENGTH;
+                  const complete = start + token.length <= typedLength;
+                  const active = !complete && start <= typedLength;
+                  return (
+                    <Text
+                      key={`${start}-${token}`}
+                      style={[
+                        styles.token,
+                        complete && styles.tokenComplete,
+                        active && styles.tokenActive,
+                      ]}>
+                      {token}
+                    </Text>
+                  );
+                })}
+              </View>
+            ) : (
+              <View style={styles.challengePlaceholder}>
+                {starting ? (
+                  <ActivityIndicator color={Palette.amber} />
+                ) : (
+                  <Text style={styles.placeholderText}>
+                    Pick a length to generate a new challenge.
+                  </Text>
+                )}
+              </View>
+            )}
+          </NeuCard>
+
+          <NeuWell padded={false} style={styles.inputWell}>
+            <TextInput
+              value={typed}
+              onChangeText={handleChange}
+              editable={challenge != null}
+              autoCapitalize="none"
+              autoCorrect={false}
+              spellCheck={false}
+              autoComplete="off"
+              textContentType="none"
+              importantForAutofill="no"
+              keyboardType="visible-password"
+              contextMenuHidden
+              selectTextOnFocus={false}
+              placeholder="Type the shown text here"
+              placeholderTextColor={Palette.textMuted}
+              style={styles.input}
+            />
+          </NeuWell>
+
+          <View style={styles.progressHeader}>
+            <Text style={styles.progressLabel}>
+              Typed {typedLength} / {targetLength}
+            </Text>
+            <Text style={styles.progressPercent}>{percent}%</Text>
+          </View>
+          <View style={styles.track}>
+            <View style={[styles.fill, { width: `${percent}%` }]} />
+          </View>
+
+          {feedback && <Text style={styles.feedback}>{feedback}</Text>}
+
+          <View style={styles.warningRow}>
+            <MaterialCommunityIcons name="alert-outline" size={14} color={Palette.amber} />
+            <Text style={styles.warningText}>One mistake restarts with a new text.</Text>
+          </View>
+
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Leave locked and return home"
+            onPress={() => router.dismissTo('/')}
+            style={({ pressed }) => [styles.leaveButton, pressed && styles.pressed]}>
+            <MaterialCommunityIcons name="lock-outline" size={16} color={Palette.textSecondary} />
+            <Text style={styles.leaveLabel}>Leave locked</Text>
+          </Pressable>
+        </ScrollView>
+      </SafeAreaView>
+
+      <Modal
+        visible={mistake != null}
+        transparent
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={tryAgain}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalIconTile}>
+              <MaterialCommunityIcons name="alert" size={24} color={Palette.danger} />
+            </View>
+
+            <Text style={styles.modalTitle}>Mistake Detected</Text>
+
+            <View style={styles.comparisonRow}>
+              <Text style={styles.comparisonText}>You typed </Text>
+              <View style={[styles.keycap, styles.keycapWrong]}>
+                <Text style={[styles.keycapLabel, styles.keycapLabelWrong]}>
+                  [{mistake?.wrongChar}]
+                </Text>
+              </View>
+              <Text style={styles.comparisonText}> instead of </Text>
+              <View style={[styles.keycap, styles.keycapExpected]}>
+                <Text style={[styles.keycapLabel, styles.keycapLabelExpected]}>
+                  [{mistake?.expectedChar}]
+                </Text>
+              </View>
+              <Text style={styles.comparisonText}>
+                . The challenge restarts with a new text.
+              </Text>
+            </View>
+
+            <NeuWell padded={false} style={styles.progressWell}>
+              <View style={styles.progressLeft}>
+                <MaterialCommunityIcons
+                  name="delete-outline"
+                  size={16}
+                  color={Palette.danger}
+                />
+                <Text style={styles.progressCleared}>Progress cleared</Text>
+              </View>
+              <View style={styles.progressRight}>
+                <Text style={styles.progressCount}>
+                  0 / {mistake?.nextChallenge.length ?? 0}
+                </Text>
+                <View style={styles.progressDot} />
+              </View>
+            </NeuWell>
+
+            <PrimaryGlowButton
+              label="Try Again"
+              onPress={tryAgain}
+              icon={<MaterialCommunityIcons name="refresh" size={18} color={Palette.canvas} />}
+              style={styles.primaryAction}
+            />
+            <SecondaryRaisedButton
+              label="Leave Locked"
+              onPress={leaveLocked}
+              icon={
+                <MaterialCommunityIcons
+                  name="lock-outline"
+                  size={16}
+                  color={Palette.textPrimary}
+                />
+              }
+              style={styles.secondaryAction}
+            />
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  screen: { flex: 1, backgroundColor: Palette.canvas },
+  safe: { flex: 1 },
+  content: {
+    flexGrow: 1,
+    paddingHorizontal: Space.margin,
+    paddingTop: Space.sm,
+    paddingBottom: Space.xl,
+    gap: Space.md,
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 48,
+    marginBottom: Space.xs,
+  },
+  backButton: {
+    position: 'absolute',
+    left: 0,
+    width: 44,
+    height: 44,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.raised,
+    boxShadow: Shadows.raisedSmall,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerTitle: {
+    fontFamily: FontNames.interBold,
+    fontSize: 18,
+    lineHeight: 24,
+    color: Palette.textPrimary,
+  },
+  selectorTrack: {
+    flexDirection: 'row',
+    gap: 4,
+    padding: 4,
+    height: 68,
+    borderRadius: Radii.well,
+    backgroundColor: Palette.well,
+    boxShadow: Shadows.sunken,
+  },
+  selectorCard: {
+    flex: 1,
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: 'transparent',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 1,
+  },
+  selectorCardActive: {
+    backgroundColor: Palette.raised,
+    borderColor: Palette.amber,
+    boxShadow: Shadows.raisedSmall,
+  },
+  selectorValueRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  selectorValue: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 13,
+    lineHeight: 16,
+    color: Palette.textPrimary,
+  },
+  selectorValueActive: { color: Palette.amber },
+  selectorDot: {
+    width: 4,
+    height: 4,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.amber,
+  },
+  selectorCaption: {
+    fontFamily: FontNames.monoRegular,
+    fontSize: 8,
+    lineHeight: 11,
+    letterSpacing: 1,
+    color: Palette.textMuted,
+  },
+  selectorCaptionActive: { color: Palette.amber },
+  challengeCard: { gap: Space.md },
+  challengeHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Space.sm,
+  },
+  challengeLabelRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flexShrink: 1,
+  },
+  challengeLabel: {
+    ...Typography.monoLabelSm,
+    fontSize: 10,
+    letterSpacing: 1,
+    color: Palette.textSecondary,
+  },
+  strictBadge: {
+    height: 24,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(251, 191, 36, 0.45)',
+    backgroundColor: Palette.amberHighlight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  strictBadgeLabel: {
+    ...Typography.monoLabelSm,
+    fontSize: 9,
+    lineHeight: 12,
+    letterSpacing: 0.8,
+    color: Palette.amber,
+  },
+  tokenGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    columnGap: 8,
+    rowGap: 10,
+  },
+  token: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 14,
+    lineHeight: 20,
+    letterSpacing: 0.4,
+    color: Palette.textSecondary,
+    paddingHorizontal: 3,
+    paddingVertical: 2,
+    borderRadius: 6,
+    borderWidth: 1.5,
+    borderColor: 'transparent',
+  },
+  tokenComplete: { color: Palette.success },
+  tokenActive: {
+    color: Palette.amber,
+    borderColor: Palette.amber,
+    backgroundColor: Palette.amberHighlight,
+  },
+  challengePlaceholder: {
+    minHeight: 120,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  placeholderText: {
+    ...Typography.bodyMd,
+    color: Palette.textMuted,
+    textAlign: 'center',
+  },
+  inputWell: {
+    borderRadius: Radii.input,
+    paddingHorizontal: 14,
+    minHeight: 48,
+    justifyContent: 'center',
+  },
+  input: {
+    minHeight: 44,
+    paddingVertical: 10,
+    fontFamily: FontNames.monoRegular,
+    fontSize: 14,
+    lineHeight: 20,
+    letterSpacing: 0.6,
+    color: Palette.success,
+  },
+  progressHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: -8,
+  },
+  progressLabel: {
+    ...Typography.monoLabelSm,
+    fontSize: 10,
+    letterSpacing: 0.6,
+    color: Palette.textSecondary,
+  },
+  progressPercent: {
+    ...Typography.monoLabelSm,
+    fontSize: 10,
+    letterSpacing: 0.6,
+    color: Palette.amber,
+  },
+  track: {
+    height: 4,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.surfaceHigh,
+    overflow: 'hidden',
+  },
+  fill: {
+    height: 4,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.amber,
+  },
+  feedback: {
+    ...Typography.bodyMd,
+    color: Palette.amber,
+  },
+  warningRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  warningText: {
+    ...Typography.bodyMd,
+    fontSize: 12,
+    color: Palette.textSecondary,
+  },
+  leaveButton: {
+    marginTop: 'auto',
+    paddingTop: Space.lg,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  leaveLabel: {
+    fontFamily: FontNames.interSemiBold,
+    fontSize: 13,
+    lineHeight: 18,
+    color: Palette.textSecondary,
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(8, 9, 12, 0.74)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: Space.lg,
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: 342,
+    borderRadius: 28,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    backgroundColor: '#18191D',
+    padding: 24,
+    alignItems: 'center',
+    boxShadow: '0px 24px 48px rgba(0, 0, 0, 0.45)',
+  },
+  modalIconTile: {
+    width: 52,
+    height: 52,
+    borderRadius: 16,
+    backgroundColor: '#241619',
+    borderWidth: 1,
+    borderColor: 'rgba(248, 113, 113, 0.3)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalTitle: {
+    fontFamily: FontNames.interBold,
+    fontSize: 22,
+    lineHeight: 28,
+    color: Palette.textPrimary,
+    textAlign: 'center',
+    marginTop: 16,
+    marginBottom: 12,
+  },
+  comparisonRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  comparisonText: {
+    fontFamily: FontNames.interRegular,
+    fontSize: 13,
+    lineHeight: 21,
+    color: Palette.textSecondary,
+  },
+  keycap: {
+    borderRadius: 5,
+    borderWidth: 1,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    marginHorizontal: 1,
+  },
+  keycapWrong: {
+    backgroundColor: 'rgba(248, 113, 113, 0.12)',
+    borderColor: 'rgba(248, 113, 113, 0.35)',
+  },
+  keycapExpected: {
+    backgroundColor: 'rgba(52, 211, 153, 0.12)',
+    borderColor: 'rgba(52, 211, 153, 0.35)',
+  },
+  keycapLabel: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  keycapLabelWrong: { color: Palette.danger },
+  keycapLabelExpected: { color: Palette.success },
+  progressWell: {
+    width: '100%',
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 20,
+  },
+  progressLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  progressCleared: {
+    fontFamily: FontNames.interMedium,
+    fontSize: 13,
+    lineHeight: 18,
+    color: Palette.textSecondary,
+  },
+  progressRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  progressCount: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 13,
+    lineHeight: 18,
+    color: Palette.danger,
+  },
+  progressDot: {
+    width: 5,
+    height: 5,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.danger,
+    boxShadow: '0px 0px 6px rgba(248, 113, 113, 0.9)',
+  },
+  primaryAction: { width: '100%', marginTop: 20 },
+  secondaryAction: { width: '100%', marginTop: 10 },
+  pressed: { opacity: 0.75 },
+});

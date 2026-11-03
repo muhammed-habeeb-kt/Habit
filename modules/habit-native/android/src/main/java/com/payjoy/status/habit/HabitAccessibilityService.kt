@@ -44,6 +44,18 @@ class HabitAccessibilityService : AccessibilityService() {
 
     val pkg = safeEvent.packageName?.toString() ?: return
     if (pkg == packageName) return
+
+    // FUTURE AI VISUAL SCANNER HOOK -------------------------------------------------
+    // When the on-device analyzer is added, this is the branch for watched apps:
+    //   val ai = HabitStore.aiSettings(this)
+    //   if (ai.enabled && pkg in ai.watchedApps) {
+    //     AiScanner.offer(pkg, safeEvent)   // throttled capture + classify, then
+    //     // HabitGuard.onAiMatch(this, matchKey, appLabel) on an adult verdict
+    //     return
+    //   }
+    // See PROJECT_NOTES.md, "Future AI Visual Scanner Architecture".
+    // -------------------------------------------------------------------------------
+
     if (pkg !in BROWSER_PACKAGES) return
 
     val now = SystemClock.elapsedRealtime()

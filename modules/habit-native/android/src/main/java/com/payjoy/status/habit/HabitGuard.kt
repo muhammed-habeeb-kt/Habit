@@ -37,15 +37,35 @@ object HabitGuard {
 
     val matched = AdultFilter.match(pageText) ?: return
     val total = HabitStore.registerAttempt(context, matched) ?: return
-    showBlockScreen(matched, total)
+    showBlockScreen(matched, total, BlockSource.BROWSER)
   }
 
-  private fun showBlockScreen(matchKey: String, attemptsToday: Int) {
+  /**
+   * Entry point for the future on-device AI visual scanner.
+   *
+   * HabitAccessibilityService will call this (instead of onPageText) after its AI
+   * module classifies a screenshot of a watched app as adult content. The AI engine
+   * itself does not exist yet; the settings and storage behind it are already live.
+   * `matchKey` should be stable per app + detected scene so the 5-second dedupe works.
+   */
+  fun onAiMatch(context: Context, matchKey: String, appLabel: String) {
+    if (!HabitStore.aiSettings(context).enabled) return
+    if (!HabitStore.state(context).protectionEnabled) return
+
+    val total = HabitStore.registerAttempt(context, "ai:$matchKey") ?: return
+    showBlockScreen(matchKey, total, BlockSource.ai(appLabel))
+  }
+
+  private fun showBlockScreen(
+    matchKey: String,
+    attemptsToday: Int,
+    source: BlockSource
+  ) {
     val currentService = service ?: return
     mainHandler.post {
       try {
         val screen = overlay ?: BlockOverlay(currentService).also { overlay = it }
-        screen.show(attemptsToday)
+        screen.show(attemptsToday, source)
         currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
         mainHandler.postDelayed({ verifyLeftPage(matchKey) }, HOME_FALLBACK_DELAY_MS)
       } catch (error: Throwable) {

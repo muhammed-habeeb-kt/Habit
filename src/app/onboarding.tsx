@@ -1,7 +1,8 @@
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import {
-  Platform,
+  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -10,23 +11,47 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { MaxContentWidth, Radius, Spacing, Type, type Theme } from '@/constants/theme';
-import { useProtection } from '@/hooks/use-protection';
-import { useTheme } from '@/hooks/use-theme';
 import {
+  NeuCard,
+  NeuWell,
+  PrimaryGlowButton,
+  StatusPill,
+} from '@/components/neumorphic';
+import {
+  FontNames,
+  MaxContentWidth,
+  Palette,
+  Radii,
+  Shadows,
+  Space,
+  Typography,
+} from '@/constants/theme';
+import { useProtection } from '@/hooks/use-protection';
+import {
+  activateDeviceAdmin,
   openAccessibilitySettings,
   openAppDetails,
   openAutostartSettings,
-  openBatterySettings,
   openNotificationSettings,
   requestNotificationPermission,
   setOnboardingCompleted,
 } from '@/native/habit';
 
+const PERMISSION_COUNT = 5;
+
+const ACCESSIBILITY_EXPLANATION =
+  'Android requires it so Habit can read browser address bars and recognise the screens of the apps you chose. Habit works only on this phone and never stores or sends what it sees.';
+
 export default function OnboardingScreen() {
-  const theme = useTheme();
   const { snapshot, notificationsEnabled, refresh } = useProtection();
   const [saving, setSaving] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  // True when the modal was opened by "Fix", so Understood continues into Settings.
+  const [helpOpensAccessibility, setHelpOpensAccessibility] = useState(false);
+  // Battery/autostart and restricted settings cannot be read back from Android,
+  // so they count as done once the person has been sent to the right screen.
+  const [batteryDone, setBatteryDone] = useState(false);
+  const [restrictedDone, setRestrictedDone] = useState(false);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -34,6 +59,16 @@ export default function OnboardingScreen() {
     }, 1500);
     return () => clearInterval(interval);
   }, [refresh]);
+
+  const accessibilityOn = snapshot?.accessibilityEnabled ?? false;
+  const notificationsOn = notificationsEnabled ?? false;
+  const deviceAdminOn = snapshot?.deviceAdminActive ?? false;
+  const grantedCount =
+    (accessibilityOn ? 1 : 0) +
+    (notificationsOn ? 1 : 0) +
+    (batteryDone ? 1 : 0) +
+    (restrictedDone ? 1 : 0) +
+    (deviceAdminOn ? 1 : 0);
 
   const finish = useCallback(async () => {
     if (saving) return;
@@ -46,283 +81,463 @@ export default function OnboardingScreen() {
     }
   }, [saving]);
 
-  const accessibilityOn = snapshot?.accessibilityEnabled ?? false;
-  const notificationsOn = notificationsEnabled ?? false;
-  const android13Plus =
-    Platform.OS === 'android' && typeof Platform.Version === 'number' && Platform.Version >= 33;
+  const openHelp = () => {
+    setHelpOpensAccessibility(false);
+    setHelpOpen(true);
+  };
+
+  const fixAccessibility = () => {
+    setHelpOpensAccessibility(true);
+    setHelpOpen(true);
+  };
+
+  const dismissHelp = async () => {
+    setHelpOpen(false);
+    if (!helpOpensAccessibility) return;
+    setHelpOpensAccessibility(false);
+    await openAccessibilitySettings();
+  };
+
+  const fixNotifications = async () => {
+    const granted = await requestNotificationPermission();
+    if (!granted) await openNotificationSettings();
+    refresh();
+  };
+
+  const fixBattery = async () => {
+    setBatteryDone(true);
+    await openAutostartSettings();
+  };
+
+  const fixRestricted = async () => {
+    setRestrictedDone(true);
+    await openAppDetails();
+  };
+
+  const fixDeviceAdmin = async () => {
+    await activateDeviceAdmin();
+    refresh();
+  };
 
   return (
-    <View style={[styles.screen, { backgroundColor: theme.background }]}>
+    <View style={styles.screen}>
       <SafeAreaView style={styles.safe} edges={['top', 'left', 'right', 'bottom']}>
         <ScrollView
           contentContainerStyle={styles.content}
           showsVerticalScrollIndicator={false}>
           <View style={styles.header}>
-            <View style={styles.headerText}>
-              <Text style={[styles.eyebrow, { color: theme.accent }]}>SETUP</Text>
-              <Text style={[styles.title, { color: theme.text }]}>Two minutes to lock in</Text>
-            </View>
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel="Close setup"
+              accessibilityLabel="Go back"
               onPress={() => router.back()}
-              style={({ pressed }) => [
-                styles.closeButton,
-                { backgroundColor: theme.surfaceAlt, opacity: pressed ? 0.7 : 1 },
-              ]}>
-              <Text style={[styles.closeLabel, { color: theme.textSecondary }]}>Close</Text>
+              style={({ pressed }) => [styles.backButton, pressed && styles.pressed]}>
+              <MaterialCommunityIcons
+                name="chevron-left"
+                size={26}
+                color={Palette.textPrimary}
+              />
             </Pressable>
+            <Text style={styles.title}>Set up Habit</Text>
           </View>
 
-          <Text style={[styles.intro, { color: theme.textSecondary }]}>
-            Habit only works with these permissions. Nothing leaves your phone.
-          </Text>
-
-          <StepCard
-            theme={theme}
-            index={1}
-            title="Accessibility access"
-            body="This is how Habit reads browser addresses and closes adult pages. Required."
-            done={accessibilityOn}
-            actionLabel={accessibilityOn ? 'Enabled' : 'Open accessibility settings'}
-            onPress={() => openAccessibilitySettings()}
-            hint="Turn on Habit in Settings → Accessibility → Installed apps."
-          />
-
-          <StepCard
-            theme={theme}
-            index={2}
-            title="Notifications"
-            body="Keeps the protection service running with a quiet, permanent notification."
-            done={notificationsOn}
-            actionLabel={notificationsOn ? 'Enabled' : 'Allow notifications'}
-            onPress={async () => {
-              const granted = await requestNotificationPermission();
-              if (!granted) await openNotificationSettings();
-              refresh();
-            }}
-          />
-
-          <StepCard
-            theme={theme}
-            index={3}
-            title="Battery & autostart"
-            body="On HyperOS/Redmi, Android otherwise stops protection when the screen is off."
-            actionLabel="Open autostart settings"
-            onPress={() => openAutostartSettings()}
-            secondaryLabel="Battery settings"
-            onSecondaryPress={() => openBatterySettings()}
-            hint="Allow autostart, then set battery saver to “No restrictions”."
-          />
-
-          {android13Plus && (
-            <StepCard
-              theme={theme}
-              index={4}
-              title="Allow restricted settings"
-              body="Android hides Accessibility from apps installed outside the Play Store until you allow it."
-              actionLabel="Open app info"
-              onPress={() => openAppDetails()}
-              hint="In app info tap ⋮ (top right) → “Allow restricted settings”."
-            />
-          )}
-
-          <Pressable
-            accessibilityRole="button"
-            disabled={saving}
-            onPress={finish}
-            style={({ pressed }) => [
-              styles.primaryButton,
-              { backgroundColor: theme.accent, opacity: pressed || saving ? 0.85 : 1 },
-            ]}>
-            <Text style={[styles.primaryLabel, { color: theme.onAccent }]}>
-              {accessibilityOn ? 'Start protecting' : 'Finish setup anyway'}
+          <NeuCard style={styles.progressCard}>
+            <View style={styles.progressTop}>
+              <StatusPill label="SETUP" tone="amber" />
+              <View style={styles.progressCountBlock}>
+                <Text style={styles.progressFraction}>
+                  {grantedCount} / {PERMISSION_COUNT}
+                </Text>
+                <Text style={styles.progressGranted}>granted</Text>
+              </View>
+            </View>
+            <View style={styles.progressTrack}>
+              <View
+                style={[
+                  styles.progressFill,
+                  { width: `${(grantedCount / PERMISSION_COUNT) * 100}%` },
+                ]}
+              />
+            </View>
+            <Text style={styles.progressNote}>
+              Habit needs these permissions to protect you.
             </Text>
-          </Pressable>
+          </NeuCard>
 
-          <Text style={[styles.footer, { color: theme.textMuted }]}>
-            You can reopen this setup any time from the Setup button on the home screen.
-          </Text>
+          <Text style={styles.sectionLabel}>REQUIRED PERMISSIONS</Text>
+
+          <PermissionCard
+            icon="eye-outline"
+            title="Accessibility service"
+            badge={{ label: 'REQUIRED', tone: 'danger' }}
+            description="Lets Habit see browser addresses and the screens of the apps you chose."
+            granted={accessibilityOn}
+            onHelp={openHelp}
+            onFix={fixAccessibility}
+          />
+
+          <PermissionCard
+            icon="bell-outline"
+            title="Notifications"
+            description="Shows that Habit is protecting you."
+            granted={notificationsOn}
+            onFix={fixNotifications}
+          />
+
+          <PermissionCard
+            icon="lightning-bolt"
+            title="Battery & autostart"
+            badge={{ label: 'CRUCIAL', tone: 'amber' }}
+            description="Keeps Habit running in the background."
+            granted={batteryDone}
+            onFix={fixBattery}
+          />
+
+          <PermissionCard
+            icon="lock-outline"
+            title="Allow restricted settings"
+            description="Needed on Android 13+ for apps installed outside the Play Store."
+            granted={restrictedDone}
+            onFix={fixRestricted}
+          />
+
+          <PermissionCard
+            icon="shield-outline"
+            title="Device admin"
+            description="Protects Habit from being force-stopped or uninstalled in Aggressive mode."
+            granted={deviceAdminOn}
+            onFix={fixDeviceAdmin}
+          />
+
+          <PrimaryGlowButton
+            label={accessibilityOn ? 'Start protecting' : 'Finish setup anyway'}
+            onPress={finish}
+            disabled={saving}
+            style={styles.finishButton}
+          />
         </ScrollView>
       </SafeAreaView>
+
+      <Modal
+        visible={helpOpen}
+        transparent
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={() => setHelpOpen(false)}>
+        <View style={styles.modalRoot}>
+          <View style={styles.scrim} />
+          <View style={styles.glassCard}>
+            <View style={styles.shieldTile}>
+              <MaterialCommunityIcons name="shield-check" size={24} color={Palette.amber} />
+            </View>
+            <Text style={styles.modalTitle}>Why does Habit need Accessibility?</Text>
+            <Text style={styles.modalBody}>{ACCESSIBILITY_EXPLANATION}</Text>
+            <NeuWell padded={false} style={styles.onDevicePill}>
+              <MaterialCommunityIcons name="lock" size={13} color={Palette.success} />
+              <Text style={styles.onDeviceLabel}>100% ON-DEVICE • NEVER TRANSMITTED</Text>
+            </NeuWell>
+            <PrimaryGlowButton
+              label="Understood"
+              onPress={dismissHelp}
+              style={styles.modalButton}
+            />
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
 
-type StepCardProps = {
-  theme: Theme;
-  index: number;
+type PermissionCardProps = {
+  icon: keyof typeof MaterialCommunityIcons.glyphMap;
   title: string;
-  body: string;
-  done?: boolean;
-  actionLabel: string;
-  onPress: () => void;
-  secondaryLabel?: string;
-  onSecondaryPress?: () => void;
-  hint?: string;
+  description: string;
+  /** Required/Crucial marker. Sits in a wrapping row with the title so it never covers it. */
+  badge?: { label: string; tone: 'danger' | 'amber' };
+  granted: boolean;
+  onFix: () => void;
+  onHelp?: () => void;
 };
 
-function StepCard({
-  theme,
-  index,
+function PermissionCard({
+  icon,
   title,
-  body,
-  done,
-  actionLabel,
-  onPress,
-  secondaryLabel,
-  onSecondaryPress,
-  hint,
-}: StepCardProps) {
+  description,
+  badge,
+  granted,
+  onFix,
+  onHelp,
+}: PermissionCardProps) {
   return (
-    <View
-      style={[
-        styles.card,
-        {
-          backgroundColor: theme.surface,
-          borderColor: done ? theme.accent : theme.border,
-        },
-      ]}>
-      <View style={styles.cardHeader}>
-        <View
-          style={[
-            styles.indexBadge,
-            { backgroundColor: done ? theme.accent : theme.surfaceAlt },
-          ]}>
-          <Text
-            style={[
-              styles.indexLabel,
-              { color: done ? theme.onAccent : theme.textSecondary },
-            ]}>
-            {done ? '✓' : String(index)}
-          </Text>
+    <NeuCard style={[styles.permissionCard, !granted && styles.permissionCardAttention]}>
+      <View style={styles.permissionRow}>
+        <View style={styles.iconTile}>
+          <MaterialCommunityIcons
+            name={icon}
+            size={20}
+            color={granted ? Palette.textPrimary : Palette.amber}
+          />
         </View>
-        <View style={styles.cardText}>
-          <Text style={[styles.cardTitle, { color: theme.text }]}>{title}</Text>
-          <Text style={[styles.cardBody, { color: theme.textSecondary }]}>{body}</Text>
+        <View style={styles.permissionContent}>
+          <View style={styles.titleRow}>
+            {/* Title and badge wrap together inside this group; nothing is absolutely
+                positioned, so the badge can never cover the title text. */}
+            <View style={styles.titleGroup}>
+              <Text style={styles.permissionTitle}>{title}</Text>
+              {badge && <StatusPill label={badge.label} tone={badge.tone} />}
+            </View>
+            <View style={styles.permissionActions}>
+              {onHelp && (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Why does Habit need this permission?"
+                  onPress={onHelp}
+                  hitSlop={8}
+                  style={({ pressed }) => [styles.helpButton, pressed && styles.pressed]}>
+                  <Text style={styles.helpLabel}>?</Text>
+                </Pressable>
+              )}
+              {granted ? (
+                <StatusPill label="✓ Granted" tone="success" />
+              ) : (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Fix ${title}`}
+                  onPress={onFix}
+                  style={({ pressed }) => [styles.fixButton, pressed && styles.fixPressed]}>
+                  <Text style={styles.fixLabel}>Fix</Text>
+                </Pressable>
+              )}
+            </View>
+          </View>
+
+          <Text style={styles.permissionDescription}>{description}</Text>
         </View>
       </View>
-
-      {hint && (
-        <Text style={[styles.hint, { color: theme.textMuted }]}>{hint}</Text>
-      )}
-
-      <View style={styles.actions}>
-        <Pressable
-          accessibilityRole="button"
-          onPress={onPress}
-          style={({ pressed }) => [
-            styles.actionButton,
-            {
-              backgroundColor: done ? theme.accentSoft : theme.surfaceAlt,
-              borderColor: done ? theme.accent : theme.border,
-              opacity: pressed ? 0.75 : 1,
-            },
-          ]}>
-          <Text
-            style={[
-              styles.actionLabel,
-              { color: done ? theme.accent : theme.text },
-            ]}>
-            {actionLabel}
-          </Text>
-        </Pressable>
-
-        {secondaryLabel && onSecondaryPress && (
-          <Pressable
-            accessibilityRole="button"
-            onPress={onSecondaryPress}
-            style={({ pressed }) => [
-              styles.linkButton,
-              { opacity: pressed ? 0.6 : 1 },
-            ]}>
-            <Text style={[styles.linkLabel, { color: theme.textSecondary }]}>
-              {secondaryLabel}
-            </Text>
-          </Pressable>
-        )}
-      </View>
-    </View>
+    </NeuCard>
   );
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1 },
+  screen: { flex: 1, backgroundColor: Palette.canvas },
   safe: { flex: 1 },
   content: {
-    paddingHorizontal: Spacing.four,
-    paddingTop: Spacing.three,
-    paddingBottom: Spacing.five,
-    gap: Spacing.three,
     width: '100%',
     maxWidth: MaxContentWidth,
     alignSelf: 'center',
+    paddingHorizontal: Space.margin,
+    paddingTop: Space.sm,
+    paddingBottom: Space.xxl,
+    gap: Space.md,
   },
-  header: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.three },
-  headerText: { flex: 1 },
-  eyebrow: {
-    fontSize: Type.eyebrow.fontSize,
-    lineHeight: Type.eyebrow.lineHeight,
-    letterSpacing: Type.eyebrow.letterSpacing,
-    fontWeight: '700',
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.gutter,
+    paddingBottom: Space.xs,
   },
-  title: {
-    fontSize: Type.title.fontSize,
-    lineHeight: Type.title.lineHeight,
-    fontWeight: '700',
-    marginTop: Spacing.one,
-  },
-  closeButton: {
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-    borderRadius: Radius.pill,
-  },
-  closeLabel: { fontSize: Type.small.fontSize, fontWeight: '600' },
-  intro: {
-    fontSize: Type.small.fontSize,
-    lineHeight: Type.small.lineHeight,
-    marginTop: -Spacing.one,
-  },
-  card: {
-    borderWidth: 1,
-    borderRadius: Radius.lg,
-    padding: Spacing.three,
-    gap: Spacing.three,
-  },
-  cardHeader: { flexDirection: 'row', gap: Spacing.three },
-  indexBadge: {
-    width: 28,
-    height: 28,
-    borderRadius: Radius.pill,
+  backButton: {
+    width: 48,
+    height: 48,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.raised,
+    boxShadow: Shadows.raisedSmall,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  indexLabel: { fontSize: Type.micro.fontSize, fontWeight: '700' },
-  cardText: { flex: 1, gap: 4 },
-  cardTitle: { fontSize: Type.bodyStrong.fontSize, fontWeight: '700' },
-  cardBody: { fontSize: Type.small.fontSize, lineHeight: Type.small.lineHeight },
-  hint: { fontSize: Type.micro.fontSize, lineHeight: 17, marginTop: -Spacing.two },
-  actions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.three },
-  actionButton: {
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-    borderRadius: Radius.pill,
+  title: {
+    ...Typography.headlineLg,
+    color: Palette.textPrimary,
+    flex: 1,
+  },
+  pressed: { opacity: 0.7 },
+
+  progressCard: { gap: Space.gutter, paddingVertical: 18 },
+  progressTop: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: Space.gutter,
+  },
+  progressCountBlock: { alignItems: 'flex-end', gap: 2 },
+  progressFraction: {
+    ...Typography.monoLabelLg,
+    color: Palette.amber,
+  },
+  progressGranted: {
+    ...Typography.bodySm,
+    color: Palette.textSecondary,
+  },
+  progressTrack: {
+    height: 8,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.well,
+    boxShadow: Shadows.sunkenSmall,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.amber,
+  },
+  progressNote: {
+    ...Typography.bodySm,
+    color: Palette.textSecondary,
+    marginTop: -Space.xs,
+  },
+
+  sectionLabel: {
+    ...Typography.monoLabelSm,
+    color: Palette.textMuted,
+    marginTop: Space.sm,
+    marginBottom: -4,
+  },
+
+  permissionCard: {
+    paddingVertical: 16,
+    paddingHorizontal: 16,
     borderWidth: 1,
+    borderColor: 'transparent',
   },
-  actionLabel: { fontSize: Type.small.fontSize, fontWeight: '600' },
-  linkButton: { paddingVertical: Spacing.two },
-  linkLabel: { fontSize: Type.small.fontSize, fontWeight: '600' },
-  primaryButton: {
-    paddingVertical: Spacing.three,
-    borderRadius: Radius.md,
+  permissionCardAttention: { borderColor: Palette.amberHighlight },
+  permissionRow: { flexDirection: 'row', gap: Space.gutter },
+  iconTile: {
+    width: Radii.tileSize,
+    height: Radii.tileSize,
+    borderRadius: Radii.tile,
+    backgroundColor: Palette.amberHighlight,
     alignItems: 'center',
-    marginTop: Spacing.two,
+    justifyContent: 'center',
   },
-  primaryLabel: { fontSize: Type.body.fontSize, fontWeight: '700' },
-  footer: {
-    fontSize: Type.micro.fontSize,
+  permissionContent: { flex: 1, minWidth: 0 },
+  titleRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: Space.sm,
+    minHeight: 32,
+  },
+  titleGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+    flexShrink: 1,
+    minWidth: 0,
+    flexGrow: 1,
+  },
+  permissionTitle: {
+    ...Typography.bodyLg,
+    fontFamily: FontNames.interBold,
+    color: Palette.textPrimary,
+    flexShrink: 1,
+  },
+  permissionActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.sm,
+    flexShrink: 0,
+  },
+  helpButton: {
+    width: 24,
+    height: 24,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.surfaceHigh,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  helpLabel: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 11,
+    lineHeight: 14,
+    color: Palette.textSecondary,
+  },
+  fixButton: {
+    minWidth: 52,
+    height: 32,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.amber,
+    boxShadow: Shadows.amberGlow,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+  },
+  fixPressed: { backgroundColor: Palette.amberPressed, boxShadow: undefined },
+  fixLabel: {
+    fontFamily: FontNames.interBold,
+    fontSize: 13,
     lineHeight: 18,
-    textAlign: 'center',
-    paddingHorizontal: Spacing.three,
+    color: Palette.canvas,
   },
+  permissionDescription: {
+    ...Typography.bodyMd,
+    color: Palette.textSecondary,
+    marginTop: 6,
+  },
+
+  finishButton: { marginTop: Space.sm },
+
+  modalRoot: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    padding: Space.md,
+  },
+  scrim: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: Palette.scrim,
+  },
+  glassCard: {
+    borderRadius: Radii.card,
+    borderWidth: 1,
+    borderColor: Palette.glassBorder,
+    backgroundColor: Palette.glassFill,
+    padding: Space.lg,
+    gap: Space.gutter,
+    alignItems: 'center',
+    boxShadow: Shadows.raisedLarge,
+  },
+  shieldTile: {
+    width: 52,
+    height: 52,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.raised,
+    borderWidth: 1,
+    borderColor: Palette.amberGlow,
+    boxShadow: Shadows.amberHalo,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalTitle: {
+    ...Typography.headlineLg,
+    fontSize: 20,
+    lineHeight: 26,
+    color: Palette.textPrimary,
+    textAlign: 'center',
+  },
+  modalBody: {
+    ...Typography.bodyMd,
+    color: Palette.textSecondary,
+    textAlign: 'center',
+  },
+  onDevicePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    borderRadius: Radii.pill,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  onDeviceLabel: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 9,
+    lineHeight: 13,
+    letterSpacing: 0.6,
+    color: Palette.textSecondary,
+    flexShrink: 1,
+    textAlign: 'center',
+  },
+  modalButton: { alignSelf: 'stretch' },
 });

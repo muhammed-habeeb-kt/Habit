@@ -23,6 +23,9 @@ object HabitUnlock {
   const val DEBUG_COOLDOWN_MS = 60L * 1000L
   const val OFF_WINDOW_MS = 10L * 60L * 1000L
 
+  /** Method C turns protection off for this fixed window, then restores the mode. */
+  const val FACE_OFF_MS = 30L * 60L * 1000L
+
   private const val PERSIST_INTERVAL_MS = 5_000L
 
   @Volatile private var lastPersistElapsed = 0L
@@ -250,12 +253,21 @@ object HabitUnlock {
 
     val offWindow = unlock.offWindow
     if (offWindow != null && remainingOffMs(offWindow, now) <= 0L) {
-      unlock = unlock.copy(offWindow = null)
+      // Never claim Aggressive when device admin is gone: fall back to Strict instead.
+      val restoreMode = if (
+        unlock.restoreMode == ProtectionState.MODE_AGGRESSIVE &&
+        !HabitDeviceAdmin.isActive(context)
+      ) {
+        ProtectionState.MODE_STRICT
+      } else {
+        unlock.restoreMode
+      }
+      unlock = unlock.copy(offWindow = null, restoreMode = restoreMode)
       HabitStore.writeUnlockState(context, unlock)
       HabitStore.updateState(context) {
         it.copy(
           protectionEnabled = true,
-          mode = if (it.mode == ProtectionState.MODE_NORMAL) unlock.restoreMode else it.mode
+          mode = if (it.mode == ProtectionState.MODE_NORMAL) restoreMode else it.mode
         )
       }
       HabitNotifier.notifyProtectionRestored(context)
@@ -438,6 +450,58 @@ object HabitUnlock {
   fun completeUnlock(context: Context): ProtectionState {
     recordSuccess(context)
     return exitStrict(context)
+  }
+
+  /**
+   * Method C success: protection is off for a fixed 30 minutes, then the previous mode
+   * returns automatically. "Turn on now" ends the window early (setProtectionEnabled).
+   * The deadline is stored monotonic *and* as wall clock, so rebooting cannot extend it.
+   */
+  fun completeFaceUnlock(context: Context): ProtectionState {
+    recordSuccess(context)
+    CharacterChallenge.clear()
+
+    val previous = HabitStore.state(context)
+    val restoreMode = if (previous.mode == ProtectionState.MODE_NORMAL) {
+      ProtectionState.MODE_STRICT
+    } else {
+      previous.mode
+    }
+
+    // Strict can be restored without device admin, so drop it while protection is off.
+    // Aggressive must keep it: re-adding admin needs a user prompt, and without it the
+    // watchdog could not report a real Aggressive state after the window.
+    if (restoreMode != ProtectionState.MODE_AGGRESSIVE) {
+      HabitDeviceAdmin.remove(context)
+    }
+
+    val unlock = HabitStore.unlockState(context)
+    val now = SystemClock.elapsedRealtime()
+    HabitStore.writeUnlockState(
+      context,
+      unlock.copy(
+        cooldown = null,
+        offWindow = UnlockWindow(
+          FACE_OFF_MS,
+          FACE_OFF_MS,
+          now,
+          System.currentTimeMillis() + FACE_OFF_MS
+        ),
+        restoreMode = restoreMode,
+        failures = unlock.failures.copy(consecutive = 0, lockedUntilWall = 0L)
+      )
+    )
+
+    val next = HabitStore.updateState(context) {
+      it.copy(mode = ProtectionState.MODE_NORMAL, protectionEnabled = false)
+    }
+    HabitAlarms.cancel(context)
+    reschedule(context)
+    // The service keeps the 30-minute window ticking even if the app is swiped away.
+    HabitForegroundService.start(context)
+    HabitWatchdog.schedule(context)
+    HabitWatchdog.check(context, force = true)
+    return next
   }
 
   /** Debug builds only: lets the tester skip the cooldown and leave Strict instantly. */

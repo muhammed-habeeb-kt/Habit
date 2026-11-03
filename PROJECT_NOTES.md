@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-10-29 (Part 4: unlock method C — two face checks)_
+_Last updated: 2026-11-01 (Part 5: Soft Black & Amber design system, 3-tab shell, AI monitoring UI + storage)_
 
 ## Product
 
@@ -49,6 +49,15 @@ Raising protection is always instant; lowering it in Strict/Aggressive needs an 
 | Screens | `src/app/index.tsx`, `src/app/unlock.tsx`, `src/app/face-unlock.tsx`, `src/app/onboarding.tsx` |
 | Countdown helpers | `src/components/countdown.tsx` |
 | Blocklist + keywords | `src/data/blocklist.json`, `src/data/keywords.json` |
+| Design tokens (colors, radii, shadows, type) | `src/constants/theme.ts` |
+| Neumorphic component kit | `src/components/neumorphic/` |
+| Floating 3-tab bar | `src/components/floating-tab-bar.tsx` |
+| Tabs: Home / Apps / Settings | `src/app/(tabs)/` |
+| Browser Blocking screen | `src/app/browsers.tsx` |
+| AI app catalogue and selection UI | `src/data/apps.ts`, `src/app/(tabs)/apps.tsx` |
+| AI settings hook (JS bridge) | `src/hooks/use-ai-monitoring.ts` |
+| AI settings storage (native) | `HabitStore.kt` (`AiSettings`, `KEY_AI`) |
+| Block overlay source badges | `BlockOverlay.kt` (`BlockSource`), `HabitGuard.onAiMatch` |
 
 ## Native pieces
 
@@ -88,7 +97,8 @@ Part 4:
 - `FaceUnlock` — unlock method C. Native session: start → first face photo → wait ≥ 3 s →
   second face photo. Uses Android's built-in offline `FaceDetector`; images are decoded  in memory, counted, and recycled; the camera's temporary capture file is deleted right
   after counting, so no photo is kept. Missing faces count as failed attempts and respect
-  the same rate limit as method A.
+  the same rate limit as method A. Success calls `HabitUnlock.completeFaceUnlock`, which
+  opens a fixed 30-minute OFF window and restores the previous mode afterwards.
 
 ## Mode state machine (native)
 
@@ -172,12 +182,76 @@ permanent lock-out.
 **Debug-only tools** (visible only when the app is debuggable, refused in release builds):
 "Short cooldown" (60 s) and "Exit Strict now".
 
+## Future AI Visual Scanner Architecture
+
+The UI, settings and storage for AI App Monitoring are built now. The scanner itself is
+intentionally **not** implemented yet. When it is added, only the parts marked *new* below
+are needed — no screen, bridge or storage change.
+
+### What already exists
+
+- **Persistence (native).** `HabitStore.AiSettings` is stored encrypted under `KEY_AI` as
+  `{ enabled, sensitivity: "low"|"balanced"|"high", watchedApps: [packageName, ...] }`.
+  `HabitStore.aiSettings(context)` reads it; `setAiMonitoringEnabled`,
+  `setAiSensitivity` and `setAiWatchedApps` write it and fire `onStateChanged`. The value
+  is also included in every `getSnapshot()` result under `"ai"`.
+- **JS bridge.** `src/native/habit.ts` exposes `getAiSettings`, `setAiMonitoringEnabled`,
+  `setAiSensitivity`, `setAiWatchedApps`; `src/hooks/use-ai-monitoring.ts` is the single
+  screen-facing hook.
+- **UI.** Apps tab: master switch, search, ALL / SELECTED / SUGGESTED filters, per-app
+  selection (browsers shown as covered by Browser Blocking). Settings tab: AI detection
+  sensitivity selector. Block overlay supports both source badges.
+- **Block screen sources.** `BlockOverlay.kt` now takes a `BlockSource`:
+  `BlockSource.BROWSER` renders `• BROWSER`; `BlockSource.ai(appLabel)` renders
+  `• AI • TELEGRAM` (app label uppercased). Browser text still says “closed this page”;
+  AI text says “closed this screen”.
+
+### Where the engine plugs in
+
+1. **New class** `AiScanner` in `modules/habit-native/android/src/main/java/com/payjoy/status/habit/`.
+   It owns the TFLite model, a single reused `Interpreter`, and a throttled analysis loop
+   (one frame at a time, no queue). Nothing is written to disk; bitmaps are recycled in
+   `finally` blocks and never logged.
+2. **Hook point** — `HabitAccessibilityService.onAccessibilityEvent`, the marked
+   `FUTURE AI VISUAL SCANNER HOOK` block right after the package gate. Instead of the
+   current early return for non-browser packages, it will read
+   `HabitStore.aiSettings(this)`; when `enabled` is true and the foreground package is in
+   `watchedApps`, it feeds the event to `AiScanner.offer(pkg, event)` and returns.
+3. **Capture** — use `AccessibilityService.takeScreenshot()` (Android 11+/API 30; required
+   anyway on the target device) on a downscaled hardware buffer, only while a watched app
+   is in front and the screen is interactive. Never capture `FLAG_SECURE` windows; that is
+   the honest “protected screens” limit already listed in Known limits.
+4. **Classification** — the model returns an adult-content score. `AiScanner` converts the
+   stored sensitivity into a confidence threshold: High = lower threshold / more blocks,
+   Balanced = default, Low = only high-confidence matches. Add a short per-app cooldown so
+   a single scene is not classified continuously.
+5. **Verdict** — on a positive verdict call
+   `HabitGuard.onAiMatch(context, matchKey, appLabel)`. `matchKey` must be stable for the
+   detected app/scene (e.g. `"telegram:adult-channel"`) so `HabitStore.registerAttempt`
+   applies its 5-second dedupe and only one attempt is counted. `HabitGuard.onAiMatch`
+   already checks the AI master switch + protection state, counts the attempt, shows the
+   `• AI • APP` badge, sends Back/Home and falls back Home.
+6. **Lifecycle** — load the model lazily on first watched-app event, close the interpreter
+   in `onDestroy`/`HabitGuard.detach`, and never start the engine when AI monitoring is off.
+
+### Rules to keep
+
+- On-device only. No screenshots, embeddings or classifications leave the phone.
+- The AI verdict is advisory input to the native block flow; JavaScript can never force a
+  block or write protection state.
+- Settings storage is already final. If new tuning is needed later, add fields to
+  `AiSettings` with defaults, not a second store.
+
 ## Status
 
 - [x] Part 1 — foundation, Normal mode, blocking, attempts, onboarding.
 - [x] Part 2 — Strict mode, unlock methods A and B, rate limiting, debug tools.
 - [x] Part 3 — Aggressive mode + device-admin self-protection (watchdog, admin requirement).
 - [x] Part 4 — unlock method C: two face checks (camera + offline face detection).
+- [x] Part 5 — design system “C10 Soft Black & Amber”: fonts, theme tokens, neumorphic kit,
+  floating 3-tab navigation, Home/Apps/Settings screens, AI monitoring UI + native settings
+  storage, block overlay source badges.
+- [ ] AI visual scanner engine (model, capture loop, classification) — deliberately pending.
 
 ## Build & run (Termux, no PC)
 
@@ -196,6 +270,12 @@ npm run lint                             # eslint
 
 Part 4 added a native dependency (`expo-camera`), so the development APK has to be rebuilt
 once before the face unlock screen can work.
+
+Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
+`@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,
+not a native blur module, so a stale development APK can still render every screen.
+The native bridge gained `getInstalledPackages` and face unlocks now create a 30-minute OFF
+window, so rebuild the development APK once for those two native changes.
 
 Build profiles live in `eas.json` (`development` = dev client APK, `preview` = release APK).
 The generated `android/` folder is never committed; `expo prebuild` (run by EAS) recreates it
@@ -224,11 +304,57 @@ from `app.json` + `plugins/withHabitAndroid.js`.
 14. In Aggressive, turn accessibility off → warning notification + banner; turn it back on →
     warnings disappear.
 15. Method C: allow camera → take the first photo → step 2 appears; wait ~3 s, take the
-    second photo → protection turns off and mode becomes Normal.
+    second photo → protection turns off for 30 minutes; Home shows the OFF countdown card;
+    after the window the previous mode returns automatically (or tap “Turn on now”).
 16. Method C with no face in frame → “No face found”, attempt counted, second step not
     reached.
 17. Method C leaving the screen mid-way and reopening starts a fresh session (the old one is
     cancelled).
+
+## Decisions
+
+- **Dark only.** The app now uses “Soft Black & Amber” exclusively. `app.json` sets
+  `userInterfaceStyle: "dark"` and both `Colors.light` / `Colors.dark` resolve to the same
+  dark palette until the older screens are restyled in later prompts.
+- **Font loading gate.** `src/app/_layout.tsx` waits for Inter, Space Mono and the icon font
+  before rendering, so no text flashes in a fallback face.
+- **Routes.** The three tabs live in `src/app/(tabs)/` (`index`, `apps`, `settings`); unlock,
+  face-unlock and onboarding stay as modal routes on the root stack. The old
+  `src/app/index.tsx` was replaced by `src/app/(tabs)/index.tsx`.
+- **AI app catalogue.** `src/data/apps.ts` is a curated offline catalogue rather than a live
+  Android package query. The native scanner only needs the stored package names, so the
+  list can grow without touching storage; browsers are shown as covered by Browser Blocking.
+- **Honest permission count.** Settings shows only the two permissions the app can actually
+  verify from JS/native (accessibility + notifications), so the progress bar is never a
+  guess. Battery/autostart stay in the onboarding checklist.
+- **Shadows.** Neumorphic depth uses React Native `boxShadow` (dual directional layers,
+  with `inset` for wells) from `Shadows` in `theme.ts`; no extra gradient/shadow library.
+- **Frost without a native blur.** `FrostedBanner` and the floating tab bar use
+translucent layers plus a hairline sheen instead of `expo-blur`. Android's blur default was
+`none` anyway, and this removes a native-module import that could crash an older dev build
+before Home rendered.
+- **Fonts never block first paint.** `_layout.tsx` renders immediately and hides the splash
+when fonts load, with a 2.5 s fallback timer. A missing font asset degrades to system fonts
+instead of leaving a blank splash.
+- **Older dev builds.** `canQueryInstalledPackages` detects a native module without
+`getInstalledPackages`; the Browser Blocking screen then shows `UNAVAILABLE` rather than
+incorrectly marking every browser as not installed.
+- **Visible render failures.** The root layout exports an Expo Router `ErrorBoundary`, so a
+render crash shows the error message and a “Try again” button instead of a blank screen.
+- **Render check.** `expo export --platform web` statically renders every route; it was used
+to confirm `/`, `/apps`, `/settings` and `/browsers` build and render (Home shows its native
+snapshot loading state during static rendering, which is expected).
+- **No AI engine yet.** Per the plan, the master switch, sensitivity and app selection only
+  persist settings today. `HabitGuard.onAiMatch` and the marked hook in
+  `HabitAccessibilityService` are the only native entry points the future engine needs.
+- **Browser install status.** The Browser Blocking screen asks Android's PackageManager
+  (`getInstalledPackages`) which of the eight watched browsers are installed. The manifest
+  already declares `<queries>` for all of them, so the check works on Android 11+ without
+  `QUERY_ALL_PACKAGES`.
+- **OFF countdown card.** Home shows it from `snapshot.unlock.offWindowActive`. Both the
+  timer unlock (10 minutes) and the two-person face check (30 minutes, `FACE_OFF_MS` in
+  `HabitUnlock`) now create an OFF window, so the card appears for either method and
+  “Turn on now” ends the window immediately.
 
 ## Device notes
 

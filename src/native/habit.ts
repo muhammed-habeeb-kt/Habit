@@ -50,6 +50,35 @@ export type FaceCheckResult = {
   message: string;
 };
 
+export type AiSensitivity = 'low' | 'balanced' | 'high';
+
+export type AiSettings = {
+  /** Master switch for the on-device AI screen analyzer. */
+  enabled: boolean;
+  /** Package names of the apps the user selected. Empty until they choose some. */
+  monitoredAppPackages: string[];
+  aiSensitivity: AiSensitivity;
+  blockAlertsEnabled: boolean;
+};
+
+/** An app actually installed on this phone, as reported by the native module. */
+export type InstalledApp = {
+  packageName: string;
+  label: string;
+  isSystemApp: boolean;
+  isBrowser: boolean;
+};
+
+const DEFAULT_AI_SETTINGS: AiSettings = {
+  enabled: true,
+  monitoredAppPackages: [],
+  aiSensitivity: 'balanced',
+  blockAlertsEnabled: true,
+};
+
+// Session fallback for Expo Go / web, where the native store does not exist.
+let fallbackAiSettings: AiSettings = DEFAULT_AI_SETTINGS;
+
 type AttemptsEvent = { count: number };
 type Listener = (payload: AttemptsEvent) => void;
 type Subscription = { remove(): void };
@@ -66,7 +95,7 @@ type HabitNativeModule = {
     typed: string
   ): Promise<ChallengeResult | null>;
   startFaceUnlock(): Promise<boolean>;
-  submitFacePhoto(uri: string): Promise<FaceCheckResult | null>;
+  submitFaceFrames(uris: string[]): Promise<FaceCheckResult | null>;
   cancelFaceUnlock(): Promise<boolean>;
   setFastCooldown(enabled: boolean): Promise<boolean>;
   debugExitStrict(): Promise<HabitSnapshot>;
@@ -74,6 +103,13 @@ type HabitNativeModule = {
   activateDeviceAdmin(): Promise<boolean>;
   publishLists(domainsJson: string, keywordsJson: string): Promise<boolean>;
   setOnboardingCompleted(completed: boolean): Promise<HabitSnapshot>;
+  getInstalledPackages(packages: string[]): Promise<string[]>;
+  getInstalledApps(): Promise<InstalledApp[]>;
+  getAiSettings(): Promise<AiSettings>;
+  setAiMonitoringEnabled(enabled: boolean): Promise<AiSettings>;
+  setAiSensitivity(sensitivity: string): Promise<AiSettings>;
+  setAiWatchedApps(packages: string[]): Promise<AiSettings>;
+  setAiBlockAlerts(enabled: boolean): Promise<AiSettings>;
   isAccessibilityEnabled(): Promise<boolean>;
   areNotificationsEnabled(): Promise<boolean>;
   requestNotificationPermission(): Promise<boolean>;
@@ -91,6 +127,22 @@ const native: HabitNativeModule | null =
     : null;
 
 export const isNativeAvailable = native != null;
+
+/**
+ * False on an older development APK whose native module predates
+ * `getInstalledPackages`. The Browser Blocking screen then shows "UNAVAILABLE"
+ * instead of claiming every browser is missing.
+ */
+export const canQueryInstalledPackages =
+  native != null && typeof native.getInstalledPackages === 'function';
+
+/**
+ * False on an older development APK whose native module predates
+ * `getInstalledApps`. The Apps screen then explains the build is out of date
+ * instead of pretending the phone has no apps.
+ */
+export const canListInstalledApps =
+  native != null && typeof native.getInstalledApps === 'function';
 
 /** Fail closed: without native state, protection is treated as ON. */
 const FALLBACK_UNLOCK: UnlockInfo = {
@@ -165,8 +217,12 @@ export function startFaceUnlock(): Promise<boolean> {
   return safeCall(() => native!.startFaceUnlock(), false);
 }
 
-export function submitFacePhoto(uri: string): Promise<FaceCheckResult | null> {
-  return safeCall(() => native!.submitFacePhoto(uri), null);
+/**
+ * Verifies one blink burst. The native side enforces the two-person order, deletes the
+ * captures and returns `first`, `unlocked`, `retry` or `error`.
+ */
+export function submitFaceFrames(uris: string[]): Promise<FaceCheckResult | null> {
+  return safeCall(() => native!.submitFaceFrames(uris), null);
 }
 
 export function cancelFaceUnlock(): Promise<boolean> {
@@ -190,6 +246,48 @@ export function activateDeviceAdmin(): Promise<boolean> {
   return safeCall(() => native!.activateDeviceAdmin(), false);
 }
 
+/** Returns the subset of `packages` that Android reports as installed. */
+export async function getInstalledPackages(packages: string[]): Promise<string[]> {
+  if (!native || !canQueryInstalledPackages) return [];
+  try {
+    const installed = await native.getInstalledPackages(packages);
+    return Array.isArray(installed)
+      ? installed.filter((item): item is string => typeof item === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Every app installed on the device (third-party and system, excluding Habit),
+ * sorted alphabetically by label. Returns [] when the native module is missing.
+ */
+export async function getInstalledApps(): Promise<InstalledApp[]> {
+  if (!native || !canListInstalledApps) return [];
+  try {
+    const apps = await native.getInstalledApps();
+    if (!Array.isArray(apps)) return [];
+    return apps
+      .filter(
+        (app): app is InstalledApp =>
+          app != null &&
+          typeof app.packageName === 'string' &&
+          typeof app.label === 'string' &&
+          app.label.length > 0
+      )
+      .map((app) => ({
+        packageName: app.packageName,
+        label: app.label,
+        isSystemApp: app.isSystemApp === true,
+        isBrowser: app.isBrowser === true,
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  } catch {
+    return [];
+  }
+}
+
 export function setOnboardingCompleted(completed: boolean): Promise<HabitSnapshot> {
   return safeCall(() => native!.setOnboardingCompleted(completed), {
     ...FALLBACK_SNAPSHOT,
@@ -202,6 +300,83 @@ export function publishLists(domains: string[], keywords: string[]): Promise<boo
     () => native!.publishLists(JSON.stringify(domains), JSON.stringify(keywords)),
     false
   );
+}
+
+function normalizeAiSettings(value: AiSettings | null | undefined): AiSettings {
+  if (!value) return DEFAULT_AI_SETTINGS;
+  const sensitivity: AiSensitivity =
+    value.aiSensitivity === 'low' || value.aiSensitivity === 'high' ? value.aiSensitivity : 'balanced';
+  return {
+    enabled: value.enabled === true,
+    monitoredAppPackages: Array.isArray(value.monitoredAppPackages)
+      ? value.monitoredAppPackages.filter((item): item is string => typeof item === 'string')
+      : DEFAULT_AI_SETTINGS.monitoredAppPackages,
+    aiSensitivity: sensitivity,
+    blockAlertsEnabled: value.blockAlertsEnabled !== undefined ? value.blockAlertsEnabled : DEFAULT_AI_SETTINGS.blockAlertsEnabled,
+  };
+}
+
+/** Reads the AI monitoring settings persisted by HabitStore. */
+export async function getAiSettings(): Promise<AiSettings> {
+  if (!native) return fallbackAiSettings;
+  try {
+    fallbackAiSettings = normalizeAiSettings(await native.getAiSettings());
+    return fallbackAiSettings;
+  } catch {
+    return fallbackAiSettings;
+  }
+}
+
+export async function setAiMonitoringEnabled(enabled: boolean): Promise<AiSettings> {
+  if (!native) {
+    fallbackAiSettings = { ...fallbackAiSettings, enabled };
+    return fallbackAiSettings;
+  }
+  try {
+    fallbackAiSettings = normalizeAiSettings(await native.setAiMonitoringEnabled(enabled));
+  } catch {
+    fallbackAiSettings = { ...fallbackAiSettings, enabled };
+  }
+  return fallbackAiSettings;
+}
+
+export async function setAiSensitivity(sensitivity: AiSensitivity): Promise<AiSettings> {
+  if (!native) {
+    fallbackAiSettings = { ...fallbackAiSettings, aiSensitivity: sensitivity };
+    return fallbackAiSettings;
+  }
+  try {
+    fallbackAiSettings = normalizeAiSettings(await native.setAiSensitivity(sensitivity));
+  } catch {
+    fallbackAiSettings = { ...fallbackAiSettings, aiSensitivity: sensitivity };
+  }
+  return fallbackAiSettings;
+}
+
+export async function setAiBlockAlerts(enabled: boolean): Promise<AiSettings> {
+  if (!native) {
+    fallbackAiSettings = { ...fallbackAiSettings, blockAlertsEnabled: enabled };
+    return fallbackAiSettings;
+  }
+  try {
+    fallbackAiSettings = normalizeAiSettings(await native.setAiBlockAlerts(enabled));
+  } catch {
+    fallbackAiSettings = { ...fallbackAiSettings, blockAlertsEnabled: enabled };
+  }
+  return fallbackAiSettings;
+}
+
+export async function setAiWatchedApps(watchedApps: string[]): Promise<AiSettings> {
+  if (!native) {
+    fallbackAiSettings = { ...fallbackAiSettings, monitoredAppPackages: watchedApps };
+    return fallbackAiSettings;
+  }
+  try {
+    fallbackAiSettings = normalizeAiSettings(await native.setAiWatchedApps(watchedApps));
+  } catch {
+    fallbackAiSettings = { ...fallbackAiSettings, monitoredAppPackages: watchedApps };
+  }
+  return fallbackAiSettings;
 }
 
 export function isAccessibilityEnabled(): Promise<boolean> {

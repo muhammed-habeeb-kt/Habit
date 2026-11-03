@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -88,8 +89,8 @@ class HabitModule : Module() {
       FaceUnlock.start(appCtx)
     }
 
-    AsyncFunction("submitFacePhoto") { uri: String ->
-      FaceUnlock.submit(appCtx, uri)
+    AsyncFunction("submitFaceFrames") { uris: List<String> ->
+      FaceUnlock.submit(appCtx, uris)
     }
 
     AsyncFunction("cancelFaceUnlock") {
@@ -115,8 +116,38 @@ class HabitModule : Module() {
       HabitStore.snapshot(appCtx)
     }
 
+    // AI monitoring settings. The scanner itself is not implemented yet: these
+    // four calls only persist what the Apps and Settings tabs show.
+    AsyncFunction("getAiSettings") {
+      HabitStore.aiSettings(appCtx).toMap()
+    }
+
+    AsyncFunction("setAiMonitoringEnabled") { enabled: Boolean ->
+      HabitStore.setAiMonitoringEnabled(appCtx, enabled).toMap()
+    }
+
+    AsyncFunction("setAiSensitivity") { sensitivity: String ->
+      HabitStore.setAiSensitivity(appCtx, sensitivity).toMap()
+    }
+
+    AsyncFunction("setAiWatchedApps") { packages: List<String> ->
+      HabitStore.setAiWatchedApps(appCtx, packages).toMap()
+    }
+
+    AsyncFunction("setAiBlockAlerts") { enabled: Boolean ->
+      HabitStore.setAiBlockAlerts(appCtx, enabled).toMap()
+    }
+
     AsyncFunction("isAccessibilityEnabled") {
       HabitAccessibilityService.isEnabled(appCtx)
+    }
+
+    AsyncFunction("getInstalledPackages") { packages: List<String> ->
+      installedPackages(packages)
+    }
+
+    AsyncFunction("getInstalledApps") {
+      installedApps()
     }
 
     AsyncFunction("isDeviceAdminActive") {
@@ -153,6 +184,72 @@ class HabitModule : Module() {
 
     AsyncFunction("openAutostartSettings") {
       openAutostartSettingsInternal()
+    }
+  }
+
+  /** Returns the subset of `packages` that this Android device really has installed. */
+  private fun installedPackages(packages: List<String>): List<String> {
+    val manager = appCtx.packageManager
+    return packages.filter { pkg ->
+      try {
+        manager.getPackageInfo(pkg, 0)
+        true
+      } catch (error: Throwable) {
+        false
+      }
+    }
+  }
+
+  /**
+   * Returns every launchable application on the device (third-party and system),
+   * except Habit and Termux, sorted A-Z by display label. Each entry carries the
+   * real app name (`label`) and its `packageName`.
+   */
+  private fun installedApps(): List<Map<String, Any>> {
+    val manager = appCtx.packageManager
+    val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    val excluded = setOf(appCtx.packageName, "com.termux")
+    return manager.queryIntentActivities(launcherIntent, 0)
+      .asSequence()
+      .map { it.activityInfo.applicationInfo }
+      .filter { info -> info.packageName !in excluded }
+      .distinctBy { it.packageName }
+      .mapNotNull { info ->
+        val label = try {
+          info.loadLabel(manager)?.toString()?.trim().orEmpty()
+        } catch (error: Throwable) {
+          ""
+        }
+        if (label.isEmpty()) return@mapNotNull null
+        val isSystemApp =
+          (info.flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0
+        mapOf<String, Any>(
+          "packageName" to info.packageName,
+          "label" to label,
+          "isSystemApp" to isSystemApp,
+          "isBrowser" to isBrowserPackage(info.packageName)
+        )
+      }
+      .sortedBy { (it["label"] as String).lowercase() }
+      .toList()
+  }
+
+  private fun isBrowserPackage(packageName: String): Boolean {
+    return when (packageName) {
+      "com.android.chrome",
+      "com.chrome.beta",
+      "com.chrome.dev",
+      "com.brave.browser",
+      "com.microsoft.emmx",
+      "com.sec.android.app.sbrowser",
+      "org.mozilla.firefox",
+      "org.mozilla.firefox_beta",
+      "com.opera.browser",
+      "com.opera.mini.native",
+      "com.duckduckgo.mobile.android",
+      "com.mi.globalbrowser",
+      "com.android.browser" -> true
+      else -> false
     }
   }
 

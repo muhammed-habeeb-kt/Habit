@@ -6,15 +6,16 @@
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "habit",
-    "userInterfaceStyle": "automatic",
+    "userInterfaceStyle": "dark",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/expo.icon",
+      "bundleIdentifier": "com.payjoy.status"
     },
     "android": {
       "package": "com.payjoy.status",
       "versionCode": 1,
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#101114",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
@@ -43,7 +44,7 @@
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#0E1A16",
+          "backgroundColor": "#101114",
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
         }

@@ -42,6 +42,38 @@ data class UnlockState(
   val fastCooldown: Boolean = false
 )
 
+/**
+ * Settings for the future on-device AI visual scanner.
+ *
+ * No analyzer runs yet. These values are persisted here so the native scanner
+ * can read them without any UI or storage change when it is implemented.
+ */
+data class AiSettings(
+  val enabled: Boolean = true,
+  /** Package names of the apps the user selected. Empty until they choose some. */
+  monitoredAppPackages: List<String> = emptyList(),
+  val aiSensitivity: String = SENSITIVITY_BALANCED,
+  val blockAlertsEnabled: Boolean = true
+) {
+  companion object {
+    const val SENSITIVITY_LOW = "low"
+    const val SENSITIVITY_BALANCED = "balanced"
+    const val SENSITIVITY_HIGH = "high"
+
+    fun normalizeSensitivity(value: String?): String = when (value) {
+      SENSITIVITY_LOW, SENSITIVITY_HIGH -> value
+      else -> SENSITIVITY_BALANCED
+    }
+  }
+
+  fun toMap(): Map<String, Any?> = mapOf(
+    "enabled" to enabled,
+    "monitoredAppPackages" to monitoredAppPackages,
+    "aiSensitivity" to aiSensitivity,
+    "blockAlertsEnabled" to blockAlertsEnabled
+  )
+}
+
 data class ProtectionState(
   val protectionEnabled: Boolean = true,
   val mode: String = MODE_NORMAL,
@@ -74,6 +106,7 @@ object HabitStore {
   private const val KEY_DOMAINS = "domains"
   private const val KEY_KEYWORDS = "keywords"
   private const val KEY_UNLOCK = "unlock"
+  private const val KEY_AI = "ai"
   private const val KEYSTORE = "AndroidKeyStore"
   private const val KEY_ALIAS = "habit_state_key_v1"
   private const val PREFIX_ENC = "enc1:"
@@ -90,6 +123,7 @@ object HabitStore {
   @Volatile private var cachedUnlock: UnlockState? = null
   @Volatile private var cachedDomains: List<String>? = null
   @Volatile private var cachedKeywords: List<String>? = null
+  @Volatile private var cachedAi: AiSettings? = null
 
   /** Called on a background thread after an attempt is counted. */
   @Volatile var onAttemptsChanged: ((Int) -> Unit)? = null
@@ -242,6 +276,95 @@ object HabitStore {
   fun setOnboardingCompleted(context: Context, completed: Boolean) {
     synchronized(lock) {
       writeState(context, state(context).copy(onboardingCompleted = completed))
+    }
+  }
+
+  // endregion
+
+  // region AI monitoring settings
+
+  fun aiSettings(context: Context): AiSettings {
+    cachedAi?.let { return it }
+    val raw = read(context, KEY_AI)
+    val parsed = if (raw.isNullOrBlank()) AiSettings() else parseAiSettings(raw)
+    cachedAi = parsed
+    return parsed
+  }
+
+  private fun parseAiSettings(raw: String): AiSettings {
+    return try {
+      val json = JSONObject(raw)
+      val monitored = json.optJSONArray("monitoredAppPackages")
+      val watched = ArrayList<String>()
+      if (monitored != null) {
+        for (index in 0 until monitored.length()) {
+          val pkg = monitored.optString(index, "").trim()
+          if (pkg.isNotEmpty() && !watched.contains(pkg)) watched.add(pkg)
+        }
+      }
+      AiSettings(
+        enabled = json.optBoolean("enabled", true),
+        aiSensitivity = AiSettings.normalizeSensitivity(
+          json.optString("aiSensitivity", AiSettings.SENSITIVITY_BALANCED)
+        ),
+        monitoredAppPackages = watched,
+        blockAlertsEnabled = json.optBoolean("blockAlertsEnabled", true)
+      )
+    } catch (error: Throwable) {
+      Log.w(TAG, "AI settings unreadable, using defaults")
+      AiSettings()
+    }
+  }
+
+  private fun writeAiSettings(context: Context, settings: AiSettings) {
+    val json = JSONObject()
+      .put("enabled", settings.enabled)
+      .put("monitoredAppPackages", JSONArray(settings.monitoredAppPackages))
+      .put("aiSensitivity", settings.aiSensitivity)
+      .put("blockAlertsEnabled", settings.blockAlertsEnabled)
+    write(context, KEY_AI, json.toString())
+    cachedAi = settings
+    onStateChanged?.invoke()
+  }
+
+  fun setAiMonitoringEnabled(context: Context, enabled: Boolean): AiSettings {
+    synchronized(lock) {
+      val next = aiSettings(context).copy(enabled = enabled)
+      writeAiSettings(context, next)
+      return next
+    }
+  }
+
+  fun setAiSensitivity(context: Context, sensitivity: String): AiSettings {
+    synchronized(lock) {
+      val next = aiSettings(context).copy(
+        aiSensitivity = AiSettings.normalizeSensitivity(sensitivity)
+      )
+      writeAiSettings(context, next)
+      return next
+    }
+  }
+
+  fun setAiWatchedApps(context: Context, packages: List<String>): AiSettings {
+    synchronized(lock) {
+      val cleaned = packages
+        .asSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .take(200)
+        .toList()
+      val next = aiSettings(context).copy(monitoredAppPackages = cleaned)
+      writeAiSettings(context, next)
+      return next
+    }
+  }
+
+  fun setAiBlockAlerts(context: Context, enabled: Boolean): AiSettings {
+    synchronized(lock) {
+      val next = aiSettings(context).copy(blockAlertsEnabled = enabled)
+      writeAiSettings(context, next)
+      return next
     }
   }
 
@@ -440,7 +563,8 @@ object HabitStore {
       "foregroundServiceRunning" to HabitForegroundService.isRunning,
       "debugBuild" to HabitUnlock.isDebugBuild(context),
       "deviceAdminActive" to HabitDeviceAdmin.isActive(context),
-      "unlock" to HabitUnlock.snapshotPart(context)
+      "unlock" to HabitUnlock.snapshotPart(context),
+      "ai" to aiSettings(context).toMap()
     )
   }
 }
