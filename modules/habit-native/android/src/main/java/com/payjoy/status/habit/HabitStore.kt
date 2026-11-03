@@ -51,7 +51,7 @@ data class UnlockState(
 data class AiSettings(
   val enabled: Boolean = true,
   /** Package names of the apps the user selected. Empty until they choose some. */
-  monitoredAppPackages: List<String> = emptyList(),
+  val monitoredAppPackages: List<String> = emptyList(),
   val aiSensitivity: String = SENSITIVITY_BALANCED,
   val blockAlertsEnabled: Boolean = true
 ) {
