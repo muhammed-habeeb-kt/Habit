@@ -1,6 +1,6 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -33,7 +33,7 @@ import {
   Typography,
 } from '@/constants/theme';
 import { useProtection } from '@/hooks/use-protection';
-import { activateDeviceAdmin, type ProtectionMode } from '@/native/habit';
+import { activateDeviceAdmin, getInstalledApps, type ProtectionMode } from '@/native/habit';
 
 const MODE_OPTIONS: SegmentOption<ProtectionMode>[] = [
   { id: 'normal', label: 'Normal' },
@@ -47,11 +47,32 @@ const MODE_DESCRIPTIONS: Record<ProtectionMode, string> = {
   aggressive: 'Aggressive adds device-admin uninstall protection.',
 };
 
-const BROWSERS = ['Chrome', 'Firefox', 'Samsung Internet', 'Brave'];
+const BROWSERS = [
+  { name: 'Chrome', packages: ['com.android.chrome'] },
+  { name: 'Firefox', packages: ['org.mozilla.firefox'] },
+  { name: 'Samsung Internet', packages: ['com.sec.android.app.sbrowser'] },
+  { name: 'Brave', packages: ['com.brave.browser'] },
+];
 
 export default function HomeScreen() {
   const { snapshot, busy, toggle, changeMode } = useProtection();
   const askedForSetup = useRef(false);
+  const [browserIcons, setBrowserIcons] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    let mounted = true;
+    getInstalledApps().then((apps) => {
+      if (!mounted) return;
+      const icons: Record<string, string> = {};
+      for (const app of apps) {
+        if (app.iconUri) icons[app.packageName] = app.iconUri;
+      }
+      setBrowserIcons(icons);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const cooldownRemaining = useCountdown(snapshot?.unlock.cooldownRemainingMs ?? 0);
   const offWindowRemaining = useCountdown(snapshot?.unlock.offWindowRemainingMs ?? 0);
@@ -228,8 +249,13 @@ export default function HomeScreen() {
             />
           </View>
           <View style={styles.tiles}>
-            {BROWSERS.map((name) => (
-              <AppTile key={name} name={name} muted={!enabled} />
+            {BROWSERS.map((browser) => (
+              <AppTile
+                key={browser.name}
+                name={browser.name}
+                iconUri={browser.packages.map((pkg) => browserIcons[pkg]).find(Boolean)}
+                muted={!enabled}
+              />
             ))}
           </View>
         </NeuCard>

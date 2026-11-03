@@ -20,7 +20,12 @@ import {
 } from '@/components/neumorphic';
 import { Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
 import { useProtection } from '@/hooks/use-protection';
-import { canQueryInstalledPackages, getInstalledPackages } from '@/native/habit';
+import {
+  canListInstalledApps,
+  canQueryInstalledPackages,
+  getInstalledApps,
+  getInstalledPackages,
+} from '@/native/habit';
 
 type BrowserInfo = {
   name: string;
@@ -42,6 +47,7 @@ const BROWSERS: BrowserInfo[] = [
 export default function BrowserBlockingScreen() {
   const { snapshot, busy, toggle } = useProtection();
   const [installed, setInstalled] = useState<string[] | null>(null);
+  const [icons, setIcons] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (!canQueryInstalledPackages) return;
@@ -51,6 +57,16 @@ export default function BrowserBlockingScreen() {
       getInstalledPackages(packages).then((installedPackages) => {
         if (mounted) setInstalled(installedPackages);
       });
+      if (canListInstalledApps) {
+        getInstalledApps().then((apps) => {
+          if (!mounted) return;
+          const next: Record<string, string> = {};
+          for (const app of apps) {
+            if (app.iconUri) next[app.packageName] = app.iconUri;
+          }
+          setIcons(next);
+        });
+      }
     };
     refresh();
     // A browser may have been installed while Habit was in the background.
@@ -142,7 +158,11 @@ export default function BrowserBlockingScreen() {
                   key={browser.packageNames[0]}
                   padded={false}
                   style={[styles.row, knownMissing && styles.rowMuted]}>
-                  <AppTile name={browser.name} muted={knownMissing} />
+                  <AppTile
+                    name={browser.name}
+                    iconUri={browser.packageNames.map((pkg) => icons[pkg]).find(Boolean)}
+                    muted={knownMissing}
+                  />
                   <Text style={styles.rowTitle}>{browser.name}</Text>
                   <StatusPill label={label} tone={tone} dot={dot} />
                 </NeuCard>

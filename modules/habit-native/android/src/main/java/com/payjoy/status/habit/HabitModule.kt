@@ -6,10 +6,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
+import java.io.File
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import expo.modules.kotlin.modules.Module
@@ -227,11 +230,41 @@ class HabitModule : Module() {
           "packageName" to info.packageName,
           "label" to label,
           "isSystemApp" to isSystemApp,
-          "isBrowser" to isBrowserPackage(info.packageName)
+          "isBrowser" to isBrowserPackage(info.packageName),
+          "iconUri" to cachedIconUri(manager, info)
         )
       }
       .sortedBy { (it["label"] as String).lowercase() }
       .toList()
+  }
+
+  /**
+   * Renders the app's real launcher icon into a 96x96 PNG under
+   * `cacheDir/app_icons` and returns a `file://` URI for it ("" if it fails).
+   * The file is rewritten when the app's APK changes, so updates show the new icon.
+   */
+  private fun cachedIconUri(manager: PackageManager, info: ApplicationInfo): String {
+    val dir = File(appCtx.cacheDir, ICON_DIR)
+    val file = File(dir, "${info.packageName}.png")
+    return try {
+      val apkStamp = File(info.sourceDir).lastModified()
+      if (!file.exists() || file.lastModified() < apkStamp) {
+        dir.mkdirs()
+        val drawable = manager.getApplicationIcon(info)
+        val bitmap = Bitmap.createBitmap(ICON_SIZE, ICON_SIZE, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        drawable.setBounds(0, 0, ICON_SIZE, ICON_SIZE)
+        drawable.draw(canvas)
+        file.outputStream().use { output ->
+          bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+        }
+        bitmap.recycle()
+      }
+      Uri.fromFile(file).toString()
+    } catch (error: Throwable) {
+      Log.w(TAG, "Could not cache icon for ${info.packageName}: ${error.message}")
+      ""
+    }
   }
 
   private fun isBrowserPackage(packageName: String): Boolean {
@@ -382,5 +415,7 @@ class HabitModule : Module() {
   companion object {
     private const val TAG = "HabitModule"
     private const val NOTIFICATION_REQUEST_CODE = 4211
+    private const val ICON_DIR = "app_icons"
+    private const val ICON_SIZE = 96
   }
 }

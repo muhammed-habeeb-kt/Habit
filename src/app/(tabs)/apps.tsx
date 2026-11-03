@@ -219,7 +219,7 @@ function AppRow({ app, selected, onPress }: AppRowProps) {
         selected && styles.rowSelected,
         pressed && styles.pressed,
       ]}>
-      <AppTile name={app.label} selected={selected} />
+      <AppTile name={app.label} iconUri={app.iconUri} selected={selected} />
       <View style={styles.grow}>
         <Text style={styles.rowTitle} numberOfLines={1}>
           {app.label}

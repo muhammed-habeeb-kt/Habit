@@ -67,6 +67,8 @@ export type InstalledApp = {
   label: string;
   isSystemApp: boolean;
   isBrowser: boolean;
+  /** `file://` path to the cached launcher icon; empty when Android had no icon. */
+  iconUri?: string;
 };
 
 const DEFAULT_AI_SETTINGS: AiSettings = {
@@ -281,6 +283,7 @@ export async function getInstalledApps(): Promise<InstalledApp[]> {
         label: app.label,
         isSystemApp: app.isSystemApp === true,
         isBrowser: app.isBrowser === true,
+        iconUri: typeof app.iconUri === 'string' && app.iconUri.length > 0 ? app.iconUri : undefined,
       }))
       .sort((a, b) => a.label.localeCompare(b.label));
   } catch {

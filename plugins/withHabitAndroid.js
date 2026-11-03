@@ -45,7 +45,9 @@ const PERMISSIONS = [
 
 const ACCESSIBILITY_PERMISSION = 'android.permission.BIND_ACCESSIBILITY_SERVICE';
 
-const ACCESSIBILITY_XML = `<?xml version="1.0" encoding="utf-8"?>
+// `settingsActivity` must point at the generated launcher activity, whose package
+// comes from `expo.android.package` — never at the internal Kotlin package.
+const accessibilityXml = (applicationPackage) => `<?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
@@ -53,7 +55,7 @@ const ACCESSIBILITY_XML = `<?xml version="1.0" encoding="utf-8"?>
     android:canRetrieveWindowContent="true"
     android:description="@string/habit_accessibility_description"
     android:notificationTimeout="100"
-    android:settingsActivity="com.payjoy.status.MainActivity" />
+    android:settingsActivity="${applicationPackage}.MainActivity" />
 `;
 
 // No policies at all: the admin exists only so Android confirms before Habit is removed.
@@ -250,8 +252,12 @@ const withHabitResources = (config) =>
         'res',
         'xml'
       );
+      const applicationPackage = config.android?.package || 'com.habit.guardian';
       fs.mkdirSync(resXml, { recursive: true });
-      fs.writeFileSync(path.join(resXml, 'habit_accessibility_service.xml'), ACCESSIBILITY_XML);
+      fs.writeFileSync(
+        path.join(resXml, 'habit_accessibility_service.xml'),
+        accessibilityXml(applicationPackage)
+      );
       fs.writeFileSync(path.join(resXml, 'habit_device_admin.xml'), DEVICE_ADMIN_XML);
       return config;
     },

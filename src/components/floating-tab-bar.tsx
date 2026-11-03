@@ -3,7 +3,7 @@ import type { BottomTabBarProps } from 'expo-router/build/react-navigation/botto
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { FontNames, Palette, Radii } from '@/constants/theme';
+import { FontNames, Palette, Radii, Space } from '@/constants/theme';
 
 type TabVisual = {
   label: string;
@@ -62,7 +62,9 @@ export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarP
                   size={20}
                   color={focused ? Palette.amber : Palette.textSecondary}
                 />
-                <Text style={[styles.label, focused && styles.labelActive]}>{visual.label}</Text>
+                <Text style={[styles.label, focused && styles.labelActive]} numberOfLines={1}>
+                  {visual.label}
+                </Text>
                 {focused && <View style={styles.glowDot} />}
               </View>
             </Pressable>
@@ -76,8 +78,9 @@ export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarP
 const styles = StyleSheet.create({
   frame: {
     position: 'absolute',
-    left: Radii.tile,
-    right: Radii.tile,
+    // Slightly wider than the 14dp tile inset so the "Settings" label never clips.
+    left: Space.sm,
+    right: Space.sm,
     borderRadius: 24,
     boxShadow: '0px 12px 32px rgba(0, 0, 0, 0.55)',
   },
@@ -121,7 +124,7 @@ const styles = StyleSheet.create({
     gap: 6,
     minWidth: 96,
     height: 44,
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     borderRadius: Radii.pill,
   },
   pillActive: {

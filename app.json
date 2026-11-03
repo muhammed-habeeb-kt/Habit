@@ -12,7 +12,7 @@
       "bundleIdentifier": "com.payjoy.status"
     },
     "android": {
-      "package": "com.payjoy.status",
+      "package": "com.habit.guardian",
       "versionCode": 1,
       "adaptiveIcon": {
         "backgroundColor": "#101114",
