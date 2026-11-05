@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-01 (Part 5: Soft Black & Amber design system, 3-tab shell, AI monitoring UI + storage)_
+_Last updated: 2026-11-05 (Part 6: live offline ML Kit face + blink detection for unlock method C)_
 
 ## Product
 
@@ -92,13 +92,17 @@ Part 3:
   device admin every 15 s, warns loudly when either is missing, and keeps a 15-minute backstop
   alarm armed.
 
-Part 4:
+Part 4 / 6:
 
-- `FaceUnlock` — unlock method C. Native session: start → first face photo → wait ≥ 3 s →
-  second face photo. Uses Android's built-in offline `FaceDetector`; images are decoded  in memory, counted, and recycled; the camera's temporary capture file is deleted right
-  after counting, so no photo is kept. Missing faces count as failed attempts and respect
-  the same rate limit as method A. Success calls `HabitUnlock.completeFaceUnlock`, which
-  opens a fixed 30-minute OFF window and restores the previous mode afterwards.
+- `FaceUnlock` — unlock method C session: start → live frames → complete. It only owns the
+  session; detection lives in `HabitModule.analyzeFaceFrame`. `completeFaceUnlock` is
+  refused without an active, unexpired session, then calls `HabitUnlock.completeFaceUnlock`
+  to open a fixed 30-minute OFF window that restores the previous mode afterwards.
+- `HabitModule.analyzeFaceFrame` — offline ML Kit face detection
+  (`com.google.mlkit:face-detection`, model bundled in the APK): fast mode, all landmarks,
+  eye-open classification. Returns `faceDetected`, `eyesOpen`, `eyesClosed`,
+  `leftEyeProb`, `rightEyeProb` and a normalized geometric + colour `faceSignature`. The
+  frame is downscaled, measured, recycled and its temporary file deleted, so no photo is kept.
 
 ## Mode state machine (native)
 
@@ -162,15 +166,19 @@ Part 4:
 
 **C — two face checks**
 
-- Started from the Unlock screen (“Start face check”) and enforced natively: a session must
-  be started, each photo must contain at least one face, and the second photo must be taken
-  at least 3 seconds after the first.
-- Uses `expo-camera` (front camera) and `android.media.FaceDetector`; fully offline, no ML
-  service. Each capture is deleted immediately after the face count, so no photo is kept.
-- Honest limit: Habit verifies that **two separate face photos** were taken, not the identity
-  of the people. It cannot tell whether the same person stepped in twice.
-- Failure to read a photo counts as a failed attempt (same 1/5/15-minute rate limit as A), so
-  the method can never permanently lock you out — A and B stay available.
+- Started from the Unlock screen and enforced natively: a session must be started, and
+  `completeFaceUnlock` is refused without an active, unexpired session.
+- The screen captures a silent low-res frame every ~450 ms
+  (`quality: 0.25, skipProcessing: true, shutterSound: false`) and sends its URI to
+  `analyzeFaceFrame`, which runs the bundled offline ML Kit detector. No network, no ML
+  service; each frame is deleted right after analysis.
+- Person 1 must be seen with open eyes and then blink (“Face detected! Now blink slowly...”).
+  A 2-second “Pass the phone to Person 2” pause follows, then Person 2 must blink too and
+  their normalized face signature must differ from Person 1's, otherwise the screen shows
+  “Same face detected — a second person must verify” and nothing is unlocked.
+- Honest limit: Habit verifies two live, blinking, visually different faces — not the
+  identity of the people. It cannot say *who* they are.
+- Rate limiting still applies to starting a check; A and B stay available.
 - Camera permission is requested on first use; recording audio and barcode scanning are
   disabled in the camera config.
 
@@ -251,6 +259,8 @@ are needed — no screen, bridge or storage change.
 - [x] Part 5 — design system “C10 Soft Black & Amber”: fonts, theme tokens, neumorphic kit,
   floating 3-tab navigation, Home/Apps/Settings screens, AI monitoring UI + native settings
   storage, block overlay source badges.
+- [x] Part 6 — unlock method C with real offline ML Kit face + blink detection, live frame
+  loop, two-person signature check.
 - [ ] AI visual scanner engine (model, capture loop, classification) — deliberately pending.
 
 ## Build & run (Termux, no PC)
@@ -270,6 +280,12 @@ npm run lint                             # eslint
 
 Part 4 added a native dependency (`expo-camera`), so the development APK has to be rebuilt
 once before the face unlock screen can work.
+
+Part 6 added the bundled offline ML Kit face detector
+(`com.google.mlkit:face-detection:16.1.7` in `modules/habit-native/android/build.gradle`)
+and the `analyzeFaceFrame` / `completeFaceUnlock` bridge calls, so the development APK must
+be rebuilt again before face detection works. On an older APK the face screen explains that
+the build cannot check faces yet instead of opening a camera that detects nothing.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,
@@ -303,13 +319,14 @@ from `app.json` + `plugins/withHabitAndroid.js`.
     red Home banner; mode stays Aggressive.
 14. In Aggressive, turn accessibility off → warning notification + banner; turn it back on →
     warnings disappear.
-15. Method C: allow camera → take the first photo → step 2 appears; wait ~3 s, take the
-    second photo → protection turns off for 30 minutes; Home shows the OFF countdown card;
-    after the window the previous mode returns automatically (or tap “Turn on now”).
-16. Method C with no face in frame → “No face found”, attempt counted, second step not
-    reached.
-17. Method C leaving the screen mid-way and reopening starts a fresh session (the old one is
-    cancelled).
+15. Method C: allow camera → Person 1 is asked into the circle, then blinks → "Person 1
+    verified" and a 2-second "Pass the phone to Person 2" pause → Person 2 blinks →
+    protection turns off for 30 minutes; Home shows the OFF countdown card; after the window
+    the previous mode returns automatically (or tap “Turn on now”).
+16. Method C with no face in frame → "Position Person 1's face inside the circle", nothing
+    is verified and step 2 is not reached.
+17. Method C where the same person blinks twice → "Same face detected — a second person must
+    verify" and no unlock; leaving the screen mid-way cancels the session.
 
 ## Decisions
 

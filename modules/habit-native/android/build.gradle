@@ -14,3 +14,9 @@ android {
     versionName '1.0.0'
   }
 }
+
+dependencies {
+  // Offline ML Kit face detection. The model ships inside the APK, so the two-person
+  // face check keeps working with no network and sends no image anywhere.
+  implementation("com.google.mlkit:face-detection:16.1.7")
+}

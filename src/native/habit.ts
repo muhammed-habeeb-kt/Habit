@@ -51,11 +51,19 @@ export type ChallengeResult = {
   failuresToday: number;
 };
 
-export type FaceCheckResult = {
-  status: 'first' | 'unlocked' | 'retry' | 'error';
-  faces: number;
-  stage: number;
-  message: string;
+/** One analyzed camera frame from the offline ML Kit face detector. */
+export type FaceFrameAnalysis = {
+  /** A face was found in the frame. */
+  faceDetected: boolean;
+  /** Both eye-open probabilities are high. */
+  eyesOpen: boolean;
+  /** At least one eye is below the blink threshold (mid-blink). */
+  eyesClosed: boolean;
+  /** -1 when ML Kit could not classify the eyes. */
+  leftEyeProb: number;
+  rightEyeProb: number;
+  /** Normalized geometric + colour signature, comparable between frames. */
+  faceSignature: number[];
 };
 
 export type AiSensitivity = 'low' | 'balanced' | 'high';
@@ -106,7 +114,8 @@ type HabitNativeModule = {
     typed: string
   ): Promise<ChallengeResult | null>;
   startFaceUnlock(): Promise<boolean>;
-  submitFaceFrames(uris: string[]): Promise<FaceCheckResult | null>;
+  analyzeFaceFrame(imagePath: string): Promise<FaceFrameAnalysis | null>;
+  completeFaceUnlock(): Promise<boolean>;
   cancelFaceUnlock(): Promise<boolean>;
   setFastCooldown(enabled: boolean): Promise<boolean>;
   debugExitStrict(): Promise<HabitSnapshot>;
@@ -154,6 +163,14 @@ export const canQueryInstalledPackages =
  */
 export const canListInstalledApps =
   native != null && typeof native.getInstalledApps === 'function';
+
+/**
+ * False on an older development APK whose native module predates the ML Kit frame
+ * analyzer. The face screen then explains the build is out of date instead of opening a
+ * camera that can never detect anything.
+ */
+export const canAnalyzeFaceFrames =
+  native != null && typeof native.analyzeFaceFrame === 'function';
 
 /** Fail closed: without native state, protection is treated as ON. */
 const FALLBACK_UNLOCK: UnlockInfo = {
@@ -275,11 +292,20 @@ export function startFaceUnlock(): Promise<boolean> {
 }
 
 /**
- * Verifies one blink burst. The native side enforces the two-person order, deletes the
- * captures and returns `first`, `unlocked`, `retry` or `error`.
+ * Analyzes one silent camera frame with the on-device ML Kit detector. The native side
+ * deletes the temporary capture before resolving, so no image is ever kept.
  */
-export function submitFaceFrames(uris: string[]): Promise<FaceCheckResult | null> {
-  return safeCall(() => native!.submitFaceFrames(uris), null);
+export function analyzeFaceFrame(imagePath: string): Promise<FaceFrameAnalysis | null> {
+  if (!native || !canAnalyzeFaceFrames) return Promise.resolve(null);
+  return safeCall(() => native!.analyzeFaceFrame(imagePath), null);
+}
+
+/**
+ * Ends a verified two-face check and starts the 30-minute OFF window. Refused natively
+ * without an active check started by `startFaceUnlock`.
+ */
+export function completeFaceUnlock(): Promise<boolean> {
+  return safeCall(() => native!.completeFaceUnlock(), false);
 }
 
 export function cancelFaceUnlock(): Promise<boolean> {

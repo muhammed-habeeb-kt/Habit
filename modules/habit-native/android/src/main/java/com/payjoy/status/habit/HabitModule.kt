@@ -7,14 +7,26 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Rect
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.Face
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetector
+import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.face.FaceLandmark
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 
@@ -25,6 +37,9 @@ import expo.modules.kotlin.modules.ModuleDefinition
 class HabitModule : Module() {
   private val appCtx: Context
     get() = requireNotNull(appContext.reactContext) { "React context is unavailable" }
+
+  /** One reused offline detector; closed in OnDestroy. */
+  @Volatile private var mlkitDetector: FaceDetector? = null
 
   override fun definition() = ModuleDefinition {
     Name("HabitNative")
@@ -54,6 +69,8 @@ class HabitModule : Module() {
     OnDestroy {
       HabitStore.onAttemptsChanged = null
       HabitStore.onStateChanged = null
+      mlkitDetector?.close()
+      mlkitDetector = null
     }
 
     AsyncFunction("getSnapshot") {
@@ -92,8 +109,16 @@ class HabitModule : Module() {
       FaceUnlock.start(appCtx)
     }
 
-    AsyncFunction("submitFaceFrames") { uris: List<String> ->
-      FaceUnlock.submit(appCtx, uris)
+    // One live camera frame for the two-person check. Offline ML Kit reports whether a
+    // face is present, whether the eyes are open or mid-blink, and a normalized
+    // geometric + colour signature the screen compares between Person 1 and Person 2.
+    AsyncFunction("analyzeFaceFrame") { imagePath: String ->
+      analyzeFaceFrame(imagePath)
+    }
+
+    // Called once both people have blinked and differ; starts the 30-minute OFF window.
+    AsyncFunction("completeFaceUnlock") {
+      FaceUnlock.complete(appCtx)
     }
 
     AsyncFunction("cancelFaceUnlock") {
@@ -294,6 +319,244 @@ class HabitModule : Module() {
     }
   }
 
+  // region face frame analysis (unlock method C)
+
+  /**
+   * Analyzes one silent camera frame with the bundled offline ML Kit face detector.
+   *
+   * Returns whether a face is in the frame, whether its eyes are open or mid-blink, and a
+   * normalized signature so the screen can tell Person 1 and Person 2 apart.
+   *
+   * The temporary capture is deleted before this returns, whatever the outcome, and the
+   * decoded bitmaps are recycled: no image is kept, logged or sent anywhere.
+   */
+  private fun analyzeFaceFrame(imagePath: String): Map<String, Any?> {
+    val uri = parseFrameUri(imagePath)
+    var decoded: Bitmap? = null
+    var upright: Bitmap? = null
+    try {
+      if (uri == null) return noFaceResult()
+      val frame = decodeFrame(uri) ?: return noFaceResult()
+      decoded = frame
+      // expo-camera stores the JPEG unrotated, so follow its EXIF orientation first.
+      val uprightFrame = rotateToUpright(uri, frame)
+      upright = uprightFrame
+
+      val face = detectFaces(uprightFrame)
+        .maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+        ?: return noFaceResult()
+
+      val left = face.leftEyeOpenProbability ?: -1f
+      val right = face.rightEyeOpenProbability ?: -1f
+      val eyesOpen = left >= EYES_OPEN_THRESHOLD && right >= EYES_OPEN_THRESHOLD
+      val eyesClosed =
+        (left >= 0f && left < EYES_CLOSED_THRESHOLD) ||
+          (right >= 0f && right < EYES_CLOSED_THRESHOLD)
+
+      return mapOf(
+        "faceDetected" to true,
+        "eyesOpen" to eyesOpen,
+        "eyesClosed" to eyesClosed,
+        "leftEyeProb" to left.toDouble(),
+        "rightEyeProb" to right.toDouble(),
+        "faceSignature" to buildFaceSignature(uprightFrame, face)
+      )
+    } catch (error: Throwable) {
+      Log.w(TAG, "Face frame analysis failed: ${error.message}")
+      return noFaceResult()
+    } finally {
+      if (upright != null && upright !== decoded) upright.recycle()
+      decoded?.recycle()
+      deleteFrame(uri)
+    }
+  }
+
+  private fun noFaceResult(): Map<String, Any?> = mapOf(
+    "faceDetected" to false,
+    "eyesOpen" to false,
+    "eyesClosed" to false,
+    "leftEyeProb" to -1.0,
+    "rightEyeProb" to -1.0,
+    "faceSignature" to emptyList<Double>()
+  )
+
+  /** Lazily builds the single reused detector: fast, landmarks on, eye probs on. */
+  private fun detector(): FaceDetector {
+    mlkitDetector?.let { return it }
+    synchronized(this) {
+      mlkitDetector?.let { return it }
+      val options = FaceDetectorOptions.Builder()
+        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+        .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+        .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+        .setMinFaceSize(0.15f)
+        .build()
+      return FaceDetection.getClient(options).also { mlkitDetector = it }
+    }
+  }
+
+  /** Runs ML Kit on a background thread and waits briefly for the result. */
+  private fun detectFaces(bitmap: Bitmap): List<Face> {
+    val latch = CountDownLatch(1)
+    var faces: List<Face> = emptyList()
+    var failure: Throwable? = null
+    try {
+      detector().process(InputImage.fromBitmap(bitmap, 0))
+        .addOnSuccessListener { result -> faces = result }
+        .addOnFailureListener { error -> failure = error }
+        .addOnCompleteListener { latch.countDown() }
+    } catch (error: Throwable) {
+      Log.w(TAG, "Face detection could not start: ${error.message}")
+      return emptyList()
+    }
+    if (!latch.await(FACE_DETECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+      Log.w(TAG, "Face detection timed out")
+      return emptyList()
+    }
+    failure?.let { Log.w(TAG, "Face detection failed: ${it.message}") }
+    return faces
+  }
+
+  /**
+   * Normalized geometric + colour signature: landmark positions relative to the face box
+   * plus a coarse, mean-centred colour grid of the same box. Comparing two signatures
+   * separates two people without ever keeping a photo.
+   */
+  private fun buildFaceSignature(bitmap: Bitmap, face: Face): List<Double> {
+    val box = face.boundingBox
+    val width = maxOf(1, box.width()).toDouble()
+    val height = maxOf(1, box.height()).toDouble()
+    val signature = ArrayList<Double>(FACE_LANDMARKS.size * 2 + FACE_GRID * FACE_GRID * 3)
+    for (type in FACE_LANDMARKS) {
+      val point = face.getLandmark(type)?.position
+      val x = point?.x ?: box.exactCenterX()
+      val y = point?.y ?: box.exactCenterY()
+      signature.add(((x - box.left) / width).toDouble())
+      signature.add(((y - box.top) / height).toDouble())
+    }
+    signature.addAll(colorGrid(bitmap, box))
+    return signature
+  }
+
+  private fun colorGrid(bitmap: Bitmap, box: Rect): List<Double> {
+    val cells = DoubleArray(FACE_GRID * FACE_GRID * 3)
+    val left = box.left.coerceIn(0, bitmap.width - 1)
+    val top = box.top.coerceIn(0, bitmap.height - 1)
+    val right = box.right.coerceIn(left + 1, bitmap.width)
+    val bottom = box.bottom.coerceIn(top + 1, bitmap.height)
+    val width = right - left
+    val height = bottom - top
+    val pixels = try {
+      IntArray(width * height).also { bitmap.getPixels(it, 0, width, left, top, width, height) }
+    } catch (error: Throwable) {
+      return cells.toList()
+    }
+
+    val counts = IntArray(FACE_GRID * FACE_GRID)
+    for (y in 0 until height) {
+      val row = (y * FACE_GRID / height).coerceIn(0, FACE_GRID - 1)
+      for (x in 0 until width) {
+        val column = (x * FACE_GRID / width).coerceIn(0, FACE_GRID - 1)
+        val cell = row * FACE_GRID + column
+        val pixel = pixels[y * width + x]
+        cells[cell * 3] += ((pixel shr 16) and 0xFF) / 255.0
+        cells[cell * 3 + 1] += ((pixel shr 8) and 0xFF) / 255.0
+        cells[cell * 3 + 2] += (pixel and 0xFF) / 255.0
+        counts[cell]++
+      }
+    }
+    for (cell in counts.indices) {
+      val count = counts[cell]
+      if (count <= 0) continue
+      cells[cell * 3] /= count
+      cells[cell * 3 + 1] /= count
+      cells[cell * 3 + 2] /= count
+    }
+    // Mean-centring makes the signature ignore exposure and white balance.
+    val average = cells.average()
+    for (index in cells.indices) cells[index] -= average
+    return cells.toList()
+  }
+
+  private fun parseFrameUri(path: String): Uri? {
+    if (path.isBlank()) return null
+    return try {
+      if (path.startsWith("file:") || path.startsWith("content:")) Uri.parse(path)
+      else Uri.fromFile(File(path))
+    } catch (error: Throwable) {
+      null
+    }
+  }
+
+  /** Decodes a downscaled frame; the full-resolution photo is never held in memory. */
+  private fun decodeFrame(uri: Uri): Bitmap? {
+    return try {
+      val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+      appCtx.contentResolver.openInputStream(uri)?.use { stream ->
+        BitmapFactory.decodeStream(stream, null, bounds)
+      }
+      if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+      var sample = 1
+      while (bounds.outWidth / (sample * 2) >= FACE_FRAME_WIDTH && sample < 8) sample *= 2
+      val options = BitmapFactory.Options().apply {
+        inSampleSize = sample
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+      }
+      appCtx.contentResolver.openInputStream(uri)?.use { stream ->
+        BitmapFactory.decodeStream(stream, null, options)
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "Could not decode face frame: ${error.message}")
+      null
+    }
+  }
+
+  /** Applies the capture's EXIF rotation so ML Kit sees an upright face. */
+  private fun rotateToUpright(uri: Uri, bitmap: Bitmap): Bitmap {
+    val degrees = try {
+      val orientation = when (uri.scheme) {
+        "file" -> uri.path?.let { path ->
+          ExifInterface(path).getAttributeInt(EXIF_ORIENTATION, EXIF_NORMAL)
+        }
+        else -> appCtx.contentResolver.openInputStream(uri)?.use { stream ->
+          ExifInterface(stream).getAttributeInt(EXIF_ORIENTATION, EXIF_NORMAL)
+        }
+      }
+      when (orientation) {
+        ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+        ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+        ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+        else -> 0f
+      }
+    } catch (error: Throwable) {
+      0f
+    }
+    if (degrees == 0f) return bitmap
+    return try {
+      val matrix = Matrix().apply { postRotate(degrees) }
+      Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    } catch (error: Throwable) {
+      Log.w(TAG, "Could not rotate face frame: ${error.message}")
+      bitmap
+    }
+  }
+
+  /** Deletes the temporary capture right after analysis, whatever it was. */
+  private fun deleteFrame(uri: Uri?) {
+    if (uri == null) return
+    try {
+      when (uri.scheme) {
+        "content" -> appCtx.contentResolver.delete(uri, null, null)
+        "file" -> uri.path?.let { path -> File(path).delete() }
+        else -> Unit
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "Could not remove face frame: ${error.message}")
+    }
+  }
+
+  // endregion
+
   private fun requestDeviceAdmin(): Boolean {
     if (HabitDeviceAdmin.isActive(appCtx)) return true
     val activity = appContext.currentActivity ?: return false
@@ -425,5 +688,30 @@ class HabitModule : Module() {
     private const val NOTIFICATION_REQUEST_CODE = 4211
     private const val ICON_DIR = "app_icons"
     private const val ICON_SIZE = 96
+    /** Frames are downscaled to this width before face detection. */
+    private const val FACE_FRAME_WIDTH = 640
+    /** Both eye probabilities above this count as open eyes. */
+    private const val EYES_OPEN_THRESHOLD = 0.6f
+    /** Either eye probability below this counts as a blink. */
+    private const val EYES_CLOSED_THRESHOLD = 0.4f
+    /** Face-signature colour grid resolution. */
+    private const val FACE_GRID = 4
+    private const val FACE_DETECT_TIMEOUT_SECONDS = 5L
+    private val EXIF_ORIENTATION = ExifInterface.TAG_ORIENTATION
+    private val EXIF_NORMAL = ExifInterface.ORIENTATION_NORMAL
+
+    /** Landmarks that describe face shape: stable for a person, different between people. */
+    private val FACE_LANDMARKS = intArrayOf(
+      FaceLandmark.LEFT_EYE,
+      FaceLandmark.RIGHT_EYE,
+      FaceLandmark.NOSE_BASE,
+      FaceLandmark.MOUTH_LEFT,
+      FaceLandmark.MOUTH_RIGHT,
+      FaceLandmark.MOUTH_BOTTOM,
+      FaceLandmark.LEFT_EAR,
+      FaceLandmark.RIGHT_EAR,
+      FaceLandmark.LEFT_CHEEK,
+      FaceLandmark.RIGHT_CHEEK
+    )
   }
 }

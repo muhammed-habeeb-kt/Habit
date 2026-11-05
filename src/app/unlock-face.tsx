@@ -1,7 +1,7 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions, type CameraType } from 'expo-camera';
 import { router } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { Circle } from 'react-native-svg';
@@ -16,29 +16,50 @@ import {
 } from '@/components/neumorphic';
 import { FontNames, Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
 import { useProtection } from '@/hooks/use-protection';
-import { cancelFaceUnlock, startFaceUnlock, submitFaceFrames } from '@/native/habit';
+import {
+  analyzeFaceFrame,
+  canAnalyzeFaceFrames,
+  cancelFaceUnlock,
+  completeFaceUnlock,
+  startFaceUnlock,
+  type FaceFrameAnalysis,
+} from '@/native/habit';
 
 /**
  * Unlock method C — two-person face check.
  *
- * Person 1 blinks, hands the phone over, then Person 2 blinks. The native engine counts
- * faces in each captured frame, checks the eye band changed (a blink) and that Person 2's
- * face signature differs from Person 1's. Success starts the 30-minute OFF window.
+ * The camera streams silent low-res frames every ~450 ms. Each one is analyzed natively
+ * by the bundled offline ML Kit detector, which reports the face, the eye-open
+ * probabilities (blinks) and a normalized signature. Person 1 blinks, the phone is handed
+ * over, then Person 2 must show a *different* signature and blink too. Success calls
+ * `completeFaceUnlock()`, which starts the 30-minute OFF window.
  *
- * 100% on-device: frames are sampled in memory and deleted; nothing is saved or sent.
+ * 100% on-device: frames are downscaled, measured and deleted; nothing is saved or sent.
  */
-type Stage = 'person1_scanning' | 'person1_verified' | 'person2_scanning' | 'both_verified';
+type Stage = 'person1_scanning' | 'handover' | 'person2_scanning' | 'both_verified';
 type PersonState = 'VERIFYING' | 'VERIFIED' | 'WAITING';
 
-const BURST_FRAMES = 8;
-const BURST_GAP_MS = 180;
+const FRAME_INTERVAL_MS = 450;
 const HANDOVER_MS = 2_000;
 const FACE_OFF_WINDOW_MS = 30 * 60 * 1000;
+/** Mean absolute signature difference below this is treated as the same person. */
+const SAME_FACE_THRESHOLD = 0.05;
 const VIEWPORT = 240;
 const CAMERA_SIZE = VIEWPORT - 32;
 
 function wait(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/** Mean absolute difference between two normalized face signatures (0 = identical). */
+function signatureDistance(first: number[], second: number[]): number {
+  const size = Math.min(first.length, second.length);
+  if (size === 0) return 1;
+  let total = 0;
+  for (let index = 0; index < size; index++) {
+    total += Math.abs((first[index] ?? 0) - (second[index] ?? 0));
+  }
+  return total / size;
 }
 
 function PersonCard({
@@ -66,10 +87,19 @@ function PersonCard({
         active && styles.personCardActive,
         state === 'WAITING' && styles.personCardIdle,
       ]}>
-      <MaterialCommunityIcons name={icon} size={22} color={color} />
+      <View style={[styles.personIcon, active && styles.personIconActive]}>
+        <MaterialCommunityIcons name={icon} size={18} color={color} />
+      </View>
       <View style={styles.personText}>
-        <Text style={styles.personName}>Person {index}</Text>
-        <Text style={[styles.personState, { color }]}>{state}</Text>
+        <Text style={styles.personName} numberOfLines={1} maxFontSizeMultiplier={1.15}>
+          Person {index}
+        </Text>
+        <Text
+          style={[styles.personState, { color }]}
+          numberOfLines={1}
+          maxFontSizeMultiplier={1.15}>
+          {state}
+        </Text>
       </View>
     </View>
   );
@@ -80,106 +110,204 @@ export default function FaceUnlockScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const cameraRef = useRef<CameraView | null>(null);
   const mounted = useRef(true);
-  const busyRef = useRef(false);
-  const handoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const analyzing = useRef(false);
+  const verifying = useRef(false);
+  const stageRef = useRef<Stage>('person1_scanning');
+  /** Blink state: a blink is open → closed, or closed → open, never a single frame. */
+  const seenOpen = useRef(false);
+  const seenClosed = useRef(false);
+  const firstSignature = useRef<number[]>([]);
 
   const [stage, setStage] = useState<Stage>('person1_scanning');
   const [facing, setFacing] = useState<CameraType>('front');
   const [started, setStarted] = useState(false);
   const [ready, setReady] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [hint, setHint] = useState('Looking for a blink...');
+  const [sameFaceWarning, setSameFaceWarning] = useState(false);
+  const [hint, setHint] = useState(
+    canAnalyzeFaceFrames
+      ? "Position Person 1's face inside the circle"
+      : 'This build cannot check faces yet — install the updated APK.'
+  );
+
+  const cameraGranted = permission?.granted === true;
+  const scanning =
+    started && ready && cameraGranted && stage !== 'handover' && stage !== 'both_verified';
 
   const offWindowMs = snapshot?.unlock.offWindowActive
     ? snapshot.unlock.offWindowRemainingMs
     : FACE_OFF_WINDOW_MS;
   const autoLock = useCountdown(stage === 'both_verified' ? offWindowMs : 0);
 
+  const setPhase = useCallback((next: Stage) => {
+    stageRef.current = next;
+    setStage(next);
+  }, []);
+
   useEffect(() => {
     mounted.current = true;
-    startFaceUnlock().then((ok) => {
-      if (!mounted.current) return;
-      setStarted(ok);
-      if (!ok) {
-        setHint(
-          'Face unlock is unavailable right now — too many failed attempts, or protection is already off.'
-        );
-      }
-    });
+    if (canAnalyzeFaceFrames) {
+      startFaceUnlock().then((ok) => {
+        if (!mounted.current) return;
+        setStarted(ok);
+        if (!ok) {
+          setHint(
+            'Face unlock is unavailable right now — too many failed attempts, or protection is already off.'
+          );
+        }
+      });
+    }
     return () => {
       mounted.current = false;
-      if (handoverTimer.current) clearTimeout(handoverTimer.current);
       void cancelFaceUnlock();
     };
   }, []);
 
-  const runCheck = async () => {
-    if (busyRef.current || !started) return;
-    const camera = cameraRef.current;
-    if (!camera) {
-      setHint('The camera is not ready yet.');
-      return;
-    }
+  const verify = useCallback(
+    async (frame: FaceFrameAnalysis) => {
+      if (verifying.current) return;
+      const current = stageRef.current;
+      if (current !== 'person1_scanning' && current !== 'person2_scanning') return;
+      verifying.current = true;
+      try {
+        const signature = frame.faceSignature ?? [];
 
-    busyRef.current = true;
-    setBusy(true);
-    setHint('Looking for a blink...');
-    try {
-      const frames: string[] = [];
-      for (let index = 0; index < BURST_FRAMES; index++) {
+        if (current === 'person1_scanning') {
+          firstSignature.current = signature;
+          seenOpen.current = false;
+          seenClosed.current = false;
+          setSameFaceWarning(false);
+          setPhase('handover');
+          setHint('Person 1 verified. Pass the phone to Person 2');
+          return;
+        }
+
+        // Person 2 must be a different face, otherwise one person could step in twice.
+        const first = firstSignature.current;
+        if (
+          first.length > 0 &&
+          signature.length > 0 &&
+          signatureDistance(first, signature) < SAME_FACE_THRESHOLD
+        ) {
+          seenOpen.current = false;
+          seenClosed.current = false;
+          setSameFaceWarning(true);
+          setHint('Same face detected — a second person must verify');
+          return;
+        }
+
+        const unlocked = await completeFaceUnlock();
         if (!mounted.current) return;
+        if (!unlocked) {
+          setHint('The face check expired. Start a new one from Unlock Protection.');
+          return;
+        }
+        await refresh();
+        if (!mounted.current) return;
+        setSameFaceWarning(false);
+        setPhase('both_verified');
+        setHint('Two faces verified');
+      } finally {
+        verifying.current = false;
+      }
+    },
+    [refresh, setPhase]
+  );
+
+  /** Feeds one analyzed frame into the two-step blink state machine. */
+  const handleFrame = useCallback(
+    (frame: FaceFrameAnalysis) => {
+      if (!mounted.current) return;
+      const person = stageRef.current === 'person2_scanning' ? 2 : 1;
+
+      if (!frame.faceDetected) {
+        seenOpen.current = false;
+        seenClosed.current = false;
+        setHint(`Position Person ${person}'s face inside the circle`);
+        return;
+      }
+
+      if (frame.eyesOpen) {
+        // Closed → open: the blink just finished.
+        if (seenClosed.current) {
+          void verify(frame);
+          return;
+        }
+        seenOpen.current = true;
+        setHint('Face detected! Now blink slowly...');
+        return;
+      }
+
+      if (frame.eyesClosed) {
+        // Open → closed: a blink starts here, so a slow blink is enough.
+        if (seenOpen.current) {
+          void verify(frame);
+          return;
+        }
+        seenClosed.current = true;
+      }
+    },
+    [verify]
+  );
+
+  // Sample a silent low-res frame every ~450 ms while a person is being scanned.
+  useEffect(() => {
+    if (!scanning) return;
+    let cancelled = false;
+
+    const capture = async () => {
+      const camera = cameraRef.current;
+      if (!camera || analyzing.current) return;
+      analyzing.current = true;
+      try {
         const photo = await camera.takePictureAsync({
-          quality: 0.35,
+          quality: 0.25,
+          skipProcessing: true,
           shutterSound: false,
         });
-        if (photo?.uri) frames.push(photo.uri);
-        if (index < BURST_FRAMES - 1) await wait(BURST_GAP_MS);
+        if (!photo?.uri || cancelled || !mounted.current) return;
+        const frame = await analyzeFaceFrame(photo.uri);
+        if (!cancelled && mounted.current && frame) handleFrame(frame);
+      } catch {
+        if (!cancelled && mounted.current) {
+          setHint('The camera missed a frame. Hold the phone still.');
+        }
+      } finally {
+        analyzing.current = false;
       }
+    };
+
+    const loop = async () => {
+      while (!cancelled) {
+        await capture();
+        await wait(FRAME_INTERVAL_MS);
+      }
+    };
+    void loop();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [facing, handleFrame, scanning]);
+
+  // Two seconds to hand the phone over before Person 2 is scanned.
+  useEffect(() => {
+    if (stage !== 'handover') return;
+    const timer = setTimeout(() => {
       if (!mounted.current) return;
-      if (frames.length === 0) {
-        setHint('The camera did not return a frame. Try again.');
-        return;
-      }
-
-      const result = await submitFaceFrames(frames);
-      if (!mounted.current) return;
-      if (!result) {
-        setHint('The face check is unavailable in this build. Try again.');
-        return;
-      }
-
-      setHint(result.message);
-      if (result.status === 'first') {
-        setStage('person1_verified');
-        return;
-      }
-      if (result.status === 'unlocked') {
-        await refresh();
-        if (mounted.current) setStage('both_verified');
-      }
-    } catch {
-      if (mounted.current) setHint('Could not use the camera. Try again.');
-    } finally {
-      busyRef.current = false;
-      if (mounted.current) setBusy(false);
-    }
-  };
-
-  const handOver = () => {
-    setStage('person2_scanning');
-    setHint('Looking for a blink...');
-    if (handoverTimer.current) clearTimeout(handoverTimer.current);
-    handoverTimer.current = setTimeout(() => {
-      void runCheck();
+      seenOpen.current = false;
+      seenClosed.current = false;
+      setPhase('person2_scanning');
+      setHint("Position Person 2's face inside the circle");
     }, HANDOVER_MS);
-  };
+    return () => clearTimeout(timer);
+  }, [setPhase, stage]);
 
   const flipCamera = () => {
     setReady(false);
     setFacing((current) => (current === 'front' ? 'back' : 'front'));
   };
 
-  const step = stage === 'person1_scanning' || stage === 'person1_verified' ? 1 : 2;
+  const step = stage === 'person1_scanning' ? 1 : 2;
   const person1State: PersonState = stage === 'person1_scanning' ? 'VERIFYING' : 'VERIFIED';
   const person2State: PersonState =
     stage === 'both_verified'
@@ -187,10 +315,13 @@ export default function FaceUnlockScreen() {
       : stage === 'person2_scanning'
         ? 'VERIFYING'
         : 'WAITING';
-  const cameraGranted = permission?.granted === true;
-  const canScan = started && ready && cameraGranted && !busy;
-  const handoff = stage === 'person1_verified';
-  const blinkLabel = busy ? 'Checking…' : handoff ? 'Pass to Person 2' : 'Blink slowly';
+  const handoff = stage === 'handover';
+  const statusLabel = handoff ? 'Pass to Person 2' : 'Blink slowly';
+  const statusIcon: keyof typeof MaterialCommunityIcons.glyphMap = sameFaceWarning
+    ? 'account-alert-outline'
+    : handoff
+      ? 'account-arrow-right-outline'
+      : 'eye-outline';
 
   if (stage === 'both_verified') {
     return (
@@ -252,23 +383,18 @@ export default function FaceUnlockScreen() {
             <PersonCard
               index={1}
               state={person1State}
-              active={stage === 'person1_scanning' && !handoff}
+              active={stage === 'person1_scanning'}
             />
             <PersonCard index={2} state={person2State} active={stage === 'person2_scanning'} />
           </View>
 
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={handoff ? 'Pass the phone to Person 2' : 'Start blink check'}
-            disabled={!canScan}
-            onPress={() => (handoff ? handOver() : runCheck())}
-            style={({ pressed }) => [styles.viewport, pressed && styles.viewportPressed]}>
+          <View style={styles.viewport}>
             <Svg width={VIEWPORT} height={VIEWPORT} style={StyleSheet.absoluteFill}>
               <Circle
                 cx={VIEWPORT / 2}
                 cy={VIEWPORT / 2}
                 r={VIEWPORT / 2 - 2}
-                stroke={Palette.amber}
+                stroke={sameFaceWarning ? Palette.danger : Palette.amber}
                 strokeWidth={2}
                 strokeDasharray="12 11"
                 strokeLinecap="round"
@@ -276,7 +402,7 @@ export default function FaceUnlockScreen() {
               />
             </Svg>
 
-            <View style={[styles.cameraClip, busy && styles.cameraBusy]}>
+            <View style={styles.cameraClip}>
               {cameraGranted ? (
                 <CameraView
                   ref={cameraRef}
@@ -301,31 +427,17 @@ export default function FaceUnlockScreen() {
               )}
             </View>
 
-            {busy && (
-              <View style={styles.scanOverlay} pointerEvents="none">
-                <ActivityIndicator color={Palette.amber} />
-              </View>
-            )}
-
-            <Text pointerEvents="none" style={styles.liveLabel}>
-              LIVE CAMERA
-            </Text>
-          </Pressable>
+            <View pointerEvents="none" style={styles.livePill}>
+              <View style={[styles.liveDot, scanning && styles.liveDotActive]} />
+              <Text style={styles.liveLabel}>{scanning ? 'LIVE SCAN' : 'LIVE CAMERA'}</Text>
+            </View>
+          </View>
 
           <View style={styles.prompt}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={blinkLabel}
-              disabled={!canScan}
-              onPress={() => (handoff ? handOver() : runCheck())}
-              style={({ pressed }) => [
-                styles.blinkPill,
-                pressed && styles.blinkPillPressed,
-                !canScan && !handoff && styles.blinkPillDisabled,
-              ]}>
-              <MaterialCommunityIcons name="eye-outline" size={18} color={Palette.textPrimary} />
-              <Text style={styles.blinkLabel}>{blinkLabel}</Text>
-            </Pressable>
+            <View style={[styles.blinkPill, sameFaceWarning && styles.blinkPillWarning]}>
+              <MaterialCommunityIcons name={statusIcon} size={18} color={Palette.textPrimary} />
+              <Text style={styles.blinkLabel}>{statusLabel}</Text>
+            </View>
             <Text style={styles.blinkHint}>{hint}</Text>
           </View>
 
@@ -404,33 +516,47 @@ const styles = StyleSheet.create({
   },
   peopleRow: {
     flexDirection: 'row',
-    gap: Space.gutter,
+    gap: Space.sm,
   },
   personCard: {
     flex: 1,
+    minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: Space.sm,
+    gap: 8,
     borderRadius: Radii.control,
     backgroundColor: Palette.raised,
     boxShadow: Shadows.raisedSmall,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
   },
   personCardActive: {
     backgroundColor: Palette.amberHighlight,
     boxShadow: `inset 0px 0px 0px 1px ${Palette.amber}, ${Shadows.raisedSmall}`,
   },
   personCardIdle: { opacity: 0.6 },
-  personText: { flex: 1, gap: 1 },
+  personIcon: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: Palette.well,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  personIconActive: { backgroundColor: Palette.canvas },
+  personText: { flex: 1, minWidth: 0, gap: 2 },
   personName: {
-    ...Typography.bodyMd,
     fontFamily: FontNames.interSemiBold,
+    fontSize: 13,
+    lineHeight: 17,
     color: Palette.textPrimary,
   },
   personState: {
     ...Typography.monoLabelSm,
-    letterSpacing: 0.6,
+    fontSize: 9,
+    lineHeight: 12,
+    letterSpacing: 0.4,
   },
   viewport: {
     width: VIEWPORT,
@@ -439,7 +565,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  viewportPressed: { opacity: 0.85 },
   cameraClip: {
     width: CAMERA_SIZE,
     height: CAMERA_SIZE,
@@ -448,31 +573,39 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.well,
     boxShadow: Shadows.sunken,
   },
-  cameraBusy: { opacity: 0.7 },
   cameraIdle: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: Palette.well,
   },
-  scanOverlay: {
+  livePill: {
     position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
+    top: 16,
+    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: Palette.canvas,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: Radii.pill,
+  },
+  liveDot: {
+    width: 5,
+    height: 5,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.textMuted,
+  },
+  liveDotActive: {
+    backgroundColor: Palette.amber,
+    boxShadow: Shadows.amberHalo,
   },
   liveLabel: {
     ...Typography.monoLabelSm,
+    fontSize: 9,
+    lineHeight: 12,
+    letterSpacing: 1,
     color: Palette.amber,
-    position: 'absolute',
-    top: 18,
-    backgroundColor: Palette.canvas,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: Radii.pill,
   },
   prompt: {
     alignItems: 'center',
@@ -488,11 +621,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     paddingVertical: 10,
   },
-  blinkPillPressed: {
-    backgroundColor: Palette.well,
-    boxShadow: Shadows.sunkenSmall,
+  blinkPillWarning: {
+    backgroundColor: Palette.amberHighlight,
+    boxShadow: `inset 0px 0px 0px 1px ${Palette.danger}, ${Shadows.raisedSmall}`,
   },
-  blinkPillDisabled: { opacity: 0.5 },
   blinkLabel: {
     fontFamily: FontNames.interSemiBold,
     fontSize: 15,
