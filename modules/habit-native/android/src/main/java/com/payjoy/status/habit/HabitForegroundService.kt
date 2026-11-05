@@ -14,7 +14,6 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 
 /**
@@ -69,8 +68,10 @@ class HabitForegroundService : Service() {
   private fun startAsForeground() {
     val notification = buildNotification()
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-      ServiceCompat.startForeground(
-        this,
+      // Platform API (added in API 29): the typed overload from androidx.core was the only
+      // call that stopped resolving once ML Kit joined the module's classpath, so use the
+      // framework method directly. The API 34 guard keeps this safe on older devices.
+      startForeground(
         NOTIFICATION_ID,
         notification,
         ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
