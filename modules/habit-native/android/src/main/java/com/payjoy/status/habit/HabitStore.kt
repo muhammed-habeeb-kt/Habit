@@ -77,17 +77,36 @@ data class AiSettings(
 data class ProtectionState(
   val protectionEnabled: Boolean = true,
   val mode: String = MODE_NORMAL,
-  val onboardingCompleted: Boolean = false
+  val onboardingCompleted: Boolean = false,
+  /** Character challenge length chosen before Strict/Aggressive was turned on. */
+  val configuredChallengeLength: Int = DEFAULT_CHALLENGE_LENGTH,
+  /** Wait-it-out duration in minutes, always between 180 and 1440. */
+  val configuredCooldownMinutes: Int = DEFAULT_COOLDOWN_MINUTES
 ) {
   companion object {
     const val MODE_NORMAL = "normal"
     const val MODE_STRICT = "strict"
     const val MODE_AGGRESSIVE = "aggressive"
 
+    const val DEFAULT_CHALLENGE_LENGTH = 200
+    const val DEFAULT_COOLDOWN_MINUTES = 180
+    const val MIN_COOLDOWN_MINUTES = 180
+    const val MAX_COOLDOWN_MINUTES = 1440
+
+    val CHALLENGE_LENGTHS = intArrayOf(100, 200, 300)
+
     fun normalizeMode(value: String?): String = when (value) {
       MODE_STRICT, MODE_AGGRESSIVE -> value
       else -> MODE_NORMAL
     }
+
+    /** Only 100, 200 or 300 are valid; anything else falls back to 200. */
+    fun normalizeChallengeLength(value: Int): Int =
+      if (CHALLENGE_LENGTHS.contains(value)) value else DEFAULT_CHALLENGE_LENGTH
+
+    /** The timer can never be shorter than 3 hours or longer than 24 hours. */
+    fun normalizeCooldownMinutes(value: Int): Int =
+      value.coerceIn(MIN_COOLDOWN_MINUTES, MAX_COOLDOWN_MINUTES)
   }
 }
 
@@ -241,7 +260,19 @@ object HabitStore {
       ProtectionState(
         protectionEnabled = json.optBoolean("protectionEnabled", true),
         mode = ProtectionState.normalizeMode(json.optString("mode", ProtectionState.MODE_NORMAL)),
-        onboardingCompleted = json.optBoolean("onboardingCompleted", false)
+        onboardingCompleted = json.optBoolean("onboardingCompleted", false),
+        configuredChallengeLength = ProtectionState.normalizeChallengeLength(
+          json.optInt(
+            "configuredChallengeLength",
+            ProtectionState.DEFAULT_CHALLENGE_LENGTH
+          )
+        ),
+        configuredCooldownMinutes = ProtectionState.normalizeCooldownMinutes(
+          json.optInt(
+            "configuredCooldownMinutes",
+            ProtectionState.DEFAULT_COOLDOWN_MINUTES
+          )
+        )
       )
     } catch (error: Throwable) {
       Log.w(TAG, "State unreadable, failing closed")
@@ -256,6 +287,8 @@ object HabitStore {
       .put("protectionEnabled", state.protectionEnabled)
       .put("mode", state.mode)
       .put("onboardingCompleted", state.onboardingCompleted)
+      .put("configuredChallengeLength", state.configuredChallengeLength)
+      .put("configuredCooldownMinutes", state.configuredCooldownMinutes)
     write(context, KEY_STATE, json.toString())
     cachedState = state
     onStateChanged?.invoke()
@@ -276,6 +309,25 @@ object HabitStore {
   fun setOnboardingCompleted(context: Context, completed: Boolean) {
     synchronized(lock) {
       writeState(context, state(context).copy(onboardingCompleted = completed))
+    }
+  }
+
+  /**
+   * Saves the two limits chosen in the "Configure Protection Lock" sheet. Values are
+   * normalized here too, so JS can never persist a weaker setup by accident.
+   */
+  fun setProtectionConfig(
+    context: Context,
+    challengeLength: Int,
+    cooldownMinutes: Int
+  ): ProtectionState {
+    synchronized(lock) {
+      val next = state(context).copy(
+        configuredChallengeLength = ProtectionState.normalizeChallengeLength(challengeLength),
+        configuredCooldownMinutes = ProtectionState.normalizeCooldownMinutes(cooldownMinutes)
+      )
+      writeState(context, next)
+      return next
     }
   }
 
@@ -558,6 +610,8 @@ object HabitStore {
       "protectionEnabled" to state.protectionEnabled,
       "mode" to state.mode,
       "onboardingCompleted" to state.onboardingCompleted,
+      "configuredChallengeLength" to state.configuredChallengeLength,
+      "configuredCooldownMinutes" to state.configuredCooldownMinutes,
       "attemptsToday" to attemptsToday(context),
       "accessibilityEnabled" to HabitAccessibilityService.isEnabled(context),
       "foregroundServiceRunning" to HabitForegroundService.isRunning,

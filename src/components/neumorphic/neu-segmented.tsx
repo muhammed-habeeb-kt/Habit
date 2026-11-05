@@ -29,9 +29,20 @@ export function NeuSegmented<T extends string>({ options, value, onChange }: Pro
             accessibilityState={{ selected: active }}
             onPress={() => onChange(option.id)}
             style={[styles.segment, active && styles.segmentActive]}>
-            <Text style={[styles.label, active && styles.labelActive]}>{option.label}</Text>
+            {/* Capped font scaling keeps "Aggressive" on one line on large-font phones. */}
+            <Text
+              numberOfLines={1}
+              maxFontSizeMultiplier={1.15}
+              style={[styles.label, active && styles.labelActive]}>
+              {option.label}
+            </Text>
             {option.hint ? (
-              <Text style={[styles.hint, active && styles.hintActive]}>{option.hint}</Text>
+              <Text
+                numberOfLines={1}
+                maxFontSizeMultiplier={1.15}
+                style={[styles.hint, active && styles.hintActive]}>
+                {option.hint}
+              </Text>
             ) : null}
           </Pressable>
         );
@@ -48,11 +59,14 @@ const styles = StyleSheet.create({
     borderRadius: Radii.well,
     backgroundColor: Palette.well,
     boxShadow: Shadows.sunken,
-    gap: 4,
+    gap: 2,
   },
   trackTall: { height: 64 },
   segment: {
     flex: 1,
+    minWidth: 0,
+    // No horizontal padding: the segment width is the label's whole budget.
+    paddingHorizontal: 0,
     borderRadius: 16,
     alignItems: 'center',
     justifyContent: 'center',
@@ -64,8 +78,11 @@ const styles = StyleSheet.create({
   },
   label: {
     fontFamily: FontNames.interMedium,
-    fontSize: 13,
-    lineHeight: 18,
+    fontSize: 12,
+    lineHeight: 16,
+    letterSpacing: 0,
+    textAlign: 'center',
+    width: '100%',
     color: Palette.textSecondary,
   },
   labelActive: {

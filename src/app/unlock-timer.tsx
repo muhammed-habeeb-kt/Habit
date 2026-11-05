@@ -27,8 +27,29 @@ const ARC_RADIUS = 103;
 const ARC_CIRCUMFERENCE = 2 * Math.PI * ARC_RADIUS;
 
 const FAST_COOLDOWN_MS = 60_000;
-const STANDARD_COOLDOWN_MS = 3 * 60 * 60 * 1000;
 const OFF_WINDOW_MS = 10 * 60 * 1000;
+
+/** "5 hours 30 min" for body copy. */
+function formatLongDuration(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  const hourLabel = `${hours} ${hours === 1 ? 'hour' : 'hours'}`;
+  return mins === 0 ? hourLabel : `${hourLabel} ${mins} min`;
+}
+
+/** "5h 30m" for tight labels such as the pipeline steps. */
+function formatShortDuration(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return mins === 0 ? `${hours}h` : `${hours}h ${mins}m`;
+}
+
+/** "24-hour" / "5h 30m" for the start button: "Start 24-hour wait". */
+function formatWaitAdjective(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return mins === 0 ? `${hours}-hour` : `${hours}h ${mins}m`;
+}
 
 type StepStatus = 'done' | 'active' | 'todo';
 
@@ -70,14 +91,21 @@ export default function UnlockTimerScreen() {
   const waiting = !offWindow && unlock.cooldownActive;
 
   const fastCooldown = unlock.fastCooldown && snapshot.debugBuild;
-  const cooldownTotalMs =
-    unlock.cooldownTotalMs > 0
+  // The wait is whatever the user configured before turning protection on (3h..24h).
+  const configuredMinutes = snapshot.configuredCooldownMinutes ?? 180;
+  const cooldownText = formatLongDuration(configuredMinutes);
+  const cooldownShort = formatShortDuration(configuredMinutes);
+  // A running cooldown keeps its own duration; otherwise the dial starts at the configured
+  // wait. The debug switch always wins so the dial matches its "1 minute" labels.
+  const cooldownTotalMs = fastCooldown
+    ? FAST_COOLDOWN_MS
+    : unlock.cooldownTotalMs > 0
       ? unlock.cooldownTotalMs
-      : fastCooldown
-        ? FAST_COOLDOWN_MS
-        : STANDARD_COOLDOWN_MS;
-  const cooldownLabel = fastCooldown ? '1 minute' : '3 hours';
-  const waitLabel = fastCooldown ? '1-minute wait' : '3-hour wait';
+      : configuredMinutes * 60_000;
+  const cooldownLabel = fastCooldown ? '1 minute' : cooldownText;
+  const waitLabel = fastCooldown
+    ? '1-minute wait'
+    : `${formatWaitAdjective(configuredMinutes)} wait`;
 
   const displayRemaining = offWindow
     ? offWindowRemaining
@@ -102,12 +130,12 @@ export default function UnlockTimerScreen() {
 
   const steps: PipelineStep[] = offWindow
     ? [
-        { index: 1, caption: 'Waited 3h', status: 'done' },
+        { index: 1, caption: `Waited ${cooldownShort}`, status: 'done' },
         { index: 2, caption: 'Off 10m window', status: 'active' },
         { index: 3, caption: 'Back on', status: 'todo' },
       ]
     : [
-        { index: 1, caption: 'Wait 3 hours', status: 'active' },
+        { index: 1, caption: `Wait ${cooldownShort}`, status: 'active' },
         { index: 2, caption: 'Off 10m window', status: 'todo' },
         { index: 3, caption: 'Back on', status: 'todo' },
       ];
@@ -351,7 +379,7 @@ export default function UnlockTimerScreen() {
                 <View style={styles.debugText}>
                   <Text style={styles.debugTitle}>Short cooldown</Text>
                   <Text style={styles.statusBody}>
-                    Make the cooldown about 1 minute instead of 3 hours.
+                    {`Make the cooldown about 1 minute instead of ${cooldownText}.`}
                   </Text>
                 </View>
                 <NeuSwitch

@@ -21,6 +21,7 @@ import {
   SecondaryRaisedButton,
 } from '@/components/neumorphic';
 import { FontNames, Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
+import { useProtection } from '@/hooks/use-protection';
 import {
   startCharacterChallenge,
   submitCharacterChallenge,
@@ -31,6 +32,11 @@ const SLAB_LENGTHS = [100, 200, 300] as const;
 type SlabLength = (typeof SLAB_LENGTHS)[number];
 
 const TOKEN_LENGTH = 10;
+
+/** The lock always uses the length saved in the Configure Protection Lock sheet. */
+function lockedLength(value: number | undefined): SlabLength {
+  return value === 100 || value === 300 ? value : 200;
+}
 
 type Mistake = {
   wrongChar: string;
@@ -51,7 +57,8 @@ function tokenize(text: string): string[] {
 }
 
 export default function UnlockCodeScreen() {
-  const [length, setLength] = useState<SlabLength>(200);
+  const { snapshot } = useProtection();
+  const configuredLength = lockedLength(snapshot?.configuredChallengeLength);
   const [challenge, setChallenge] = useState<CharacterChallenge | null>(null);
   const [typed, setTyped] = useState('');
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -82,17 +89,10 @@ export default function UnlockCodeScreen() {
   }, []);
 
   useEffect(() => {
-    if (bootstrapped.current) return;
+    if (bootstrapped.current || !snapshot) return;
     bootstrapped.current = true;
-    void beginChallenge(200);
-  }, [beginChallenge]);
-
-  const selectLength = (nextLength: SlabLength) => {
-    if (starting) return;
-    setLength(nextLength);
-    setTyped('');
-    void beginChallenge(nextLength);
-  };
+    void beginChallenge(configuredLength);
+  }, [beginChallenge, configuredLength, snapshot]);
 
   const sendAttempt = useCallback(
     async (value: string, challengeId: string, mismatch?: { wrongChar: string; expectedChar: string }) => {
@@ -175,7 +175,7 @@ export default function UnlockCodeScreen() {
   };
 
   const typedLength = normalize(typed).length;
-  const targetLength = challenge?.length ?? length;
+  const targetLength = challenge?.length ?? configuredLength;
   const percent =
     targetLength > 0 ? Math.round((Math.min(typedLength, targetLength) / targetLength) * 100) : 0;
   const tokens = challenge ? tokenize(challenge.text) : [];
@@ -198,21 +198,23 @@ export default function UnlockCodeScreen() {
             <Text style={styles.headerTitle}>Type to Unlock</Text>
           </View>
 
+          {/* Read-only on purpose: the configured length is locked while protection is on. */}
           <View style={styles.selectorTrack}>
             {SLAB_LENGTHS.map((option) => {
-              const active = option === length;
+              const active = option === configuredLength;
               return (
-                <Pressable
+                <View
                   key={option}
-                  accessibilityRole="button"
-                  accessibilityState={{ selected: active }}
-                  onPress={() => selectLength(option)}
-                  style={({ pressed }) => [
+                  accessibilityState={{ selected: active, disabled: !active }}
+                  style={[
                     styles.selectorCard,
                     active && styles.selectorCardActive,
-                    pressed && styles.pressed,
+                    !active && styles.selectorCardLocked,
                   ]}>
                   <View style={styles.selectorValueRow}>
+                    {active && (
+                      <MaterialCommunityIcons name="lock" size={11} color={Palette.amber} />
+                    )}
                     <Text
                       style={[
                         styles.selectorValue,
@@ -220,7 +222,6 @@ export default function UnlockCodeScreen() {
                       ]}>
                       {option}
                     </Text>
-                    {active && <View style={styles.selectorDot} />}
                   </View>
                   <Text
                     style={[
@@ -229,10 +230,13 @@ export default function UnlockCodeScreen() {
                     ]}>
                     CHARACTERS
                   </Text>
-                </Pressable>
+                </View>
               );
             })}
           </View>
+          <Text style={styles.lockedNote}>
+            Length locked at {configuredLength} characters by your protection setup.
+          </Text>
 
           <NeuCard style={styles.challengeCard}>
             <View style={styles.challengeHeader}>
@@ -274,7 +278,7 @@ export default function UnlockCodeScreen() {
                   <ActivityIndicator color={Palette.amber} />
                 ) : (
                   <Text style={styles.placeholderText}>
-                    Pick a length to generate a new challenge.
+                    Preparing your locked challenge…
                   </Text>
                 )}
               </View>
@@ -460,10 +464,17 @@ const styles = StyleSheet.create({
     borderColor: Palette.amber,
     boxShadow: Shadows.raisedSmall,
   },
+  selectorCardLocked: { opacity: 0.4 },
   selectorValueRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
+  },
+  lockedNote: {
+    ...Typography.bodySm,
+    color: Palette.textMuted,
+    textAlign: 'center',
+    marginTop: -Space.sm,
   },
   selectorValue: {
     fontFamily: FontNames.monoBold,
@@ -472,12 +483,6 @@ const styles = StyleSheet.create({
     color: Palette.textPrimary,
   },
   selectorValueActive: { color: Palette.amber },
-  selectorDot: {
-    width: 4,
-    height: 4,
-    borderRadius: Radii.pill,
-    backgroundColor: Palette.amber,
-  },
   selectorCaption: {
     fontFamily: FontNames.monoRegular,
     fontSize: 8,

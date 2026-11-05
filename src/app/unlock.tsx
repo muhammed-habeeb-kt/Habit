@@ -1,11 +1,13 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useCallback } from 'react';
+import { Animated, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { NeuCard, SecondaryRaisedButton } from '@/components/neumorphic';
 import { FontNames, Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
 import { useProtection } from '@/hooks/use-protection';
+import { useSheetDismiss } from '@/hooks/use-sheet-dismiss';
 
 type IconName = React.ComponentProps<typeof MaterialCommunityIcons>['name'];
 
@@ -21,35 +23,49 @@ type UnlockMethod = {
   href: '/unlock-code' | '/unlock-timer' | '/unlock-face';
 };
 
-const METHODS: UnlockMethod[] = [
-  {
-    key: 'code',
-    title: 'Type the code',
-    tag: 'DELIBERATE',
-    tagTone: 'amber',
-    subtitle: 'Type a long scrambled text: 100, 200 or 300 characters.',
-    icon: 'keyboard-outline',
-    href: '/unlock-code',
-  },
-  {
-    key: 'timer',
-    title: 'Wait it out',
-    tag: '3 HOURS',
-    tagTone: 'neutral',
-    subtitle: 'Protection stays on for 3 hours, then switches off for 10 minutes.',
-    icon: 'clock-outline',
-    href: '/unlock-timer',
-  },
-  {
-    key: 'face',
-    title: 'Two-person face check',
-    tag: 'INSTANT',
-    tagTone: 'success',
-    subtitle: 'Two different people verify their faces. Protection is off for 30 minutes.',
-    icon: 'account-multiple-outline',
-    href: '/unlock-face',
-  },
-];
+/** "3 HOURS" for the tag and "3 hours" for the sentence, from the configured timer. */
+function cooldownLabels(minutes: number): { tag: string; text: string } {
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (mins === 0) {
+    const unit = hours === 1 ? 'hour' : 'hours';
+    return { tag: `${hours} ${unit.toUpperCase()}`, text: `${hours} ${unit}` };
+  }
+  return { tag: `${hours}H ${mins}M`, text: `${hours}h ${mins}m` };
+}
+
+function buildMethods(cooldownMinutes: number, challengeLength: number): UnlockMethod[] {
+  const cooldown = cooldownLabels(cooldownMinutes);
+  return [
+    {
+      key: 'code',
+      title: 'Type the code',
+      tag: 'DELIBERATE',
+      tagTone: 'amber',
+      subtitle: `Type a long scrambled text: ${challengeLength} characters.`,
+      icon: 'keyboard-outline',
+      href: '/unlock-code',
+    },
+    {
+      key: 'timer',
+      title: 'Wait it out',
+      tag: cooldown.tag,
+      tagTone: 'neutral',
+      subtitle: `Protection stays on for ${cooldown.text}, then switches off for 10 minutes.`,
+      icon: 'clock-outline',
+      href: '/unlock-timer',
+    },
+    {
+      key: 'face',
+      title: 'Two-person face check',
+      tag: 'INSTANT',
+      tagTone: 'success',
+      subtitle: 'Two different people verify their faces. Protection is off for 30 minutes.',
+      icon: 'account-multiple-outline',
+      href: '/unlock-face',
+    },
+  ];
+}
 
 const TAG_COLORS: Record<TagTone, { text: string; background: string; border: string }> = {
   amber: {
@@ -117,16 +133,32 @@ function MethodCard({ method }: { method: UnlockMethod }) {
 
 export default function UnlockScreen() {
   const { snapshot } = useProtection();
+  const closeSheet = useCallback(() => router.back(), []);
+  const { panHandlers, animatedStyle, dismiss } = useSheetDismiss(closeSheet);
+
+  const methods = buildMethods(
+    snapshot?.configuredCooldownMinutes ?? 180,
+    snapshot?.configuredChallengeLength ?? 200
+  );
 
   return (
     <View style={styles.backdrop}>
-      <View style={styles.sheet}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Close unlock sheet"
+        onPress={dismiss}
+        style={styles.dismissArea}
+      />
+
+      <Animated.View style={[styles.sheet, animatedStyle]}>
         <SafeAreaView edges={['bottom']} style={styles.sheetSafe}>
+          <View style={styles.sheetHeader} {...panHandlers}>
+            <View style={styles.handle} />
+          </View>
+
           <ScrollView
             contentContainerStyle={styles.content}
             showsVerticalScrollIndicator={false}>
-            <View style={styles.handle} />
-
             <View style={styles.badge}>
               <View style={styles.badgeDot} />
               <Text style={styles.badgeLabel}>{modeLabel(snapshot?.mode)}</Text>
@@ -136,14 +168,14 @@ export default function UnlockScreen() {
             <Text style={styles.subtitle}>Any one method is enough</Text>
 
             <View style={styles.methods}>
-              {METHODS.map((method) => (
+              {methods.map((method) => (
                 <MethodCard key={method.key} method={method} />
               ))}
             </View>
 
             <SecondaryRaisedButton
               label="Stay Protected"
-              onPress={() => router.back()}
+              onPress={closeSheet}
               icon={
                 <MaterialCommunityIcons
                   name="shield-check-outline"
@@ -157,7 +189,7 @@ export default function UnlockScreen() {
             <Text style={styles.footer}>PROTECTION KEEPS RUNNING WHILE YOU DECIDE</Text>
           </ScrollView>
         </SafeAreaView>
-      </View>
+      </Animated.View>
     </View>
   );
 }
@@ -168,27 +200,31 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.scrim,
     justifyContent: 'flex-end',
   },
+  /** Fills the area above the sheet so a backdrop tap always reaches it. */
+  dismissArea: { flex: 1 },
   sheet: {
     width: '100%',
     backgroundColor: Palette.surface,
     borderTopLeftRadius: 32,
     borderTopRightRadius: 32,
-    paddingTop: 12,
     maxHeight: '94%',
   },
   sheetSafe: { flexShrink: 1 },
+  sheetHeader: {
+    paddingTop: 12,
+    paddingBottom: Space.md,
+    alignItems: 'center',
+  },
   content: {
     paddingHorizontal: Space.margin,
     paddingBottom: Space.sm,
     gap: Space.sm,
   },
   handle: {
-    alignSelf: 'center',
     width: 40,
     height: 4,
     borderRadius: Radii.pill,
     backgroundColor: Palette.surfaceHigh,
-    marginBottom: Space.md,
   },
   badge: {
     alignSelf: 'center',

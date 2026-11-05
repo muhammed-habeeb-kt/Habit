@@ -133,6 +133,14 @@ export default function RootLayout() {
           }}
         />
         <Stack.Screen
+          name="configure-protection"
+          options={{
+            presentation: 'transparentModal',
+            animation: 'slide_from_bottom',
+            contentStyle: { backgroundColor: 'transparent' },
+          }}
+        />
+        <Stack.Screen
           name="face-unlock"
           options={{ presentation: 'modal', animation: 'slide_from_bottom' }}
         />

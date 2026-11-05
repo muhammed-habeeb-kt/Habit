@@ -119,6 +119,14 @@ class HabitModule : Module() {
       HabitStore.snapshot(appCtx)
     }
 
+    // Saves the challenge length and wait-it-out duration chosen before Strict or
+    // Aggressive is turned on. The state machine clamps them and only refuses a lower
+    // while protection is actually running.
+    AsyncFunction("configureProtection") { challengeLength: Int, cooldownMinutes: Int ->
+      HabitUnlock.configureProtection(appCtx, challengeLength, cooldownMinutes)
+      HabitStore.snapshot(appCtx)
+    }
+
     // AI monitoring settings. The scanner itself is not implemented yet: these
     // four calls only persist what the Apps and Settings tabs show.
     AsyncFunction("getAiSettings") {

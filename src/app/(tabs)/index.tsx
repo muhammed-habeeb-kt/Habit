@@ -3,7 +3,6 @@ import { router } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   Pressable,
   StyleSheet,
   Text,
@@ -55,7 +54,7 @@ const BROWSERS = [
 ];
 
 export default function HomeScreen() {
-  const { snapshot, busy, toggle, changeMode } = useProtection();
+  const { snapshot, busy, toggle } = useProtection();
   const askedForSetup = useRef(false);
   const [browserIcons, setBrowserIcons] = useState<Record<string, string>>({});
 
@@ -109,25 +108,23 @@ export default function HomeScreen() {
   const handleMode = (id: ProtectionMode) => {
     if (id === snapshot.mode) return;
 
+    // Raising from Normal always configures the lock first: challenge length and the
+    // wait-it-out timer are chosen before Strict/Aggressive can turn on.
+    if (snapshot.mode === 'normal' && (id === 'strict' || id === 'aggressive')) {
+      router.push({ pathname: '/configure-protection', params: { mode: id } });
+      return;
+    }
+
     if (id === 'aggressive') {
       // The bottom sheet explains device admin and requests it when needed.
       router.push('/aggressive');
       return;
     }
 
+    // Lowering Strict/Aggressive needs an unlock (challenge or cooldown).
     if (snapshot.mode !== 'normal') {
       router.push('/unlock');
-      return;
     }
-
-    Alert.alert(
-      'Turn on Strict mode?',
-      'Protection turns on and stays on. To lower it later you must either type a 100, 200 or 300 character random string, or wait out a 3-hour cooldown.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Enable Strict', onPress: () => changeMode('strict') },
-      ]
-    );
   };
 
   return (
@@ -136,12 +133,16 @@ export default function HomeScreen() {
         <View style={styles.logoTile}>
           <MaterialCommunityIcons name="shield-outline" size={22} color={Palette.amber} />
         </View>
-        <Text style={styles.headerTitle}>Habit</Text>
-        <StatusPill
-          label={enabled ? 'PROTECTION ON' : 'PROTECTION OFF'}
-          tone={enabled ? 'amber' : 'neutral'}
-          dot
-        />
+        <Text style={styles.headerTitle} numberOfLines={1}>
+          Habit
+        </Text>
+        <View style={styles.headerBadge}>
+          <StatusPill
+            label={enabled ? 'PROTECTION ON' : 'PROTECTION OFF'}
+            tone={enabled ? 'amber' : 'neutral'}
+            dot
+          />
+        </View>
       </View>
 
       {!snapshot.accessibilityEnabled && (
@@ -286,8 +287,13 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: Space.gutter,
+    gap: Space.sm,
     paddingVertical: Space.sm,
+  },
+  /** Reserves the trailing slot so the badge never runs into another header icon. */
+  headerBadge: {
+    flexShrink: 0,
+    marginLeft: 'auto',
   },
   logoTile: {
     width: Radii.tileSize,
@@ -302,6 +308,7 @@ const styles = StyleSheet.create({
     ...Typography.headlineLg,
     color: Palette.textPrimary,
     flex: 1,
+    flexShrink: 1,
   },
   dialWrap: { alignItems: 'center', gap: Space.md, paddingTop: Space.md },
   dialCaption: {

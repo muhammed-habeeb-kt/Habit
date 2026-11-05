@@ -1,12 +1,13 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useEffect, useState } from 'react';
-import { AppState, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useEffect, useState } from 'react';
+import { Animated, AppState, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { NeuCard, PrimaryGlowButton } from '@/components/neumorphic';
 import { FontNames, Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
 import { useProtection } from '@/hooks/use-protection';
+import { useSheetDismiss } from '@/hooks/use-sheet-dismiss';
 import { activateDeviceAdmin, isDeviceAdminActive } from '@/native/habit';
 
 /**
@@ -45,6 +46,8 @@ export default function AggressiveModeScreen() {
   const [busy, setBusy] = useState(false);
   const [waitingForAdmin, setWaitingForAdmin] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  const closeSheet = useCallback(() => router.back(), []);
+  const { panHandlers, animatedStyle, dismiss } = useSheetDismiss(closeSheet);
 
   // Android's admin dialog pauses Habit. When it comes back, either the admin is on and
   // Aggressive can be switched on, or the user backed out and can try again.
@@ -92,12 +95,12 @@ export default function AggressiveModeScreen() {
       <Pressable
         accessibilityRole="button"
         accessibilityLabel="Close Aggressive mode sheet"
-        onPress={() => router.back()}
+        onPress={dismiss}
         style={styles.dismissArea}
       />
 
       <SafeAreaView edges={['bottom']} style={styles.sheetSafe}>
-        <View style={styles.sheet}>
+        <Animated.View style={[styles.sheet, animatedStyle]} {...panHandlers}>
           <View style={styles.handle} />
 
           <View style={styles.alertPill}>
@@ -144,7 +147,7 @@ export default function AggressiveModeScreen() {
 
           <Pressable
             accessibilityRole="button"
-            onPress={() => router.back()}
+            onPress={dismiss}
             style={({ pressed }) => [styles.cancel, pressed && styles.pressed]}>
             <Text style={styles.cancelLabel}>Cancel</Text>
           </Pressable>
@@ -152,7 +155,7 @@ export default function AggressiveModeScreen() {
           {hint ? <Text style={styles.hint}>{hint}</Text> : null}
 
           <Text style={styles.footer}>HABIT TAMPER PROTECTION • ANDROID DEVICE ADMIN</Text>
-        </View>
+        </Animated.View>
       </SafeAreaView>
     </View>
   );

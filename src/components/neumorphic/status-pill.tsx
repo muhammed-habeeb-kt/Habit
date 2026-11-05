@@ -31,7 +31,9 @@ export function StatusPill({ label, tone = 'neutral', dot }: Props) {
           ]}
         />
       )}
-      <Text style={[styles.label, { color: colors.text }]}>{label}</Text>
+      <Text numberOfLines={1} style={[styles.label, { color: colors.text }]}>
+        {label}
+      </Text>
     </View>
   );
 }
@@ -40,6 +42,7 @@ const styles = StyleSheet.create({
   pill: {
     flexDirection: 'row',
     alignItems: 'center',
+    flexShrink: 0,
     gap: 6,
     alignSelf: 'flex-start',
     borderRadius: Radii.pill,

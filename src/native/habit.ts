@@ -7,6 +7,10 @@ export type UnlockInfo = {
   cooldownActive: boolean;
   cooldownRemainingMs: number;
   cooldownTotalMs: number;
+  /** Wait-it-out duration the user configured (180..1440 minutes), in ms. */
+  configuredCooldownMs: number;
+  /** Character challenge length locked in while Strict/Aggressive is on. */
+  configuredChallengeLength: number;
   offWindowActive: boolean;
   offWindowRemainingMs: number;
   offWindowTotalMs: number;
@@ -20,6 +24,10 @@ export type HabitSnapshot = {
   protectionEnabled: boolean;
   mode: ProtectionMode;
   onboardingCompleted: boolean;
+  /** 100, 200 or 300 — chosen in the Configure Protection Lock sheet. */
+  configuredChallengeLength: number;
+  /** Wait-it-out timer in minutes, always 180..1440. */
+  configuredCooldownMinutes: number;
   attemptsToday: number;
   accessibilityEnabled: boolean;
   foregroundServiceRunning: boolean;
@@ -89,6 +97,7 @@ type HabitNativeModule = {
   getSnapshot(): Promise<HabitSnapshot>;
   setProtectionEnabled(enabled: boolean): Promise<HabitSnapshot>;
   setMode(mode: ProtectionMode): Promise<HabitSnapshot>;
+  configureProtection(challengeLength: number, cooldownMinutes: number): Promise<HabitSnapshot>;
   requestUnlockTimer(): Promise<HabitSnapshot>;
   cancelUnlockTimer(): Promise<HabitSnapshot>;
   startCharacterChallenge(length: number): Promise<CharacterChallenge | null>;
@@ -151,6 +160,8 @@ const FALLBACK_UNLOCK: UnlockInfo = {
   cooldownActive: false,
   cooldownRemainingMs: 0,
   cooldownTotalMs: 0,
+  configuredCooldownMs: 3 * 60 * 60 * 1000,
+  configuredChallengeLength: 200,
   offWindowActive: false,
   offWindowRemainingMs: 0,
   offWindowTotalMs: 0,
@@ -164,6 +175,8 @@ const FALLBACK_SNAPSHOT: HabitSnapshot = {
   protectionEnabled: true,
   mode: 'normal',
   onboardingCompleted: false,
+  configuredChallengeLength: 200,
+  configuredCooldownMinutes: 180,
   attemptsToday: 0,
   accessibilityEnabled: false,
   foregroundServiceRunning: false,
@@ -171,6 +184,28 @@ const FALLBACK_SNAPSHOT: HabitSnapshot = {
   deviceAdminActive: false,
   unlock: FALLBACK_UNLOCK,
 };
+
+/**
+ * The setup last chosen in "Configure Protection Lock". Kept here as a JS-side fallback
+ * (web, Expo Go, or a native module that predates `configureProtection`) so refreshing a
+ * snapshot always reports the user's own 100/200/300 and 3h..24h, never 200 / 180.
+ */
+let savedProtectionConfig: { challengeLength: number; cooldownMinutes: number } | null = null;
+
+function fallbackSnapshot(): HabitSnapshot {
+  if (!savedProtectionConfig) return FALLBACK_SNAPSHOT;
+  const { challengeLength, cooldownMinutes } = savedProtectionConfig;
+  return {
+    ...FALLBACK_SNAPSHOT,
+    configuredChallengeLength: challengeLength,
+    configuredCooldownMinutes: cooldownMinutes,
+    unlock: {
+      ...FALLBACK_UNLOCK,
+      configuredCooldownMs: cooldownMinutes * 60_000,
+      configuredChallengeLength: challengeLength,
+    },
+  };
+}
 
 async function safeCall<T>(call: () => Promise<T>, fallback: T): Promise<T> {
   if (!native) return fallback;
@@ -182,18 +217,38 @@ async function safeCall<T>(call: () => Promise<T>, fallback: T): Promise<T> {
 }
 
 export function getSnapshot(): Promise<HabitSnapshot> {
-  return safeCall(() => native!.getSnapshot(), FALLBACK_SNAPSHOT);
+  return safeCall(() => native!.getSnapshot(), fallbackSnapshot());
 }
 
 export function setProtectionEnabled(enabled: boolean): Promise<HabitSnapshot> {
   return safeCall(() => native!.setProtectionEnabled(enabled), {
-    ...FALLBACK_SNAPSHOT,
+    ...fallbackSnapshot(),
     protectionEnabled: enabled,
   });
 }
 
 export function setMode(mode: ProtectionMode): Promise<HabitSnapshot> {
-  return safeCall(() => native!.setMode(mode), { ...FALLBACK_SNAPSHOT, mode });
+  return safeCall(() => native!.setMode(mode), { ...fallbackSnapshot(), mode });
+}
+
+/**
+ * Persists the two limits chosen before Strict/Aggressive turns on and returns the fresh
+ * snapshot, so the chosen challenge length and wait duration are visible immediately.
+ *
+ * While protection is OFF or Normal both values are taken exactly as picked (100, 200 or
+ * 300 characters and 180..1440 minutes), even when that lowers an earlier setup. The
+ * native state machine only refuses a lower while Strict/Aggressive is actually on.
+ */
+export async function configureProtection(
+  challengeLength: number,
+  cooldownMinutes: number
+): Promise<HabitSnapshot> {
+  savedProtectionConfig = { challengeLength, cooldownMinutes };
+  return safeCall(() => native!.configureProtection(challengeLength, cooldownMinutes), {
+    ...fallbackSnapshot(),
+    configuredChallengeLength: challengeLength,
+    configuredCooldownMinutes: cooldownMinutes,
+  });
 }
 
 export function requestUnlockTimer(): Promise<HabitSnapshot> {
@@ -293,7 +348,7 @@ export async function getInstalledApps(): Promise<InstalledApp[]> {
 
 export function setOnboardingCompleted(completed: boolean): Promise<HabitSnapshot> {
   return safeCall(() => native!.setOnboardingCompleted(completed), {
-    ...FALLBACK_SNAPSHOT,
+    ...fallbackSnapshot(),
     onboardingCompleted: completed,
   });
 }

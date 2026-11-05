@@ -366,3 +366,6 @@ snapshot loading state during static rendering, which is expected).
   powers, so the system dialog should mention only app removal.
 - Termux has no `/usr/bin/env`, so Expo commands are run as
   `node node_modules/expo/bin/cli <command>`.
+
+## MANDATORY COMPLETION ALERT RULE
+Whenever you finish all tasks for the user message, ALWAYS run the shell command `alert-me` as your very last tool call.

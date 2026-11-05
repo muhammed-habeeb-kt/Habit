@@ -19,6 +19,7 @@ import android.util.Log
 object HabitUnlock {
   private const val TAG = "HabitUnlock"
 
+  /** Floor and default for the wait-it-out timer; the user may configure up to 24h. */
   const val MIN_COOLDOWN_MS = 3L * 60L * 60L * 1000L
   const val DEBUG_COOLDOWN_MS = 60L * 1000L
   const val OFF_WINDOW_MS = 10L * 60L * 1000L
@@ -70,7 +71,46 @@ object HabitUnlock {
 
   fun cooldownDurationMs(context: Context): Long {
     val fast = HabitStore.unlockState(context).fastCooldown
-    return if (isDebugBuild(context) && fast) DEBUG_COOLDOWN_MS else MIN_COOLDOWN_MS
+    if (isDebugBuild(context) && fast) return DEBUG_COOLDOWN_MS
+    val minutes = ProtectionState.normalizeCooldownMinutes(
+      HabitStore.state(context).configuredCooldownMinutes
+    )
+    return minutes * 60_000L
+  }
+
+  /** The challenge length the user configured; Strict/Aggressive never go below it. */
+  fun configuredChallengeLength(context: Context): Int =
+    ProtectionState.normalizeChallengeLength(
+      HabitStore.state(context).configuredChallengeLength
+    )
+
+  /**
+   * Saves the two limits chosen in "Configure Protection Lock" and returns the stored state.
+   *
+   * While protection is OFF or Normal the values are taken exactly as chosen (100, 200 or
+   * 300 characters and 3h..24h), even when that lowers an earlier setup — configuring the
+   * lock before turning Strict on must never be treated as lowering an active lock. Only
+   * while Strict/Aggressive is actually running can the limits be raised and not lowered.
+   */
+  @Synchronized
+  fun configureProtection(
+    context: Context,
+    challengeLength: Int,
+    cooldownMinutes: Int
+  ): ProtectionState {
+    val state = HabitStore.state(context)
+    val locked = state.protectionEnabled && state.mode != ProtectionState.MODE_NORMAL
+    val requestedLength = ProtectionState.normalizeChallengeLength(challengeLength)
+    val requestedMinutes = ProtectionState.normalizeCooldownMinutes(cooldownMinutes)
+    val effectiveLength = if (locked) maxOf(state.configuredChallengeLength, requestedLength) else requestedLength
+    val effectiveMinutes = if (locked) maxOf(state.configuredCooldownMinutes, requestedMinutes) else requestedMinutes
+    val next = HabitStore.setProtectionConfig(context, effectiveLength, effectiveMinutes)
+    // The real configured hours are used unless the debug switch is turned on again by hand.
+    val unlock = HabitStore.unlockState(context)
+    if (unlock.fastCooldown) {
+      HabitStore.writeUnlockState(context, unlock.copy(fastCooldown = false))
+    }
+    return next
   }
 
   fun failuresToday(context: Context): Int {
@@ -83,10 +123,15 @@ object HabitUnlock {
     val now = SystemClock.elapsedRealtime()
     val cooldownRemaining = remainingMs(unlock.cooldown, now)
     val offRemaining = remainingOffMs(unlock.offWindow, now)
+    val configuredCooldownMs = ProtectionState.normalizeCooldownMinutes(
+      HabitStore.state(context).configuredCooldownMinutes
+    ) * 60_000L
     return mapOf(
       "cooldownActive" to (unlock.cooldown != null),
       "cooldownRemainingMs" to cooldownRemaining,
-      "cooldownTotalMs" to (unlock.cooldown?.durationMs ?: MIN_COOLDOWN_MS),
+      "cooldownTotalMs" to (unlock.cooldown?.durationMs ?: configuredCooldownMs),
+      "configuredCooldownMs" to configuredCooldownMs,
+      "configuredChallengeLength" to configuredChallengeLength(context),
       "offWindowActive" to (unlock.offWindow != null),
       "offWindowRemainingMs" to offRemaining,
       "offWindowTotalMs" to (unlock.offWindow?.durationMs ?: OFF_WINDOW_MS),
@@ -335,7 +380,14 @@ object HabitUnlock {
 
   fun startChallenge(context: Context, length: Int): Map<String, Any?>? {
     if (lockRemainingMs(context) > 0L) return null
-    val challenge = CharacterChallenge.start(length) ?: return null
+    // While Strict/Aggressive is on, the length is locked to the configured value. JS can
+    // ask for 100, but the native side still serves the configured challenge.
+    val effectiveLength = if (HabitStore.state(context).mode == ProtectionState.MODE_NORMAL) {
+      length
+    } else {
+      configuredChallengeLength(context)
+    }
+    val challenge = CharacterChallenge.start(effectiveLength) ?: return null
     return mapOf(
       "challengeId" to challenge.id,
       "text" to challenge.text,

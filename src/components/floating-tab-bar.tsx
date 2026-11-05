@@ -59,7 +59,7 @@ export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarP
               <View style={[styles.pill, focused && styles.pillActive]}>
                 <MaterialCommunityIcons
                   name={focused ? visual.activeIcon : visual.icon}
-                  size={20}
+                  size={18}
                   color={focused ? Palette.amber : Palette.textSecondary}
                 />
                 <Text style={[styles.label, focused && styles.labelActive]} numberOfLines={1}>
@@ -91,7 +91,7 @@ const styles = StyleSheet.create({
     borderColor: Palette.glassBorder,
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 6,
+    paddingHorizontal: 4,
     overflow: 'hidden',
     backgroundColor: 'rgba(18, 19, 22, 0.94)',
   },
@@ -121,10 +121,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 6,
-    minWidth: 96,
+    gap: 5,
+    maxWidth: '100%',
     height: 44,
-    paddingHorizontal: 12,
+    paddingHorizontal: 8,
     borderRadius: Radii.pill,
   },
   pillActive: {
@@ -133,9 +133,11 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(251, 191, 36, 0.35)',
   },
   label: {
+    flexShrink: 0,
     fontFamily: FontNames.interMedium,
     fontSize: 11,
     lineHeight: 15,
+    letterSpacing: 0,
     color: Palette.textSecondary,
   },
   labelActive: {
