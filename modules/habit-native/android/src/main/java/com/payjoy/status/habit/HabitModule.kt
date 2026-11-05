@@ -202,6 +202,13 @@ class HabitModule : Module() {
       requestNotificationPermissionInternal()
     }
 
+    // Records that the user has actually returned from Android's App Info screen. This is
+    // the only way "Allow restricted settings" is credited; a tap alone proves nothing.
+    AsyncFunction("setRestrictedSettingsVisited") { visited: Boolean ->
+      HabitStore.setRestrictedSettingsVisited(appCtx, visited)
+      true
+    }
+
     AsyncFunction("openAccessibilitySettings") {
       openIntent(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }

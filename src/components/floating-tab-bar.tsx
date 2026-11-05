@@ -62,7 +62,10 @@ export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarP
                   size={18}
                   color={focused ? Palette.amber : Palette.textSecondary}
                 />
-                <Text style={[styles.label, focused && styles.labelActive]} numberOfLines={1}>
+                <Text
+                  style={[styles.label, focused && styles.labelActive]}
+                  numberOfLines={1}
+                  maxFontSizeMultiplier={1}>
                   {visual.label}
                 </Text>
                 {focused && <View style={styles.glowDot} />}
@@ -113,15 +116,17 @@ const styles = StyleSheet.create({
   },
   tab: {
     flex: 1,
+    minWidth: 0,
     height: '100%',
     alignItems: 'center',
     justifyContent: 'center',
+    paddingHorizontal: 2,
   },
   pill: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 5,
+    gap: 4,
     maxWidth: '100%',
     height: 44,
     paddingHorizontal: 8,

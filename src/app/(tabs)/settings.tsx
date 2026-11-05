@@ -41,16 +41,23 @@ const SENSITIVITY_NOTES: Record<AiSensitivity, string> = {
   high: 'Catches more, including borderline content.',
 };
 
+const PERMISSION_COUNT = 5;
+
 export default function SettingsScreen() {
   const { snapshot } = useProtection();
   const { settings, busy, changeSensitivity, toggleBlockAlerts } = useAiMonitoring();
 
   const mode = snapshot?.mode ?? 'normal';
   const pill = MODE_PILL[mode] ?? MODE_PILL.normal;
-  const accessibilityOn = snapshot?.accessibilityEnabled ?? false;
-  const notificationsOn = snapshot?.foregroundServiceRunning ?? false;
-  // grantedCount represents how many of the 5 required permissions are granted
-  const grantedCount = (accessibilityOn ? 1 : 0) + (notificationsOn ? 1 : 0);
+  // Same shared native snapshot the Setup screen uses: all five are live Android checks,
+  // so both screens always show exactly the same count.
+  const grantedCount =
+    (snapshot?.accessibilityEnabled ? 1 : 0) +
+    (snapshot?.notificationsGranted ? 1 : 0) +
+    (snapshot?.batteryOptimizationIgnored ? 1 : 0) +
+    (snapshot?.restrictedSettingsAllowed ? 1 : 0) +
+    (snapshot?.deviceAdminActive ? 1 : 0);
+  const allGranted = grantedCount >= PERMISSION_COUNT;
   const sensitivity = settings?.aiSensitivity ?? 'balanced';
   const version = Constants.expoConfig?.version ?? '1.0.0';
 
@@ -99,20 +106,31 @@ export default function SettingsScreen() {
             <MaterialCommunityIcons name="shield-check" size={24} color={Palette.amber} />
           </View>
           <View style={styles.grow}>
-            <Text style={styles.cardTitle}>Permissions</Text>
+            <View style={styles.permissionTitleRow}>
+              <Text style={styles.cardTitle}>Permissions</Text>
+              {allGranted ? <StatusPill label="✓ Granted" tone="success" /> : null}
+            </View>
             <Text style={styles.cardSubtitle}>
-              {grantedCount} of 5 required permissions granted
+              {grantedCount} of {PERMISSION_COUNT} required permissions granted
             </Text>
           </View>
           <Pressable
             accessibilityRole="button"
+            accessibilityLabel={allGranted ? 'View permissions' : 'Fix permissions'}
             onPress={() => router.push('/onboarding')}
-            style={({ pressed }) => [styles.fixButton, pressed && styles.pressed]}>
-            <Text style={styles.fixLabel}>Fix</Text>
+            style={({ pressed }) => [
+              allGranted ? styles.viewButton : styles.fixButton,
+              pressed && styles.pressed,
+            ]}>
+            <Text style={allGranted ? styles.viewLabel : styles.fixLabel}>
+              {allGranted ? 'View' : 'Fix'}
+            </Text>
           </Pressable>
         </View>
         <View style={styles.track}>
-          <View style={[styles.fill, { width: `${(grantedCount / 5) * 100}%` }]} />
+          <View
+            style={[styles.fill, { width: `${(grantedCount / PERMISSION_COUNT) * 100}%` }]}
+          />
         </View>
       </NeuCard>
 
@@ -189,7 +207,12 @@ const styles = StyleSheet.create({
     fontFamily: FontNames.interSemiBold,
     color: Palette.textPrimary,
   },
-  sensitivityCard: { gap: Space.xs, paddingVertical: 18 },
+  sensitivityCard: {
+    width: '100%',
+    alignSelf: 'stretch',
+    gap: Space.xs,
+    paddingVertical: 18,
+  },
   cardTitle: {
     ...Typography.headlineMd,
     fontSize: 16,
@@ -200,15 +223,23 @@ const styles = StyleSheet.create({
     ...Typography.bodyMd,
     color: Palette.textSecondary,
   },
-  sensitivityControl: { marginTop: Space.gutter },
+  sensitivityControl: { width: '100%', marginTop: Space.gutter },
   note: {
     ...Typography.bodySm,
+    width: '100%',
+    flexShrink: 1,
     color: Palette.textMuted,
     marginTop: Space.sm,
   },
   permissionsCard: { gap: Space.md },
   row: { flexDirection: 'row', alignItems: 'center', gap: Space.gutter },
   permissionRow: { flexDirection: 'row', alignItems: 'center', gap: Space.gutter },
+  permissionTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: Space.sm,
+  },
   iconWell: {
     width: 44,
     height: 44,
@@ -232,6 +263,22 @@ const styles = StyleSheet.create({
     ...Typography.bodyMd,
     fontFamily: FontNames.interBold,
     color: Palette.canvas,
+  },
+  viewButton: {
+    minWidth: 52,
+    height: 36,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.surfaceHigh,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: Palette.glassBorder,
+  },
+  viewLabel: {
+    ...Typography.bodyMd,
+    fontFamily: FontNames.interSemiBold,
+    color: Palette.textSecondary,
   },
   track: {
     height: 8,

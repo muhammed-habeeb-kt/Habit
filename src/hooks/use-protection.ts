@@ -4,7 +4,6 @@ import { AppState } from 'react-native';
 import {
   addAttemptsListener,
   addStateListener,
-  areNotificationsEnabled,
   getSnapshot,
   setMode,
   setProtectionEnabled,
@@ -14,18 +13,15 @@ import {
 
 export function useProtection() {
   const [snapshot, setSnapshot] = useState<HabitSnapshot | null>(null);
-  const [notificationsEnabled, setNotificationsEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const mounted = useRef(true);
 
+  // One shared snapshot is the only source of permission state; every value in it is a
+  // live Android check, so two screens can never disagree about what is granted.
   const refresh = useCallback(async () => {
-    const [next, notifications] = await Promise.all([
-      getSnapshot(),
-      areNotificationsEnabled(),
-    ]);
+    const next = await getSnapshot();
     if (!mounted.current) return;
     setSnapshot(next);
-    setNotificationsEnabled(notifications);
   }, []);
 
   useEffect(() => {
@@ -91,7 +87,6 @@ export function useProtection() {
 
   return {
     snapshot,
-    notificationsEnabled,
     busy,
     toggle,
     changeMode,

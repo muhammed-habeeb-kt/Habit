@@ -53,6 +53,7 @@ export function NeuSegmented<T extends string>({ options, value, onChange }: Pro
 
 const styles = StyleSheet.create({
   track: {
+    width: '100%',
     flexDirection: 'row',
     height: 56,
     padding: 4,

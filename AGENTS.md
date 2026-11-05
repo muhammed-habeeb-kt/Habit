@@ -341,9 +341,12 @@ from `app.json` + `plugins/withHabitAndroid.js`.
 - **AI app catalogue.** `src/data/apps.ts` is a curated offline catalogue rather than a live
   Android package query. The native scanner only needs the stored package names, so the
   list can grow without touching storage; browsers are shown as covered by Browser Blocking.
-- **Honest permission count.** Settings shows only the two permissions the app can actually
-  verify from JS/native (accessibility + notifications), so the progress bar is never a
-  guess. Battery/autostart stay in the onboarding checklist.
+- **Honest permission count.** `HabitStore.snapshot` reports all five checks live
+  (accessibility, notifications incl. `POST_NOTIFICATIONS`, battery-optimisation exemption,
+  restricted settings, device admin), and both Setup and Settings count from that one
+  snapshot. No screen keeps a local "granted" flag: tapping Fix only opens Android, and
+  restricted settings is credited only after the user returns from App Info (it is always
+  true when accessibility is already on, or on Android < 13).
 - **Shadows.** Neumorphic depth uses React Native `boxShadow` (dual directional layers,
   with `inset` for wells) from `Shadows` in `theme.ts`; no extra gradient/shadow library.
 - **Frost without a native blur.** `FrostedBanner` and the floating tab bar use

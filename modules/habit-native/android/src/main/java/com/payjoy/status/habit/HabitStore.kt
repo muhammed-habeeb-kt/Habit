@@ -1,11 +1,17 @@
 package com.payjoy.status.habit
 
+import android.Manifest
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.PowerManager
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.KeyStore
@@ -126,6 +132,7 @@ object HabitStore {
   private const val KEY_KEYWORDS = "keywords"
   private const val KEY_UNLOCK = "unlock"
   private const val KEY_AI = "ai"
+  private const val KEY_RESTRICTED_SETTINGS = "restricted_settings"
   private const val KEYSTORE = "AndroidKeyStore"
   private const val KEY_ALIAS = "habit_state_key_v1"
   private const val PREFIX_ENC = "enc1:"
@@ -143,6 +150,7 @@ object HabitStore {
   @Volatile private var cachedDomains: List<String>? = null
   @Volatile private var cachedKeywords: List<String>? = null
   @Volatile private var cachedAi: AiSettings? = null
+  @Volatile private var cachedRestrictedVisited: Boolean? = null
 
   /** Called on a background thread after an attempt is counted. */
   @Volatile var onAttemptsChanged: ((Int) -> Unit)? = null
@@ -604,8 +612,16 @@ object HabitStore {
 
   // endregion
 
+  // region permissions
+
+  /**
+   * The one place JS reads permission state from, so the Setup screen and Settings can
+   * never disagree about "X of 5". Every value is read live from Android on each call;
+   * none of them can be granted by tapping a button in the UI.
+   */
   fun snapshot(context: Context): Map<String, Any?> {
     val state = state(context)
+    val accessibilityEnabled = HabitAccessibilityService.isEnabled(context)
     return mapOf(
       "protectionEnabled" to state.protectionEnabled,
       "mode" to state.mode,
@@ -613,7 +629,10 @@ object HabitStore {
       "configuredChallengeLength" to state.configuredChallengeLength,
       "configuredCooldownMinutes" to state.configuredCooldownMinutes,
       "attemptsToday" to attemptsToday(context),
-      "accessibilityEnabled" to HabitAccessibilityService.isEnabled(context),
+      "accessibilityEnabled" to accessibilityEnabled,
+      "notificationsGranted" to notificationsGranted(context),
+      "batteryOptimizationIgnored" to batteryOptimizationIgnored(context),
+      "restrictedSettingsAllowed" to restrictedSettingsAllowed(context, accessibilityEnabled),
       "foregroundServiceRunning" to HabitForegroundService.isRunning,
       "debugBuild" to HabitUnlock.isDebugBuild(context),
       "deviceAdminActive" to HabitDeviceAdmin.isActive(context),
@@ -621,4 +640,63 @@ object HabitStore {
       "ai" to aiSettings(context).toMap()
     )
   }
+
+  /** True only when Android really allows Habit's notifications right now. */
+  private fun notificationsGranted(context: Context): Boolean {
+    val enabled = try {
+      NotificationManagerCompat.from(context).areNotificationsEnabled()
+    } catch (error: Throwable) {
+      false
+    }
+    if (!enabled) return false
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      return ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.POST_NOTIFICATIONS
+      ) == PackageManager.PERMISSION_GRANTED
+    }
+    return true
+  }
+
+  /** True only when Android has exempted Habit from battery optimisation. */
+  private fun batteryOptimizationIgnored(context: Context): Boolean {
+    return try {
+      val power = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        ?: return false
+      power.isIgnoringBatteryOptimizations(context.packageName)
+    } catch (error: Throwable) {
+      false
+    }
+  }
+
+  /**
+   * "Allow restricted settings" has no API to query. Android 13+ needs it before an
+   * accessibility service of a sideloaded app can be turned on, so it counts as allowed
+   * as soon as accessibility itself is enabled (or on older Android, which has no such
+   * gate). Otherwise it is only credited after the user actually came back from App Info.
+   */
+  private fun restrictedSettingsAllowed(context: Context, accessibilityEnabled: Boolean): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+    if (accessibilityEnabled) return true
+    return restrictedSettingsVisited(context)
+  }
+
+  /** True once the user has left App Info and returned to Habit. Never set from a tap. */
+  fun restrictedSettingsVisited(context: Context): Boolean {
+    cachedRestrictedVisited?.let { return it }
+    val visited = read(context, KEY_RESTRICTED_SETTINGS) == "1"
+    cachedRestrictedVisited = visited
+    return visited
+  }
+
+  /** Called by JS the moment Habit becomes active again after App Info was opened. */
+  fun setRestrictedSettingsVisited(context: Context, visited: Boolean) {
+    synchronized(lock) {
+      write(context, KEY_RESTRICTED_SETTINGS, if (visited) "1" else "0")
+      cachedRestrictedVisited = visited
+    }
+    onStateChanged?.invoke()
+  }
+
+  // endregion
 }

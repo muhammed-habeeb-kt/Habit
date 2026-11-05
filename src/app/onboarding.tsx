@@ -1,7 +1,8 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { router } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
+import { router, useFocusEffect } from 'expo-router';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AppState,
   Modal,
   Pressable,
   ScrollView,
@@ -32,9 +33,11 @@ import {
   openAccessibilitySettings,
   openAppDetails,
   openAutostartSettings,
+  openBatterySettings,
   openNotificationSettings,
   requestNotificationPermission,
   setOnboardingCompleted,
+  setRestrictedSettingsVisited,
 } from '@/native/habit';
 
 const PERMISSION_COUNT = 5;
@@ -43,32 +46,59 @@ const ACCESSIBILITY_EXPLANATION =
   'Android requires it so Habit can read browser address bars and recognise the screens of the apps you chose. Habit works only on this phone and never stores or sends what it sees.';
 
 export default function OnboardingScreen() {
-  const { snapshot, notificationsEnabled, refresh } = useProtection();
+  const { snapshot, refresh } = useProtection();
   const [saving, setSaving] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   // True when the modal was opened by "Fix", so Understood continues into Settings.
   const [helpOpensAccessibility, setHelpOpensAccessibility] = useState(false);
-  // Battery/autostart and restricted settings cannot be read back from Android,
-  // so they count as done once the person has been sent to the right screen.
-  const [batteryDone, setBatteryDone] = useState(false);
-  const [restrictedDone, setRestrictedDone] = useState(false);
+  // Set when App Info was opened for restricted settings; the grant is only credited
+  // after Habit becomes active again, never on the tap itself.
+  const restrictedReturn = useRef(false);
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      refresh();
-    }, 1500);
-    return () => clearInterval(interval);
-  }, [refresh]);
-
+  // Every value below is a live Android check from the shared native snapshot. Nothing
+  // here is local "granted" state, so leaving and returning to this screen cannot reset
+  // or fake the count.
   const accessibilityOn = snapshot?.accessibilityEnabled ?? false;
-  const notificationsOn = notificationsEnabled ?? false;
+  const notificationsOn = snapshot?.notificationsGranted ?? false;
+  const batteryOn = snapshot?.batteryOptimizationIgnored ?? false;
+  const restrictedOn = snapshot?.restrictedSettingsAllowed ?? false;
   const deviceAdminOn = snapshot?.deviceAdminActive ?? false;
   const grantedCount =
     (accessibilityOn ? 1 : 0) +
     (notificationsOn ? 1 : 0) +
-    (batteryDone ? 1 : 0) +
-    (restrictedDone ? 1 : 0) +
+    (batteryOn ? 1 : 0) +
+    (restrictedOn ? 1 : 0) +
     (deviceAdminOn ? 1 : 0);
+
+  // Settings and system dialogs return without remounting this screen, so re-check on
+  // focus and whenever the app comes back to the foreground.
+  useFocusEffect(
+    useCallback(() => {
+      void refresh();
+    }, [refresh])
+  );
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      if (!restrictedReturn.current) {
+        void refresh();
+        return;
+      }
+      restrictedReturn.current = false;
+      void setRestrictedSettingsVisited(true).then(() => refresh());
+    });
+    return () => subscription.remove();
+  }, [refresh]);
+
+  // Device admin and the notification permission use system dialogs that keep the app
+  // active, so a light poll keeps those cards truthful while this screen is open.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void refresh();
+    }, 1500);
+    return () => clearInterval(interval);
+  }, [refresh]);
 
   const finish = useCallback(async () => {
     if (saving) return;
@@ -105,12 +135,14 @@ export default function OnboardingScreen() {
   };
 
   const fixBattery = async () => {
-    setBatteryDone(true);
-    await openAutostartSettings();
+    // Opens Android's own battery-optimisation request, then falls back to the vendor
+    // autostart screen. Nothing is marked granted here; the snapshot decides.
+    const opened = await openBatterySettings();
+    if (!opened) await openAutostartSettings();
   };
 
   const fixRestricted = async () => {
-    setRestrictedDone(true);
+    restrictedReturn.current = true;
     await openAppDetails();
   };
 
@@ -188,7 +220,7 @@ export default function OnboardingScreen() {
             title="Battery & autostart"
             badge={{ label: 'CRUCIAL', tone: 'amber' }}
             description="Keeps Habit running in the background."
-            granted={batteryDone}
+            granted={batteryOn}
             onFix={fixBattery}
           />
 
@@ -196,7 +228,7 @@ export default function OnboardingScreen() {
             icon="lock-outline"
             title="Allow restricted settings"
             description="Needed on Android 13+ for apps installed outside the Play Store."
-            granted={restrictedDone}
+            granted={restrictedOn}
             onFix={fixRestricted}
           />
 

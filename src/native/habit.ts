@@ -29,7 +29,18 @@ export type HabitSnapshot = {
   /** Wait-it-out timer in minutes, always 180..1440. */
   configuredCooldownMinutes: number;
   attemptsToday: number;
+  /** Live Android check: the accessibility service is enabled right now. */
   accessibilityEnabled: boolean;
+  /** Live Android check: notifications are allowed, including POST_NOTIFICATIONS. */
+  notificationsGranted: boolean;
+  /** Live Android check: Habit is exempt from battery optimisation. */
+  batteryOptimizationIgnored: boolean;
+  /**
+   * Android 13+ gates accessibility behind "Allow restricted settings". True on older
+   * Android, true once accessibility is on, and otherwise only after the user returned
+   * from App Info.
+   */
+  restrictedSettingsAllowed: boolean;
   foregroundServiceRunning: boolean;
   debugBuild: boolean;
   deviceAdminActive: boolean;
@@ -133,6 +144,7 @@ type HabitNativeModule = {
   isAccessibilityEnabled(): Promise<boolean>;
   areNotificationsEnabled(): Promise<boolean>;
   requestNotificationPermission(): Promise<boolean>;
+  setRestrictedSettingsVisited(visited: boolean): Promise<boolean>;
   openAccessibilitySettings(): Promise<boolean>;
   openNotificationSettings(): Promise<boolean>;
   openAppDetails(): Promise<boolean>;
@@ -196,6 +208,9 @@ const FALLBACK_SNAPSHOT: HabitSnapshot = {
   configuredCooldownMinutes: 180,
   attemptsToday: 0,
   accessibilityEnabled: false,
+  notificationsGranted: false,
+  batteryOptimizationIgnored: false,
+  restrictedSettingsAllowed: false,
   foregroundServiceRunning: false,
   debugBuild: false,
   deviceAdminActive: false,
@@ -473,6 +488,17 @@ export function areNotificationsEnabled(): Promise<boolean> {
 
 export function requestNotificationPermission(): Promise<boolean> {
   return safeCall(() => native!.requestNotificationPermission(), false);
+}
+
+/**
+ * Marks "Allow restricted settings" as visited. JS must only call this after the user has
+ * actually returned from Android's App Info screen, never on the tap that opened it.
+ */
+export function setRestrictedSettingsVisited(visited: boolean): Promise<boolean> {
+  if (!native || typeof native.setRestrictedSettingsVisited !== 'function') {
+    return Promise.resolve(false);
+  }
+  return safeCall(() => native!.setRestrictedSettingsVisited(visited), false);
 }
 
 export function openAccessibilitySettings(): Promise<boolean> {
