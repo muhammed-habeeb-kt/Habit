@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  Keyboard,
   Modal,
   Pressable,
   ScrollView,
@@ -12,7 +14,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import {
   NeuCard,
@@ -32,6 +34,10 @@ const SLAB_LENGTHS = [100, 200, 300] as const;
 type SlabLength = (typeof SLAB_LENGTHS)[number];
 
 const TOKEN_LENGTH = 10;
+
+/** Tallest the challenge stream may get: it scrolls instead of pushing the input dock away. */
+const GRID_MAX_HEIGHT = 230;
+const GRID_MAX_HEIGHT_KEYBOARD = 124;
 
 /** The lock always uses the length saved in the Configure Protection Lock sheet. */
 function lockedLength(value: number | undefined): SlabLength {
@@ -58,15 +64,74 @@ function tokenize(text: string): string[] {
 
 export default function UnlockCodeScreen() {
   const { snapshot } = useProtection();
+  const insets = useSafeAreaInsets();
   const configuredLength = lockedLength(snapshot?.configuredChallengeLength);
   const [challenge, setChallenge] = useState<CharacterChallenge | null>(null);
   const [typed, setTyped] = useState('');
   const [feedback, setFeedback] = useState<string | null>(null);
   const [mistake, setMistake] = useState<Mistake | null>(null);
   const [starting, setStarting] = useState(false);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [gridViewportHeight, setGridViewportHeight] = useState(0);
+  /** Laid-out heights of the root view, to see whether Android itself shrank for the IME. */
+  const [screenHeight, setScreenHeight] = useState(0);
+  const [idleScreenHeight, setIdleScreenHeight] = useState(0);
+  const [cursorOpacity] = useState(() => new Animated.Value(1));
   const submitting = useRef(false);
   const startingChallenge = useRef(false);
   const bootstrapped = useRef(false);
+  const tokenScrollRef = useRef<ScrollView>(null);
+  const tokenOffsets = useRef<Record<number, number>>({});
+
+  const keyboardVisible = keyboardHeight > 0;
+
+  /* ------------------------------------------------------------------ */
+  /* Keyboard: compact the header area and keep the input dock above it  */
+  /* ------------------------------------------------------------------ */
+
+  useEffect(() => {
+    const show = Keyboard.addListener('keyboardDidShow', (event) => {
+      setKeyboardHeight(event.endCoordinates?.height ?? 0);
+    });
+    const hide = Keyboard.addListener('keyboardDidHide', () => setKeyboardHeight(0));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+
+  // Edge-to-edge Android windows do not resize for the keyboard, older configurations do.
+  // Android reports the IME height without the system bar, so the bar inset is added here;
+  // whatever the OS already took away through a resize is subtracted again. The dock then
+  // sits directly on top of the keyboard in both cases.
+  const layoutShrink =
+    idleScreenHeight > 0 ? Math.max(0, idleScreenHeight - screenHeight) : 0;
+  const coveredByKeyboard = keyboardVisible
+    ? Math.max(0, keyboardHeight + insets.bottom - layoutShrink)
+    : 0;
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(cursorOpacity, {
+          toValue: 0.15,
+          duration: 520,
+          useNativeDriver: true,
+        }),
+        Animated.timing(cursorOpacity, {
+          toValue: 1,
+          duration: 520,
+          useNativeDriver: true,
+        }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [cursorOpacity]);
+
+  /* ------------------------------------------------------------------ */
+  /* Challenge lifecycle                                                 */
+  /* ------------------------------------------------------------------ */
 
   const beginChallenge = useCallback(async (nextLength: SlabLength) => {
     if (startingChallenge.current) return;
@@ -174,19 +239,66 @@ export default function UnlockCodeScreen() {
     router.dismissTo('/');
   };
 
-  const typedLength = normalize(typed).length;
+  /* ------------------------------------------------------------------ */
+  /* Derived typing state                                                */
+  /* ------------------------------------------------------------------ */
+
+  const typedNormalized = normalize(typed);
+  const typedLength = typedNormalized.length;
   const targetLength = challenge?.length ?? configuredLength;
   const percent =
     targetLength > 0 ? Math.round((Math.min(typedLength, targetLength) / targetLength) * 100) : 0;
   const tokens = challenge ? tokenize(challenge.text) : [];
+  const activeTokenIndex =
+    tokens.length > 0
+      ? Math.min(Math.floor(typedLength / TOKEN_LENGTH), tokens.length - 1)
+      : 0;
+
+  // The current 10-character chunk, mirrored inside the input well so every keystroke is
+  // visible without reading the (possibly scrolled) stream above.
+  const typedChunkStart = Math.floor(typedLength / TOKEN_LENGTH) * TOKEN_LENGTH;
+  const chunkTyped = typedNormalized.slice(typedChunkStart, typedChunkStart + TOKEN_LENGTH);
+  const chunkTarget = challenge
+    ? challenge.text.slice(typedChunkStart, typedChunkStart + TOKEN_LENGTH)
+    : '';
+  const chunkRemaining = chunkTarget.slice(chunkTyped.length);
+  const nextChar = chunkRemaining.slice(0, 1);
+  const remainingChars = chunkRemaining.slice(1);
+  const chunkNumber = tokens.length > 0 ? Math.min(typedChunkStart / TOKEN_LENGTH + 1, tokens.length) : 0;
+
+  // Keep the active amber chunk (and the next row) centred in the stream viewport.
+  useEffect(() => {
+    if (!challenge || gridViewportHeight === 0) return;
+    const offset = tokenOffsets.current[activeTokenIndex];
+    if (offset == null) return;
+    tokenScrollRef.current?.scrollTo({
+      y: Math.max(0, offset - gridViewportHeight / 2 + 14),
+      animated: true,
+    });
+  }, [activeTokenIndex, challenge, gridViewportHeight, keyboardVisible]);
+
+  useEffect(() => {
+    tokenOffsets.current = {};
+  }, [challenge?.challengeId]);
+
+  const gridMaxHeight = keyboardVisible ? GRID_MAX_HEIGHT_KEYBOARD : GRID_MAX_HEIGHT;
 
   return (
-    <View style={styles.screen}>
-      <SafeAreaView style={styles.safe} edges={['top', 'left', 'right', 'bottom']}>
-        <ScrollView
-          contentContainerStyle={styles.content}
-          showsVerticalScrollIndicator={false}
-          keyboardShouldPersistTaps="handled">
+    <View
+      style={styles.screen}
+      onLayout={(event) => {
+        const next = event.nativeEvent.layout.height;
+        setScreenHeight(next);
+        // A resized window is never taller than the keyboard-free one (portrait-locked).
+        if (!keyboardVisible) setIdleScreenHeight((previous) => Math.max(previous, next));
+      }}>
+      <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>
+        <View
+          style={[
+            styles.body,
+            { gap: keyboardVisible ? Space.sm : Space.md },
+            coveredByKeyboard > 0 && { paddingBottom: coveredByKeyboard },
+          ]}>
           <View style={styles.header}>
             <Pressable
               accessibilityRole="button"
@@ -198,47 +310,54 @@ export default function UnlockCodeScreen() {
             <Text style={styles.headerTitle}>Type to Unlock</Text>
           </View>
 
-          {/* Read-only on purpose: the configured length is locked while protection is on. */}
-          <View style={styles.selectorTrack}>
-            {SLAB_LENGTHS.map((option) => {
-              const active = option === configuredLength;
-              return (
-                <View
-                  key={option}
-                  accessibilityState={{ selected: active, disabled: !active }}
-                  style={[
-                    styles.selectorCard,
-                    active && styles.selectorCardActive,
-                    !active && styles.selectorCardLocked,
-                  ]}>
-                  <View style={styles.selectorValueRow}>
-                    {active && (
-                      <MaterialCommunityIcons name="lock" size={11} color={Palette.amber} />
-                    )}
-                    <Text
+          {/* Read-only on purpose: the configured length is locked while protection is on.
+              While typing it collapses to one slim badge to give the keyboard the room. */}
+          {keyboardVisible ? (
+            <View style={styles.compactLockRow}>
+              <View style={styles.compactLockBadge}>
+                <MaterialCommunityIcons name="lock" size={12} color={Palette.amber} />
+                <Text style={styles.compactLockLabel}>
+                  Locked at {configuredLength} characters
+                </Text>
+              </View>
+            </View>
+          ) : (
+            <>
+              <View style={styles.selectorTrack}>
+                {SLAB_LENGTHS.map((option) => {
+                  const active = option === configuredLength;
+                  return (
+                    <View
+                      key={option}
+                      accessibilityState={{ selected: active, disabled: !active }}
                       style={[
-                        styles.selectorValue,
-                        active && styles.selectorValueActive,
+                        styles.selectorCard,
+                        active && styles.selectorCardActive,
+                        !active && styles.selectorCardLocked,
                       ]}>
-                      {option}
-                    </Text>
-                  </View>
-                  <Text
-                    style={[
-                      styles.selectorCaption,
-                      active && styles.selectorCaptionActive,
-                    ]}>
-                    CHARACTERS
-                  </Text>
-                </View>
-              );
-            })}
-          </View>
-          <Text style={styles.lockedNote}>
-            Length locked at {configuredLength} characters by your protection setup.
-          </Text>
+                      <View style={styles.selectorValueRow}>
+                        {active && (
+                          <MaterialCommunityIcons name="lock" size={11} color={Palette.amber} />
+                        )}
+                        <Text style={[styles.selectorValue, active && styles.selectorValueActive]}>
+                          {option}
+                        </Text>
+                      </View>
+                      <Text
+                        style={[styles.selectorCaption, active && styles.selectorCaptionActive]}>
+                        CHARACTERS
+                      </Text>
+                    </View>
+                  );
+                })}
+              </View>
+              <Text style={styles.lockedNote}>
+                Length locked at {configuredLength} characters by your protection setup.
+              </Text>
+            </>
+          )}
 
-          <NeuCard style={styles.challengeCard}>
+          <NeuCard style={[styles.challengeCard, keyboardVisible && styles.challengeCardCompact]}>
             <View style={styles.challengeHeader}>
               <View style={styles.challengeLabelRow}>
                 <MaterialCommunityIcons
@@ -254,24 +373,35 @@ export default function UnlockCodeScreen() {
             </View>
 
             {challenge ? (
-              <View style={styles.tokenGrid}>
-                {tokens.map((token, index) => {
-                  const start = index * TOKEN_LENGTH;
-                  const complete = start + token.length <= typedLength;
-                  const active = !complete && start <= typedLength;
-                  return (
-                    <Text
-                      key={`${start}-${token}`}
-                      style={[
-                        styles.token,
-                        complete && styles.tokenComplete,
-                        active && styles.tokenActive,
-                      ]}>
-                      {token}
-                    </Text>
-                  );
-                })}
-              </View>
+              <ScrollView
+                ref={tokenScrollRef}
+                style={[styles.tokenScroll, { maxHeight: gridMaxHeight }]}
+                contentContainerStyle={styles.tokenGridContent}
+                showsVerticalScrollIndicator
+                keyboardShouldPersistTaps="always"
+                onLayout={(event) => setGridViewportHeight(event.nativeEvent.layout.height)}>
+                <View style={styles.tokenGrid}>
+                  {tokens.map((token, index) => {
+                    const start = index * TOKEN_LENGTH;
+                    const complete = start + token.length <= typedLength;
+                    const active = !complete && start <= typedLength;
+                    return (
+                      <Text
+                        key={`${start}-${token}`}
+                        onLayout={(event) => {
+                          tokenOffsets.current[index] = event.nativeEvent.layout.y;
+                        }}
+                        style={[
+                          styles.token,
+                          complete && styles.tokenComplete,
+                          active && styles.tokenActive,
+                        ]}>
+                        {token}
+                      </Text>
+                    );
+                  })}
+                </View>
+              </ScrollView>
             ) : (
               <View style={styles.challengePlaceholder}>
                 {starting ? (
@@ -285,52 +415,94 @@ export default function UnlockCodeScreen() {
             )}
           </NeuCard>
 
-          <NeuWell padded={false} style={styles.inputWell}>
-            <TextInput
-              value={typed}
-              onChangeText={handleChange}
-              editable={challenge != null}
-              autoCapitalize="none"
-              autoCorrect={false}
-              spellCheck={false}
-              autoComplete="off"
-              textContentType="none"
-              importantForAutofill="no"
-              keyboardType="visible-password"
-              contextMenuHidden
-              selectTextOnFocus={false}
-              placeholder="Type the shown text here"
-              placeholderTextColor={Palette.textMuted}
-              style={styles.input}
-            />
-          </NeuWell>
+          <View style={styles.spacer} />
 
-          <View style={styles.progressHeader}>
-            <Text style={styles.progressLabel}>
-              Typed {typedLength} / {targetLength}
-            </Text>
-            <Text style={styles.progressPercent}>{percent}%</Text>
+          <View
+            style={[
+              styles.dock,
+              { paddingBottom: keyboardVisible ? Space.sm : Math.max(insets.bottom, Space.md) },
+            ]}>
+            {feedback && (
+              <Text style={styles.feedback} numberOfLines={2}>
+                {feedback}
+              </Text>
+            )}
+
+            <NeuWell padded={false} style={styles.inputWell}>
+              <View style={styles.streamRow}>
+                <Text style={styles.streamTyped} numberOfLines={1}>
+                  {chunkTyped}
+                </Text>
+                <Animated.View style={[styles.streamCursor, { opacity: cursorOpacity }]} />
+                <Text style={styles.streamNext} numberOfLines={1}>
+                  {nextChar ? (
+                    <Text style={styles.streamNextChar}>{nextChar}</Text>
+                  ) : null}
+                  {remainingChars}
+                </Text>
+              </View>
+              <TextInput
+                value={typed}
+                onChangeText={handleChange}
+                editable={challenge != null}
+                autoCapitalize="none"
+                autoCorrect={false}
+                spellCheck={false}
+                autoComplete="off"
+                textContentType="none"
+                importantForAutofill="no"
+                keyboardType="visible-password"
+                contextMenuHidden
+                selectTextOnFocus={false}
+                placeholder="Type the shown text here"
+                placeholderTextColor={Palette.textMuted}
+                style={styles.input}
+              />
+              <View style={styles.chunkMetaRow}>
+                <Text style={styles.chunkMeta}>
+                  CHUNK <Text style={styles.chunkMetaStrong}>{chunkNumber || '—'}</Text>
+                  {tokens.length > 0 ? ` / ${tokens.length}` : ''}
+                </Text>
+                <Text style={styles.chunkMeta}>
+                  <Text style={styles.chunkMetaStrong}>{chunkTyped.length}</Text> / {TOKEN_LENGTH}{' '}
+                  IN CHUNK
+                </Text>
+              </View>
+            </NeuWell>
+
+            <View style={styles.progressHeader}>
+              <Text style={styles.progressLabel}>
+                Typed {typedLength} / {targetLength}
+              </Text>
+              <Text style={styles.progressPercent}>{percent}%</Text>
+            </View>
+            <View style={styles.track}>
+              <View style={[styles.fill, { width: `${percent}%` }]} />
+            </View>
+
+            {!keyboardVisible && (
+              <>
+                <View style={styles.warningRow}>
+                  <MaterialCommunityIcons name="alert-outline" size={14} color={Palette.amber} />
+                  <Text style={styles.warningText}>One mistake restarts with a new text.</Text>
+                </View>
+
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Leave locked and return home"
+                  onPress={() => router.dismissTo('/')}
+                  style={({ pressed }) => [styles.leaveButton, pressed && styles.pressed]}>
+                  <MaterialCommunityIcons
+                    name="lock-outline"
+                    size={16}
+                    color={Palette.textSecondary}
+                  />
+                  <Text style={styles.leaveLabel}>Leave locked</Text>
+                </Pressable>
+              </>
+            )}
           </View>
-          <View style={styles.track}>
-            <View style={[styles.fill, { width: `${percent}%` }]} />
-          </View>
-
-          {feedback && <Text style={styles.feedback}>{feedback}</Text>}
-
-          <View style={styles.warningRow}>
-            <MaterialCommunityIcons name="alert-outline" size={14} color={Palette.amber} />
-            <Text style={styles.warningText}>One mistake restarts with a new text.</Text>
-          </View>
-
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Leave locked and return home"
-            onPress={() => router.dismissTo('/')}
-            style={({ pressed }) => [styles.leaveButton, pressed && styles.pressed]}>
-            <MaterialCommunityIcons name="lock-outline" size={16} color={Palette.textSecondary} />
-            <Text style={styles.leaveLabel}>Leave locked</Text>
-          </Pressable>
-        </ScrollView>
+        </View>
       </SafeAreaView>
 
       <Modal
@@ -410,11 +582,10 @@ export default function UnlockCodeScreen() {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: Palette.canvas },
   safe: { flex: 1 },
-  content: {
-    flexGrow: 1,
+  body: {
+    flex: 1,
     paddingHorizontal: Space.margin,
     paddingTop: Space.sm,
-    paddingBottom: Space.xl,
     gap: Space.md,
   },
   header: {
@@ -476,6 +647,28 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: -Space.sm,
   },
+  compactLockRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+  },
+  compactLockBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    height: 26,
+    paddingHorizontal: 12,
+    borderRadius: Radii.pill,
+    borderWidth: 1,
+    borderColor: 'rgba(251, 191, 36, 0.45)',
+    backgroundColor: Palette.amberHighlight,
+  },
+  compactLockLabel: {
+    ...Typography.monoLabelSm,
+    fontSize: 9,
+    lineHeight: 12,
+    letterSpacing: 0.6,
+    color: Palette.amber,
+  },
   selectorValue: {
     fontFamily: FontNames.monoBold,
     fontSize: 13,
@@ -491,7 +684,8 @@ const styles = StyleSheet.create({
     color: Palette.textMuted,
   },
   selectorCaptionActive: { color: Palette.amber },
-  challengeCard: { gap: Space.md },
+  challengeCard: { gap: Space.md, flexShrink: 1, minHeight: 0 },
+  challengeCardCompact: { padding: 14, gap: Space.sm },
   challengeHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -527,6 +721,8 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
     color: Palette.amber,
   },
+  tokenScroll: { flexShrink: 1 },
+  tokenGridContent: { paddingBottom: 2 },
   tokenGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -561,25 +757,79 @@ const styles = StyleSheet.create({
     color: Palette.textMuted,
     textAlign: 'center',
   },
+  spacer: { flexGrow: 1, minHeight: Space.xs },
+  dock: { gap: Space.sm },
   inputWell: {
     borderRadius: Radii.input,
     paddingHorizontal: 14,
-    minHeight: 48,
+    paddingTop: 10,
+    paddingBottom: 8,
     justifyContent: 'center',
   },
+  streamRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 1,
+    minHeight: 22,
+  },
+  streamTyped: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 16,
+    lineHeight: 22,
+    letterSpacing: 0.8,
+    color: Palette.success,
+    flexShrink: 0,
+  },
+  streamCursor: {
+    width: 2,
+    height: 18,
+    borderRadius: 1,
+    marginHorizontal: 1,
+    backgroundColor: Palette.amber,
+    boxShadow: Shadows.amberHalo,
+  },
+  streamNext: {
+    flexShrink: 1,
+    fontFamily: FontNames.monoRegular,
+    fontSize: 16,
+    lineHeight: 22,
+    letterSpacing: 0.8,
+    color: Palette.textMuted,
+  },
+  streamNextChar: {
+    color: Palette.amber,
+    backgroundColor: Palette.amberHighlight,
+  },
   input: {
-    minHeight: 44,
-    paddingVertical: 10,
+    minHeight: 38,
+    paddingVertical: 6,
+    paddingHorizontal: 0,
     fontFamily: FontNames.monoRegular,
     fontSize: 14,
     lineHeight: 20,
     letterSpacing: 0.6,
     color: Palette.success,
   },
+  chunkMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Space.sm,
+  },
+  chunkMeta: {
+    fontFamily: FontNames.monoRegular,
+    fontSize: 9,
+    lineHeight: 13,
+    letterSpacing: 0.8,
+    color: Palette.textMuted,
+  },
+  chunkMetaStrong: {
+    fontFamily: FontNames.monoBold,
+    color: Palette.amber,
+  },
   progressHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: -8,
   },
   progressLabel: {
     ...Typography.monoLabelSm,
@@ -619,8 +869,7 @@ const styles = StyleSheet.create({
     color: Palette.textSecondary,
   },
   leaveButton: {
-    marginTop: 'auto',
-    paddingTop: Space.lg,
+    paddingTop: Space.xs,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
