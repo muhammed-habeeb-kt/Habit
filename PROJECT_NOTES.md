@@ -320,6 +320,12 @@ model assets, so the development APK must be rebuilt once. On a fresh clone run
 `bash scripts/download-ai-models.sh` (npm `postinstall` already does it) before building; the
 installer fails loudly if either model is missing or is an error page instead of a model.
 
+The GitHub Actions workflow now installs NDK `27.1.12297006` (the version Expo 57 / RN 0.86
+pins) itself, with retries and a `source.properties` check, before Gradle runs. Build #12
+failed because Gradle's own SDK auto-install downloaded a truncated NDK archive
+(`ZipException: Archive is not a ZIP archive`), not because of Kotlin. The workflow also
+deletes the preinstalled NDK versions it never uses, which frees roughly 10 GB.
+
 Part 8 added `SYSTEM_ALERT_WINDOW`, the `getAiScannerStatus` / `testAiModels` /
 `canDrawOverlays` bridge calls and the diagnostics card, so the development APK has to be
 rebuilt again. The accessibility XML changed (`typeWindowsChanged`, no package filter), so

@@ -29,6 +29,10 @@ jobs:
       # and per native module). The runner only ships ~14 GB free, and running
       # out of space is what made the linker abort with "Bus error" and the
       # react-native-reanimated AAR step fail to add its .so files.
+      #
+      # The preinstalled NDK versions are removed here on purpose: none of them is
+      # the one React Native 0.86 / Expo 57 wants (27.1.12297006), and the next
+      # step installs exactly that one. Keeping the others only wastes ~10 GB.
       - name: Free disk space
         run: |
           df -h /
@@ -39,7 +43,61 @@ jobs:
             /usr/local/share/boost \
             /usr/local/lib/android/sdk/emulator \
             /usr/local/lib/android/sdk/system-images \
+            /usr/local/lib/android/sdk/ndk \
+            /usr/local/lib/android/sdk/sources \
+            /usr/local/lib/android/sdk/docs \
             /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # Build #12 failed here, not in Kotlin: Gradle tried to auto-install the NDK
+      # and the downloaded archive was truncated ("java.util.zip.ZipException:
+      # Archive is not a ZIP archive" from sdkmanager's installer), so the build
+      # died while configuring :app. Installing it up front, with retries, a clean
+      # download cache and a real verification, keeps that failure out of Gradle.
+      - name: Install Android NDK 27.1
+        run: |
+          set -euo pipefail
+          NDK_VERSION="27.1.12297006"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "SDK root: $SDK_ROOT"
+
+          if [ -f "$SDK_ROOT/ndk/$NDK_VERSION/source.properties" ]; then
+            echo "NDK $NDK_VERSION is already installed"
+            df -h /
+            exit 0
+          fi
+
+          SDKMANAGER="$(ls "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1 || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager was not found under $SDK_ROOT" >&2
+            exit 1
+          fi
+          echo "sdkmanager: $SDKMANAGER"
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+
+          for attempt in 1 2 3; do
+            echo "::group::NDK install attempt $attempt"
+            # A failed attempt can leave a partial archive behind, and sdkmanager
+            # reuses it on the next try, so the cache is wiped every time.
+            rm -rf "$SDK_ROOT/ndk/$NDK_VERSION" "$SDK_ROOT/.temp" "$SDK_ROOT/.downloadIntermediates"
+            if "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "ndk;$NDK_VERSION"; then
+              echo "::endgroup::"
+              if [ -f "$SDK_ROOT/ndk/$NDK_VERSION/source.properties" ]; then
+                echo "NDK $NDK_VERSION installed"
+                break
+              fi
+            fi
+            echo "::endgroup::"
+            echo "attempt $attempt failed, retrying"
+            sleep 15
+          done
+
+          if [ ! -f "$SDK_ROOT/ndk/$NDK_VERSION/source.properties" ]; then
+            echo "NDK $NDK_VERSION could not be installed" >&2
+            df -h /
+            exit 1
+          fi
           df -h /
 
       - name: Install dependencies
