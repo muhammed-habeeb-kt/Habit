@@ -13,10 +13,22 @@ android {
     versionCode 1
     versionName '1.0.0'
   }
+
+  // The AI models live in src/main/assets and are memory-mapped by LiteRT / ONNX Runtime.
+  // Compression would force a copy into RAM before every load (and TFLite cannot map a
+  // compressed asset at all), so keep the model extensions stored uncompressed in the APK.
+  androidResources {
+    noCompress += ['tflite', 'onnx']
+  }
 }
 
 dependencies {
   // Offline ML Kit face detection. The model ships inside the APK, so the two-person
   // face check keeps working with no network and sends no image anywhere.
   implementation("com.google.mlkit:face-detection:16.1.7")
+
+  // AI visual scanner, stage 1: NSFW MobileNetV2 classifier (.tflite).
+  implementation("org.tensorflow:tensorflow-lite:2.16.1")
+  // AI visual scanner, stage 2: NudeNet YOLOv8n person-part detector (.onnx).
+  implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
 }

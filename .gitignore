@@ -41,3 +41,8 @@ example
 # generated native folders
 /ios
 /android
+
+# AI models are downloaded by scripts/download-ai-models.sh (~30 MB)
+modules/habit-native/android/src/main/assets/*.tflite
+modules/habit-native/android/src/main/assets/*.onnx
+.cache/

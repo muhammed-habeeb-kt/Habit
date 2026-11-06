@@ -45,6 +45,11 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      # Also runs as npm's postinstall, but kept explicit so a build can never start
+      # `expo prebuild` without the AI model assets in the native module.
+      - name: Download AI models
+        run: bash scripts/download-ai-models.sh
+
       - name: Expo Prebuild
         env:
           CI: 1

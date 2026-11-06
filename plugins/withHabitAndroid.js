@@ -53,6 +53,7 @@ const accessibilityXml = (applicationPackage) => `<?xml version="1.0" encoding="
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
     android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
     android:description="@string/habit_accessibility_description"
     android:notificationTimeout="100"
     android:settingsActivity="${applicationPackage}.MainActivity" />
