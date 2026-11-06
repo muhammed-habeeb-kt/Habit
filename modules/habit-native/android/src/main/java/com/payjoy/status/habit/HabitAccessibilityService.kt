@@ -20,6 +20,11 @@ import android.view.accessibility.AccessibilityNodeInfo
  */
 class HabitAccessibilityService : AccessibilityService() {
   private var lastScanAt = 0L
+  /** Throttles the AI router: content-changed events arrive many times per second. */
+  private var lastRoutedPackage: String? = null
+  private var lastRoutedAt = 0L
+  /** The launcher package never changes while the service runs. */
+  @Volatile private var cachedHomePackage: String? = null
 
   override fun onServiceConnected() {
     super.onServiceConnected()
@@ -41,6 +46,7 @@ class HabitAccessibilityService : AccessibilityService() {
     val safeEvent = event ?: return
     when (safeEvent.eventType) {
       AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+      AccessibilityEvent.TYPE_WINDOWS_CHANGED,
       AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
       AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
       AccessibilityEvent.TYPE_VIEW_SCROLLED -> Unit
@@ -49,11 +55,14 @@ class HabitAccessibilityService : AccessibilityService() {
 
     val pkg = safeEvent.packageName?.toString() ?: return
 
-    // Watched apps are guarded by the screenshot cascade, not by text scanning. The
-    // window change is also how a closed/minimised app stops the loop immediately.
-    if (safeEvent.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-      updateAiScanner(pkg)
-    }
+    // Watched apps are guarded by the screenshot cascade, not by text or URL scanning.
+    // Every event is offered to the router, not just a window-state change: Telegram can
+    // become visible through a notification, a share sheet or a split-screen resume without
+    // ever emitting TYPE_WINDOW_STATE_CHANGED, and the loop has to arm the moment the user
+    // is inside a monitored app. The router returns immediately once the loop is running,
+    // so the extra events cost nothing, and it stops the loop as soon as another app is in
+    // front.
+    updateAiScanner(pkg)
 
     if (pkg == packageName) return
     if (pkg !in BROWSER_PACKAGES) return
@@ -79,7 +88,23 @@ class HabitAccessibilityService : AccessibilityService() {
   private fun updateAiScanner(pkg: String) {
     try {
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-      if (pkg == packageName || pkg == SYSTEM_UI_PACKAGE || pkg == homePackage()) {
+      // Already scanning this app: nothing to read, nothing to start.
+      if (AiVisualScanner.isRunningFor(pkg)) return
+
+      // Every event comes through here, and TYPE_WINDOW_CONTENT_CHANGED can fire dozens of
+      // times a second. The store is only re-read when the package changes or a second has
+      // passed, so routing stays cheap without ever missing an app switch.
+      val now = SystemClock.elapsedRealtime()
+      if (pkg == lastRoutedPackage && now - lastRoutedAt < ROUTE_INTERVAL_MS) return
+      lastRoutedPackage = pkg
+      lastRoutedAt = now
+
+      // SystemUI is the notification shade / volume panel. It is not a different app, and
+      // pulling the shade down inside a watched app is exactly how the user reads the live
+      // AI line in the notification, so it must not stop the loop.
+      if (pkg == SYSTEM_UI_PACKAGE) return
+
+      if (pkg == packageName || pkg == homePackage()) {
         AiVisualScanner.stop()
         return
       }
@@ -88,7 +113,7 @@ class HabitAccessibilityService : AccessibilityService() {
       val ai = HabitStore.aiSettings(this)
       if (state.protectionEnabled && ai.enabled && pkg in ai.monitoredAppPackages) {
         AiVisualScanner.start(this, pkg)
-      } else {
+      } else if (AiVisualScanner.isRunning) {
         AiVisualScanner.stop()
       }
     } catch (error: Throwable) {
@@ -96,14 +121,26 @@ class HabitAccessibilityService : AccessibilityService() {
     }
   }
 
-  private fun homePackage(): String? = try {
-    val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-    packageManager
-      .resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
-      ?.activityInfo
-      ?.packageName
+  /** Package of the window in front right now, or null when Android hides it. */
+  fun foregroundPackage(): String? = try {
+    rootInActiveWindow?.packageName?.toString()
   } catch (error: Throwable) {
     null
+  }
+
+  private fun homePackage(): String? {
+    cachedHomePackage?.let { return it }
+    val resolved = try {
+      val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+      packageManager
+        .resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
+        ?.activityInfo
+        ?.packageName
+    } catch (error: Throwable) {
+      null
+    }
+    if (resolved != null) cachedHomePackage = resolved
+    return resolved
   }
 
   override fun onUnbind(intent: Intent?): Boolean {
@@ -210,6 +247,7 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val TAG = "HabitA11y"
     private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
     private const val SCAN_INTERVAL_MS = 180L
+    private const val ROUTE_INTERVAL_MS = 1_000L
     private const val MAX_DEPTH = 10
     private const val NODE_BUDGET = 220
     private const val MAX_TEXT_LENGTH = 5000

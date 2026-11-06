@@ -3,6 +3,7 @@ import { router } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
+import { AiScannerStatusCard } from '@/components/ai-scanner-status-card';
 import { AppTile, FrostedBanner, NeuCard, NeuSwitch, NeuWell } from '@/components/neumorphic';
 import { TabScreen } from '@/components/tab-screen';
 import { Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
@@ -125,6 +126,8 @@ export default function AppsScreen() {
         title="Habit scans these apps only while they are open."
         body="Nothing leaves your phone."
       />
+
+      <AiScannerStatusCard />
 
       <NeuWell padded={false} style={styles.search}>
         <MaterialCommunityIcons name="magnify" size={20} color={Palette.textMuted} />

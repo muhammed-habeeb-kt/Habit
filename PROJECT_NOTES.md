@@ -198,8 +198,16 @@ and UI from Part 5 are unchanged; the engine only reads `HabitStore.aiSettings(c
 - `build.gradle` adds `org.tensorflow:tensorflow-lite:2.16.1` and
   `com.microsoft.onnxruntime:onnxruntime-android:1.19.2`, and stores `.tflite` / `.onnx`
   uncompressed so TFLite can map the asset instead of copying it into RAM.
-- The generated accessibility XML declares `android:canTakeScreenshot="true"`; capture needs
-  Android 11 (API 30) or newer.
+- The generated accessibility XML declares `android:canTakeScreenshot="true"` and
+  `flagRetrieveInteractiveWindows`; capture needs Android 11 (API 30) or newer.
+- The XML deliberately has **no `android:packageNames`**: a package filter would stop Android
+  from delivering window events for Telegram and the other watched apps, so the loop could
+  never arm. The service receives every app's events and filters in Kotlin.
+- The verified I/O contract (checked by parsing the files themselves): stage 1 is
+  `FLOAT32 [1,224,224,3] -> [1,5]`; stage 2 is `FLOAT32 images [N,3,H,W] -> output0 [N,22,A]`
+  (22 = 4 box rows + 18 classes). `AiVisualScanner` validates the stage-1 input shape on
+  load, adapts to a 1-class or unknown-class output, and reports a mismatch instead of
+  failing silently.
 
 ### Cascade per frame
 
@@ -207,10 +215,12 @@ and UI from Part 5 are unchanged; the engine only reads `HabitStore.aiSettings(c
    selected app is in front, protection is on and the screen is interactive. One capture +
    inference may be in flight; a tick that arrives meanwhile is dropped.
 2. The hardware buffer is wrapped and copied to an ARGB_8888 software bitmap (hardware
-   bitmaps cannot be read pixel by pixel), then split into upper and lower square tiles.
+   bitmaps cannot be read pixel by pixel), then split into three overlapping square tiles —
+   top, centre and bottom. The centre tile is what catches a media viewer or chat column in
+   an app like Telegram.
 3. Stage 1 scores each tile as `P(Porn) + P(Hentai) + 0.3 * P(Sexy)`:
    below `stage1SafeExit` (0.20) the frame exits, at or above `stage1InstantBlock` (0.88) it
-   blocks immediately, and the gray zone runs Stage 2 on every suspicious tile.
+   blocks immediately, and otherwise Stage 2 runs once on the strongest tile.
 4. Stage 2 keeps the highest confidence of the explicit exposed classes 2
    (`BUTTOCKS_EXPOSED`), 3 (`FEMALE_BREAST_EXPOSED`), 4 (`FEMALE_GENITALIA_EXPOSED`),
    6 (`ANUS_EXPOSED`) and 14 (`MALE_GENITALIA_EXPOSED`). Covered classes and faces are
@@ -224,9 +234,14 @@ and UI from Part 5 are unchanged; the engine only reads `HabitStore.aiSettings(c
 
 ### Lifecycle and blocking
 
-- `HabitAccessibilityService` starts or stops the loop on `TYPE_WINDOW_STATE_CHANGED`. Habit,
-  SystemUI and the launcher never start it; leaving the app, disabling protection/AI in
-  settings, or showing the overlay stops it immediately and resets the strikes.
+- `HabitAccessibilityService` offers every accepted event (window state changed, windows
+  changed, content changed, text changed, scrolled) to the router, not just a window-state
+  change: Telegram can appear through a notification, a share sheet or a split-screen resume
+  without one. The router returns immediately while the loop already runs for that package.
+  Habit and the launcher stop it; SystemUI (notification shade) deliberately does not, so the
+  live AI line stays readable while the user pulls the shade down inside a watched app.
+  Leaving the app, disabling protection/AI, or showing the overlay stops it and resets the
+  strikes.
 - A verdict calls `HabitGuard.onAiMatch` with the stable key `<package>:ai-screenshot`, so the
   existing 5-second dedupe counts one attempt, the overlay shows `• AI • APP`, and Back/Home
   remain the escape actions. The loop stops before the overlay is added.
@@ -236,6 +251,30 @@ and UI from Part 5 are unchanged; the engine only reads `HabitStore.aiSettings(c
   Every hardware buffer and bitmap is closed or recycled in `finally`.
 - Honest limits: `FLAG_SECURE` windows (banking apps, some streaming apps) refuse screenshots,
   so they are not scanned; the cascade is advisory input to the native block flow only.
+
+### Diagnostics (Part 8)
+
+Every failure used to be a `Log.w` and nothing else, which looked exactly like “nothing
+happens”. Now:
+
+- `AiVisualScanner` keeps live counters (`frames`, `blocks`, `lastStage1Score`,
+  `lastStage2Score`, `verdict`) plus `modelError`, `stage1Model` / `stage2Model` descriptors,
+  `lastError` and its age. `HabitModule` exposes them as `getAiScannerStatus`.
+- The persistent notification rebuilds every second while scanning:
+  `AI scanning Telegram • Frames: 12 • mob 0.14 • nude 0.02 (safe)`, or
+  `AI error: <exact reason>`, with the protection sentence in the expanded text.
+- The Apps tab shows a **Live AI scanner status** card (accessibility, screenshot support,
+  display-over-other-apps, both model descriptors, watched apps, last app/frames/scores,
+  last error) and a **Test AI models now** button that runs both models once on a generated
+  bitmap (never the screen) through `testAiModels`.
+- A model load failure is retried every 15 s instead of disabling the scanner for the whole
+  session, and `openFd` mapping falls back to copying the asset into a direct buffer, so a
+  compressed `.tflite` can no longer break the engine silently.
+- `HabitGuard` now presses Back **before** showing the overlay (the overlay takes focus, so a
+  later global Back would be handled by the block screen itself), and the overlay retries
+  with `TYPE_APPLICATION_OVERLAY` when HyperOS refuses an accessibility overlay. If neither
+  window type can be added, the failure is reported in the card and the scanner falls back to
+  Home instead of leaving the user in the app.
 
 ## Status
 
@@ -248,6 +287,9 @@ and UI from Part 5 are unchanged; the engine only reads `HabitStore.aiSettings(c
   storage, block overlay source badges.
 - [x] Part 7 — on-device AI screenshot cascade: both models, two-stage gray-zone scan,
   two-frame temporal confirmation, lifecycle wired to the accessibility service.
+- [x] Part 8 — AI scanner reliability: all-app event routing, three-tile capture with a
+  centre tile, verified model tensors, compressed-asset fallback, live notification text and
+  an Apps-tab diagnostics card with a model self-test.
 
 ## Build & run (Termux, no PC)
 
@@ -277,6 +319,11 @@ Part 7 added TensorFlow Lite and ONNX Runtime as native dependencies and downloa
 model assets, so the development APK must be rebuilt once. On a fresh clone run
 `bash scripts/download-ai-models.sh` (npm `postinstall` already does it) before building; the
 installer fails loudly if either model is missing or is an error page instead of a model.
+
+Part 8 added `SYSTEM_ALERT_WINDOW`, the `getAiScannerStatus` / `testAiModels` /
+`canDrawOverlays` bridge calls and the diagnostics card, so the development APK has to be
+rebuilt again. The accessibility XML changed (`typeWindowsChanged`, no package filter), so
+turn Habit's accessibility service off and on after installing the new APK.
 
 Build profiles live in `eas.json` (`development` = dev client APK, `preview` = release APK).
 The generated `android/` folder is never committed; `expo prebuild` (run by EAS) recreates it

@@ -49,10 +49,10 @@ data class UnlockState(
 )
 
 /**
- * Settings for the future on-device AI visual scanner.
+ * Settings for the on-device AI visual scanner.
  *
- * No analyzer runs yet. These values are persisted here so the native scanner
- * can read them without any UI or storage change when it is implemented.
+ * The scanner reads these on every tick; the UI reads them through the bridge. Removal is
+ * refused while Strict/Aggressive is protecting the phone (see [isMonitoringLocked]).
  */
 data class AiSettings(
   val enabled: Boolean = true,

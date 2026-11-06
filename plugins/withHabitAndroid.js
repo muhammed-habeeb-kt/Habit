@@ -41,15 +41,24 @@ const PERMISSIONS = [
   // Android 11+ package visibility: needed so the Apps screen can list every
   // installed package (third-party and system) instead of a filtered subset.
   'android.permission.QUERY_ALL_PACKAGES',
+  // Fallback drawing path for the block screen. The primary path is
+  // TYPE_ACCESSIBILITY_OVERLAY, but MIUI/HyperOS can refuse that window unless the app is
+  // allowed to draw over other apps, so the overlay retries with TYPE_APPLICATION_OVERLAY.
+  'android.permission.SYSTEM_ALERT_WINDOW',
 ];
 
 const ACCESSIBILITY_PERMISSION = 'android.permission.BIND_ACCESSIBILITY_SERVICE';
 
 // `settingsActivity` must point at the generated launcher activity, whose package
 // comes from `expo.android.package` — never at the internal Kotlin package.
+//
+// Deliberately NO `android:packageNames`. A package filter would make Android skip every
+// window event from Telegram and the other watched apps, so the AI screenshot loop could
+// never arm. The service receives events from all apps and decides in Kotlin (browser text
+// scan vs. watched-app screenshot cascade). keep-screen-on is off, interactive windows on.
 const accessibilityXml = (applicationPackage) => `<?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeWindowContentChanged|typeViewTextChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
     android:canRetrieveWindowContent="true"
@@ -270,7 +279,7 @@ const withHabitStrings = (config) =>
       [
         {
           $: { name: 'habit_accessibility_description' },
-          _: 'Habit checks the address and visible text of browser pages to block adult websites. Pages are never recorded or stored.',
+          _: 'Habit blocks adult websites and, when you choose apps to watch, scans their screen on this phone to close adult content. Nothing is recorded, stored or sent.',
         },
       ],
       config.modResults

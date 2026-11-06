@@ -176,6 +176,31 @@ class HabitModule : Module() {
       HabitStore.setAiBlockAlerts(appCtx, enabled).toMap()
     }
 
+    // Live diagnostics for the Apps tab card: what the scanner is doing right now, which
+    // models loaded, the last two scores and the exact last error.
+    AsyncFunction("getAiScannerStatus") {
+      AiVisualScanner.statusMap(appCtx)
+    }
+
+    // Runs both bundled models once on a generated bitmap (never the screen) so the user
+    // can prove the installed APK really contains two working models.
+    AsyncFunction("testAiModels") {
+      AiVisualScanner.selfTest(appCtx)
+    }
+
+    AsyncFunction("canDrawOverlays") {
+      Settings.canDrawOverlays(appCtx)
+    }
+
+    AsyncFunction("openOverlaySettings") {
+      openIntent(
+        Intent(
+          Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+          Uri.parse("package:${appCtx.packageName}")
+        )
+      )
+    }
+
     AsyncFunction("isAccessibilityEnabled") {
       HabitAccessibilityService.isEnabled(appCtx)
     }

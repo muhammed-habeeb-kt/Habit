@@ -53,33 +53,68 @@ object HabitGuard {
     if (!HabitStore.state(context).protectionEnabled) return
 
     val total = HabitStore.registerAttempt(context, "ai:$matchKey") ?: return
-    showBlockScreen(matchKey, total, BlockSource.ai(appLabel))
+    // `matchKey` is "<package>:ai-screenshot", so the package is recoverable for the
+    // still-in-front check that decides whether Home is needed as well as Back.
+    val packageHint = matchKey.substringBefore(':').takeIf { it.contains('.') }
+    showBlockScreen(matchKey, total, BlockSource.ai(appLabel), packageHint)
   }
 
   private fun showBlockScreen(
     matchKey: String,
     attemptsToday: Int,
-    source: BlockSource
+    source: BlockSource,
+    packageHint: String? = null
   ) {
     // A covered screen must never be classified again; stop before the overlay is added.
     AiVisualScanner.onOverlayShown()
-    val currentService = service ?: return
+    val currentService = service ?: run {
+      AiVisualScanner.noteOverlayError("block screen skipped: accessibility service is not attached")
+      return
+    }
     mainHandler.post {
+      // Back goes first: the overlay asks for focus, and a global Back fired afterwards
+      // would be delivered to the block screen's own key handler instead of the app.
       try {
+        currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+      } catch (error: Throwable) {
+        Log.w(TAG, "Back action failed: ${error.message}")
+      }
+
+      val shown = try {
         val screen = overlay ?: BlockOverlay(currentService).also { overlay = it }
         screen.show(attemptsToday, source)
-        currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
-        mainHandler.postDelayed({ verifyLeftPage(matchKey) }, HOME_FALLBACK_DELAY_MS)
       } catch (error: Throwable) {
-        Log.w(TAG, "showBlockScreen failed: ${error.message}")
+        AiVisualScanner.noteOverlayError("overlay failed: ${error.message}")
+        false
       }
+      if (!shown) {
+        AiVisualScanner.noteOverlayError(
+          "overlay blocked by the launcher — allow \"display over other apps\" for Habit"
+        )
+      }
+      mainHandler.postDelayed(
+        { verifyLeftPage(matchKey, packageHint, shown) },
+        HOME_FALLBACK_DELAY_MS
+      )
     }
   }
 
   /** If the blocked content is still on screen, escape to the home screen instead. */
-  private fun verifyLeftPage(matchKey: String) {
+  private fun verifyLeftPage(matchKey: String, packageHint: String?, overlayShown: Boolean) {
     val currentService = service ?: return
     try {
+      if (packageHint != null) {
+        // An AI block is judged by the app still being in front, not by page text: the
+        // verdict came from a screenshot inside an app, which may expose no text at all
+        // (Telegram's media viewer, for example). With no block screen to cover it, Home
+        // is the only thing that actually protects the user.
+        if (!overlayShown && currentService.foregroundPackage() == packageHint) {
+          currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+        }
+        return
+      }
+      // A browser page can stay on the adult content even after Back, so it is checked by
+      // text regardless of the overlay (the overlay is only a visual cover).
       val stillBlocked = currentService.currentPageText()
       if (stillBlocked.isNotEmpty() && AdultFilter.match(stillBlocked) != null) {
         currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)

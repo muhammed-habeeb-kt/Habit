@@ -13,6 +13,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -65,7 +66,12 @@ class BlockOverlay(private val service: HabitAccessibilityService) {
 
   private val autoHide = Runnable { hide() }
 
-  fun show(attemptsToday: Int, source: BlockSource = BlockSource.BROWSER) {
+  /**
+   * Draws the block screen and returns true when a window is actually on screen. A false
+   * result means the phone refused the overlay (HyperOS needs "display over other apps"
+   * for the fallback path), so the caller can report the failure and still escape the app.
+   */
+  fun show(attemptsToday: Int, source: BlockSource = BlockSource.BROWSER): Boolean {
     if (added && source != currentSource) {
       // The badge and wording differ per source, so build a fresh root.
       hide()
@@ -74,31 +80,49 @@ class BlockOverlay(private val service: HabitAccessibilityService) {
     attemptsView?.text = attemptsToday.toString()
     if (!added) {
       val view = buildRoot(attemptsToday, source)
-      val params = WindowManager.LayoutParams(
-        WindowManager.LayoutParams.MATCH_PARENT,
-        WindowManager.LayoutParams.MATCH_PARENT,
-        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-        PixelFormat.TRANSLUCENT
-      ).apply {
-        gravity = Gravity.TOP or Gravity.START
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-          layoutInDisplayCutoutMode =
-            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        }
-      }
-      try {
-        windowManager.addView(view, params)
+      // Accessibility overlays need no extra permission on stock Android, but MIUI /
+      // HyperOS can reject the window. The application-overlay type (SYSTEM_ALERT_WINDOW)
+      // is the documented fallback once the user allows "display over other apps".
+      added = addView(view, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY) ||
+        addView(view, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
+      if (added) {
         root = view
-        added = true
         view.requestFocus()
-      } catch (error: Throwable) {
-        Log.w(TAG, "Could not show block overlay: ${error.message}")
+      } else {
+        Log.w(TAG, "Could not show block overlay: both window types were refused")
       }
     }
     handler.removeCallbacks(autoHide)
     handler.postDelayed(autoHide, AUTO_HIDE_MS)
+    return added
+  }
+
+  private fun addView(view: View, windowType: Int): Boolean {
+    if (windowType == WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY) {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+      if (!Settings.canDrawOverlays(service)) return false
+    }
+    val params = WindowManager.LayoutParams(
+      WindowManager.LayoutParams.MATCH_PARENT,
+      WindowManager.LayoutParams.MATCH_PARENT,
+      windowType,
+      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+      PixelFormat.TRANSLUCENT
+    ).apply {
+      gravity = Gravity.TOP or Gravity.START
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        layoutInDisplayCutoutMode =
+          WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+      }
+    }
+    return try {
+      windowManager.addView(view, params)
+      true
+    } catch (error: Throwable) {
+      Log.w(TAG, "window type $windowType refused: ${error.message}")
+      false
+    }
   }
 
   fun hide() {

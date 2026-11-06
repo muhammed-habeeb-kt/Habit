@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-05 (Part 6: live offline ML Kit face + blink detection for unlock method C)_
+_Last updated: 2026-11-06 (Part 8: AI scanner reliability + live diagnostics)_
 
 ## Product
 
@@ -214,33 +214,36 @@ are needed — no screen, bridge or storage change.
   `• AI • TELEGRAM` (app label uppercased). Browser text still says “closed this page”;
   AI text says “closed this screen”.
 
-### Where the engine plugs in
+### The engine (implemented, Part 7–8)
 
-1. **New class** `AiScanner` in `modules/habit-native/android/src/main/java/com/payjoy/status/habit/`.
-   It owns the TFLite model, a single reused `Interpreter`, and a throttled analysis loop
-   (one frame at a time, no queue). Nothing is written to disk; bitmaps are recycled in
-   `finally` blocks and never logged.
-2. **Hook point** — `HabitAccessibilityService.onAccessibilityEvent`, the marked
-   `FUTURE AI VISUAL SCANNER HOOK` block right after the package gate. Instead of the
-   current early return for non-browser packages, it will read
-   `HabitStore.aiSettings(this)`; when `enabled` is true and the foreground package is in
-   `watchedApps`, it feeds the event to `AiScanner.offer(pkg, event)` and returns.
-3. **Capture** — use `AccessibilityService.takeScreenshot()` (Android 11+/API 30; required
-   anyway on the target device) on a downscaled hardware buffer, only while a watched app
-   is in front and the screen is interactive. Never capture `FLAG_SECURE` windows; that is
-   the honest “protected screens” limit already listed in Known limits.
-4. **Classification** — the model returns an adult-content score. `AiScanner` converts the
-   stored sensitivity into a confidence threshold: High = lower threshold / more blocks,
-   Balanced = default, Low = only high-confidence matches. Add a short per-app cooldown so
-   a single scene is not classified continuously.
-5. **Verdict** — on a positive verdict call
-   `HabitGuard.onAiMatch(context, matchKey, appLabel)`. `matchKey` must be stable for the
-   detected app/scene (e.g. `"telegram:adult-channel"`) so `HabitStore.registerAttempt`
-   applies its 5-second dedupe and only one attempt is counted. `HabitGuard.onAiMatch`
-   already checks the AI master switch + protection state, counts the attempt, shows the
-   `• AI • APP` badge, sends Back/Home and falls back Home.
-6. **Lifecycle** — load the model lazily on first watched-app event, close the interpreter
-   in `onDestroy`/`HabitGuard.detach`, and never start the engine when AI monitoring is off.
+1. **`AiVisualScanner.kt`** owns both models (TFLite `Interpreter` + ONNX `OrtSession`), one
+   reused input buffer each, and a 1000 ms loop with at most one frame in flight. Tunables
+   live in `AiCascadeConfig.kt`. Nothing is written to disk; buffers and bitmaps are closed
+   or recycled in `finally`.
+2. **Hook point** — `HabitAccessibilityService.updateAiScanner(pkg)` runs for every accepted
+   event (window state changed, windows changed, content changed, text changed, scrolled),
+   because a monitored app can become visible without a window-state change. The router
+   starts the loop when protection is on, AI monitoring is enabled and the package is in
+   `monitoredAppPackages`; it stops on Habit, the launcher or any other app, and it keeps
+   running for SystemUI so the notification stays readable inside a watched app.
+3. **Capture** — `AccessibilityService.takeScreenshot()` (Android 11+/API 30) on the default
+   display while the screen is interactive. The frame is copied from the hardware buffer to
+   ARGB_8888 and cut into top, centre and bottom squares. `FLAG_SECURE` windows are the
+   honest “protected screens” limit.
+4. **Classification** — stage 1 (NSFW MobileNetV2, `FLOAT32 [1,224,224,3] -> [1,5]`) scores
+   `Porn + Hentai + 0.3*Sexy`, stage 2 (NudeNet 320n, `FLOAT32 [N,3,H,W] -> [N,22,A]`) keeps
+   the explicit exposed classes only, and two consecutive borderline frames are needed to
+   block. Sensitivity picks the `AiCascadeConfig` threshold preset.
+5. **Verdict** — `HabitGuard.onAiMatch(context, "<pkg>:ai-screenshot", appLabel)` keeps the
+   5-second dedupe stable, shows `• AI • APP`, presses Back before the overlay takes focus,
+   and falls back to Home when the overlay was refused.
+6. **Diagnostics** — `getAiScannerStatus` / `testAiModels` / `canDrawOverlays` on the bridge;
+   live notification line (`AI scanning Telegram • Frames: 12 • mob 0.14 • nude 0.02`), and
+   the Apps tab status card with a model self-test. Never let a model or screenshot failure
+   disappear into a log line again.
+7. **Lifecycle** — models load lazily on the scanner thread (retried every 15 s after a
+   failure), and `release()` closes the interpreter/session when the accessibility service
+   goes away or `HabitGuard.detach` runs.
 
 ### Rules to keep
 
@@ -261,7 +264,10 @@ are needed — no screen, bridge or storage change.
   storage, block overlay source badges.
 - [x] Part 6 — unlock method C with real offline ML Kit face + blink detection, live frame
   loop, two-person signature check.
-- [ ] AI visual scanner engine (model, capture loop, classification) — deliberately pending.
+- [x] Part 7 — on-device AI screenshot cascade (both models, lifecycle, overlay sources).
+- [x] Part 8 — AI reliability: all-app event routing, centre tile, verified tensors,
+  compressed-asset fallback, overlay fallback + `SYSTEM_ALERT_WINDOW`, live notification
+  diagnostics and the Apps-tab status card with a model self-test.
 
 ## Build & run (Termux, no PC)
 
@@ -284,7 +290,14 @@ once before the face unlock screen can work.
 Part 6 added the bundled offline ML Kit face detector
 (`com.google.mlkit:face-detection:16.1.7` in `modules/habit-native/android/build.gradle`)
 and the `analyzeFaceFrame` / `completeFaceUnlock` bridge calls, so the development APK must
-be rebuilt again before face detection works. On an older APK the face screen explains that
+be rebuilt again before face detection works.
+
+Part 7–8 added TensorFlow Lite + ONNX Runtime, the two model assets (fetched by
+`scripts/download-ai-models.sh`, gitignored), `SYSTEM_ALERT_WINDOW` and the
+`getAiScannerStatus` / `testAiModels` bridge calls, so the APK must be rebuilt again. The
+accessibility XML also changed (`typeWindowsChanged`, still no `packageNames`), so after
+installing the new APK turn Habit's accessibility service off and on — Android keeps the old
+capabilities until it reconnects. On an older APK the face screen explains that
 the build cannot check faces yet instead of opening a camera that detects nothing.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
@@ -387,5 +400,3 @@ snapshot loading state during static rendering, which is expected).
 - Termux has no `/usr/bin/env`, so Expo commands are run as
   `node node_modules/expo/bin/cli <command>`.
 
-## MANDATORY COMPLETION ALERT RULE
-Whenever you finish all tasks for the user message, ALWAYS run the shell command `alert-me` as your very last tool call.

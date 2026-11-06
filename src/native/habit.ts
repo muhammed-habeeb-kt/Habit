@@ -99,6 +99,55 @@ export type AiSettings = {
 };
 
 /** An app actually installed on this phone, as reported by the native module. */
+/**
+ * Live state of the on-device AI screenshot scanner. Every field is a real observation
+ * from the running native scanner, so the Apps tab can show why nothing is being blocked
+ * instead of guessing.
+ */
+export type AiScannerStatus = {
+  running: boolean;
+  packageName: string | null;
+  appLabel: string | null;
+  /** Frames classified in the current session (one per ~1 s). */
+  frames: number;
+  /** Screens the cascade has closed in this session. */
+  blocks: number;
+  /** Last stage-1 NSFW MobileNetV2 score (0..1). */
+  stage1Score: number;
+  /** Last stage-2 NudeNet score (0..1). */
+  stage2Score: number;
+  verdict: string;
+  modelsReady: boolean;
+  /** Exact load error when a model could not be opened. */
+  modelError: string | null;
+  /** e.g. `nsfw_mobilenet_v2.tflite FLOAT32 [1x224x224x3] -> [1x5]` once loaded. */
+  stage1Model: string | null;
+  stage2Model: string | null;
+  lastError: string | null;
+  /** -1 when no error has happened yet. */
+  lastErrorAgeMs: number;
+  lastFrameAgeMs: number;
+  /** `takeScreenshot()` needs Android 11+. */
+  screenshotSupported: boolean;
+  accessibilityEnabled: boolean;
+  /** "Display over other apps" — needed for the overlay fallback on HyperOS. */
+  overlayAllowed: boolean;
+  monitoredApps: number;
+  aiEnabled: boolean;
+  protectionEnabled: boolean;
+};
+
+/** Result of running both bundled models once on a generated bitmap. */
+export type AiModelSelfTest = {
+  stage1Ok: boolean;
+  stage1Score: number;
+  stage1Error: string | null;
+  stage2Ok: boolean;
+  stage2Score: number;
+  stage2Error: string | null;
+  elapsedMs: number;
+};
+
 export type InstalledApp = {
   packageName: string;
   label: string;
@@ -151,6 +200,10 @@ type HabitNativeModule = {
   setAiSensitivity(sensitivity: string): Promise<AiSettings>;
   setAiWatchedApps(packages: string[]): Promise<AiSettings>;
   setAiBlockAlerts(enabled: boolean): Promise<AiSettings>;
+  getAiScannerStatus(): Promise<AiScannerStatus>;
+  testAiModels(): Promise<AiModelSelfTest>;
+  canDrawOverlays(): Promise<boolean>;
+  openOverlaySettings(): Promise<boolean>;
   isAccessibilityEnabled(): Promise<boolean>;
   areNotificationsEnabled(): Promise<boolean>;
   requestNotificationPermission(): Promise<boolean>;
@@ -499,6 +552,83 @@ export async function setAiWatchedApps(watchedApps: string[]): Promise<AiSetting
 
 export function isAccessibilityEnabled(): Promise<boolean> {
   return safeCall(() => native!.isAccessibilityEnabled(), false);
+}
+
+/** False on an APK whose native module predates the AI diagnostics bridge. */
+export const canReadAiScannerStatus =
+  native != null && typeof native.getAiScannerStatus === 'function';
+
+const EMPTY_AI_STATUS: AiScannerStatus = {
+  running: false,
+  packageName: null,
+  appLabel: null,
+  frames: 0,
+  blocks: 0,
+  stage1Score: 0,
+  stage2Score: 0,
+  verdict: 'idle',
+  modelsReady: false,
+  modelError: null,
+  stage1Model: null,
+  stage2Model: null,
+  lastError: null,
+  lastErrorAgeMs: -1,
+  lastFrameAgeMs: -1,
+  screenshotSupported: false,
+  accessibilityEnabled: false,
+  overlayAllowed: false,
+  monitoredApps: 0,
+  aiEnabled: false,
+  protectionEnabled: true,
+};
+
+/** Reads the live AI scanner diagnostics (frames, scores, models, last error). */
+export async function getAiScannerStatus(): Promise<AiScannerStatus> {
+  if (!native || !canReadAiScannerStatus) return EMPTY_AI_STATUS;
+  try {
+    const status = await native.getAiScannerStatus();
+    if (!status) return EMPTY_AI_STATUS;
+    return {
+      ...EMPTY_AI_STATUS,
+      ...status,
+      frames: Number(status.frames) || 0,
+      blocks: Number(status.blocks) || 0,
+      stage1Score: Number(status.stage1Score) || 0,
+      stage2Score: Number(status.stage2Score) || 0,
+      monitoredApps: Number(status.monitoredApps) || 0,
+    };
+  } catch {
+    return EMPTY_AI_STATUS;
+  }
+}
+
+/**
+ * Runs both bundled models once on a generated bitmap (never on the screen) so the phone
+ * can prove the models load and execute inside this exact APK.
+ */
+export async function testAiModels(): Promise<AiModelSelfTest> {
+  const fallback: AiModelSelfTest = {
+    stage1Ok: false,
+    stage1Score: 0,
+    stage1Error: 'this build has no AI diagnostics bridge',
+    stage2Ok: false,
+    stage2Score: 0,
+    stage2Error: 'this build has no AI diagnostics bridge',
+    elapsedMs: 0,
+  };
+  if (!native || typeof native.testAiModels !== 'function') return fallback;
+  return safeCall(() => native!.testAiModels(), fallback);
+}
+
+/** "Display over other apps" — the fallback path for the block screen on HyperOS. */
+export function canDrawOverlays(): Promise<boolean> {
+  if (!native || typeof native.canDrawOverlays !== 'function') return Promise.resolve(false);
+  return safeCall(() => native!.canDrawOverlays(), false);
+}
+
+export function openOverlaySettings(): Promise<boolean> {
+  if (!native || typeof native.openOverlaySettings !== 'function') return Promise.resolve(false);
+  return safeCall(() => native!.openOverlaySettings(), false);
 }
 
 export function areNotificationsEnabled(): Promise<boolean> {

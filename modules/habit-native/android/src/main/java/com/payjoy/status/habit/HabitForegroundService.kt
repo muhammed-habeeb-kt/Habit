@@ -30,6 +30,8 @@ class HabitForegroundService : Service() {
         HabitStore.init(this@HabitForegroundService)
         HabitUnlock.tick(this@HabitForegroundService)
         HabitWatchdog.check(this@HabitForegroundService)
+        // Includes the live AI line, so the notification updates once a second while a
+        // watched app is being scanned (frames, both scores, verdict or the exact error).
         val text = notificationText()
         if (text != lastNotificationText) {
           startAsForeground()
@@ -81,7 +83,13 @@ class HabitForegroundService : Service() {
     }
   }
 
+  /** Protection sentence, then the live AI scanner line when there is one. */
   private fun notificationText(): String {
+    val ai = AiVisualScanner.summary()
+    return if (ai.isNullOrBlank()) protectionText() else "${protectionText()}\n$ai"
+  }
+
+  private fun protectionText(): String {
     return try {
       val unlock = HabitStore.unlockState(this)
       val offWindow = unlock.offWindow
@@ -102,6 +110,7 @@ class HabitForegroundService : Service() {
 
   private fun buildNotification(): Notification {
     val body = notificationText()
+    val ai = AiVisualScanner.summary()
     lastNotificationText = body
     val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
     val contentIntent = launchIntent?.let {
@@ -114,8 +123,10 @@ class HabitForegroundService : Service() {
     }
 
     val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-      .setContentTitle("Habit protection")
-      .setContentText(body)
+      .setContentTitle(if (ai.isNullOrBlank()) "Habit protection" else "Habit AI scanner")
+      // Collapsed: the AI line is what the user is looking for. Expanded: both lines.
+      .setContentText(ai ?: body)
+      .setStyle(NotificationCompat.BigTextStyle().bigText(body))
       .setSmallIcon(applicationInfo.icon)
       .setOngoing(true)
       .setShowWhen(false)
