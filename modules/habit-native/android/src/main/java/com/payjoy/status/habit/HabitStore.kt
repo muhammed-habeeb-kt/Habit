@@ -387,9 +387,25 @@ object HabitStore {
     onStateChanged?.invoke()
   }
 
+  /**
+   * True while removing monitoring would lower an active lock: Strict or Aggressive with
+   * protection actually on. Adding apps or turning monitoring on is always allowed, and the
+   * temporary unlocked OFF window has protection off (mode Normal), so removal is allowed
+   * there too.
+   */
+  fun isMonitoringLocked(context: Context): Boolean {
+    val state = state(context)
+    return state.protectionEnabled &&
+      (state.mode == ProtectionState.MODE_STRICT ||
+        state.mode == ProtectionState.MODE_AGGRESSIVE)
+  }
+
   fun setAiMonitoringEnabled(context: Context, enabled: Boolean): AiSettings {
     synchronized(lock) {
-      val next = aiSettings(context).copy(enabled = enabled)
+      val current = aiSettings(context)
+      // Turning it off is a removal; turning it on only adds protection.
+      if (!enabled && current.enabled && isMonitoringLocked(context)) return current
+      val next = current.copy(enabled = enabled)
       writeAiSettings(context, next)
       return next
     }
@@ -407,6 +423,7 @@ object HabitStore {
 
   fun setAiWatchedApps(context: Context, packages: List<String>): AiSettings {
     synchronized(lock) {
+      val current = aiSettings(context)
       val cleaned = packages
         .asSequence()
         .map { it.trim() }
@@ -414,7 +431,12 @@ object HabitStore {
         .distinct()
         .take(200)
         .toList()
-      val next = aiSettings(context).copy(monitoredAppPackages = cleaned)
+      // Removing an already-selected app lowers a Strict/Aggressive lock, so refuse it
+      // natively even if an older UI (or JS) tries. Adding apps stays instant.
+      if (isMonitoringLocked(context) && current.monitoredAppPackages.any { it !in cleaned }) {
+        return current
+      }
+      val next = current.copy(monitoredAppPackages = cleaned)
       writeAiSettings(context, next)
       return next
     }

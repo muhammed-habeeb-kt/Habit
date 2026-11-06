@@ -10,6 +10,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Matrix
+import android.graphics.PointF
 import android.graphics.Rect
 import android.media.ExifInterface
 import android.net.Uri
@@ -18,6 +19,7 @@ import android.provider.Settings
 import android.util.Log
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import kotlin.math.hypot
 import java.util.concurrent.TimeUnit
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -152,8 +154,8 @@ class HabitModule : Module() {
       HabitStore.snapshot(appCtx)
     }
 
-    // AI monitoring settings. The scanner itself is not implemented yet: these
-    // four calls only persist what the Apps and Settings tabs show.
+    // AI monitoring settings. HabitStore refuses to remove watched apps or to turn the
+    // master switch off while Strict/Aggressive is locked; adding is always instant.
     AsyncFunction("getAiSettings") {
       HabitStore.aiSettings(appCtx).toMap()
     }
@@ -331,8 +333,10 @@ class HabitModule : Module() {
   /**
    * Analyzes one silent camera frame with the bundled offline ML Kit face detector.
    *
-   * Returns whether a face is in the frame, whether its eyes are open or mid-blink, and a
-   * normalized signature so the screen can tell Person 1 and Person 2 apart.
+   * Returns whether a face is in the frame, whether its eyes are open or mid-blink, the
+   * head Euler angles, the ML Kit tracking id and an illumination-normalized inner-feature
+   * signature. The screen uses the pose gate and the signature to tell Person 1 and
+   * Person 2 apart without ever evaluating identity on a blink frame.
    *
    * The temporary capture is deleted before this returns, whatever the outcome, and the
    * decoded bitmaps are recycled: no image is kept, logged or sent anywhere.
@@ -366,6 +370,10 @@ class HabitModule : Module() {
         "eyesClosed" to eyesClosed,
         "leftEyeProb" to left.toDouble(),
         "rightEyeProb" to right.toDouble(),
+        "eulerX" to face.headEulerAngleX.toDouble(),
+        "eulerY" to face.headEulerAngleY.toDouble(),
+        "eulerZ" to face.headEulerAngleZ.toDouble(),
+        "trackingId" to (face.trackingId?.toInt() ?: -1),
         "faceSignature" to buildFaceSignature(uprightFrame, face)
       )
     } catch (error: Throwable) {
@@ -384,18 +392,27 @@ class HabitModule : Module() {
     "eyesClosed" to false,
     "leftEyeProb" to -1.0,
     "rightEyeProb" to -1.0,
+    "eulerX" to 0.0,
+    "eulerY" to 0.0,
+    "eulerZ" to 0.0,
+    "trackingId" to -1,
     "faceSignature" to emptyList<Double>()
   )
 
-  /** Lazily builds the single reused detector: fast, landmarks on, eye probs on. */
+  /** Lazily builds the single reused detector: landmarks, eye probs and face tracking on. */
   private fun detector(): FaceDetector {
     mlkitDetector?.let { return it }
     synchronized(this) {
       mlkitDetector?.let { return it }
       val options = FaceDetectorOptions.Builder()
-        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+        // Tracking ids require accurate mode; fast mode reports -1 for every face, which
+        // would leave the two-person gate with only the colour/geometry signature.
+        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
         .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
         .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+        // Keeps one id per face across consecutive frames. Two different IDs are strong
+        // evidence of two people, and a shared ID is treated as the same person.
+        .enableTracking()
         .setMinFaceSize(0.15f)
         .build()
       return FaceDetection.getClient(options).also { mlkitDetector = it }
@@ -425,64 +442,147 @@ class HabitModule : Module() {
   }
 
   /**
-   * Normalized geometric + colour signature: landmark positions relative to the face box
-   * plus a coarse, mean-centred colour grid of the same box. Comparing two signatures
-   * separates two people without ever keeping a photo.
+   * Identity signature built only from stable inner facial features:
+   *  - [FACE_GEOMETRY_FEATURES] scale-free geometry ratios (eye-to-nose, nose-to-mouth,
+   *    mouth width, eye-to-mouth, cheek span, ear span, nose-to-mouth-bottom), all divided
+   *    by the inter-ocular distance so framing changes cancel out;
+   *  - an illumination-normalized 2x2 grid over four regions (forehead, both cheeks and
+   *    the chin), stored as chromaticity plus luma relative to the face average.
+   *
+   * The eye slits are outside every region and a blink does not move the eye landmarks, so
+   * closing the eyes cannot change the identity signature.
    */
   private fun buildFaceSignature(bitmap: Bitmap, face: Face): List<Double> {
     val box = face.boundingBox
-    val width = maxOf(1, box.width()).toDouble()
-    val height = maxOf(1, box.height()).toDouble()
-    val signature = ArrayList<Double>(FACE_LANDMARKS.size * 2 + FACE_GRID * FACE_GRID * 3)
-    for (type in FACE_LANDMARKS) {
-      val point = face.getLandmark(type)?.position
-      val x = point?.x ?: box.exactCenterX()
-      val y = point?.y ?: box.exactCenterY()
-      signature.add(((x - box.left) / width).toDouble())
-      signature.add(((y - box.top) / height).toDouble())
-    }
-    signature.addAll(colorGrid(bitmap, box))
+    val leftEye = landmark(face, FaceLandmark.LEFT_EYE, box)
+    val rightEye = landmark(face, FaceLandmark.RIGHT_EYE, box)
+    val nose = landmark(face, FaceLandmark.NOSE_BASE, box)
+    val mouthLeft = landmark(face, FaceLandmark.MOUTH_LEFT, box)
+    val mouthRight = landmark(face, FaceLandmark.MOUTH_RIGHT, box)
+    val mouthBottom = landmark(face, FaceLandmark.MOUTH_BOTTOM, box)
+    val leftCheek = landmark(face, FaceLandmark.LEFT_CHEEK, box)
+    val rightCheek = landmark(face, FaceLandmark.RIGHT_CHEEK, box)
+    val leftEar = landmark(face, FaceLandmark.LEFT_EAR, box)
+    val rightEar = landmark(face, FaceLandmark.RIGHT_EAR, box)
+
+    val eyeMid = midpoint(leftEye, rightEye)
+    val mouthCenter = midpoint(mouthLeft, mouthRight)
+    val eyeDistance = distance(leftEye, rightEye)
+      .coerceAtLeast(maxOf(1.0, box.width() * 0.25))
+
+    val signature =
+      ArrayList<Double>(FACE_GEOMETRY_FEATURES + FACE_SKIN_CELLS * 3)
+    signature.add(distance(eyeMid, nose) / eyeDistance)
+    signature.add(distance(nose, mouthCenter) / eyeDistance)
+    signature.add(distance(mouthLeft, mouthRight) / eyeDistance)
+    signature.add(distance(eyeMid, mouthBottom) / eyeDistance)
+    signature.add(distance(leftCheek, rightCheek) / eyeDistance)
+    signature.add(distance(leftEar, rightEar) / eyeDistance)
+    signature.add(distance(nose, mouthBottom) / eyeDistance)
+    signature.addAll(skinSignature(bitmap, box))
     return signature
   }
 
-  private fun colorGrid(bitmap: Bitmap, box: Rect): List<Double> {
-    val cells = DoubleArray(FACE_GRID * FACE_GRID * 3)
-    val left = box.left.coerceIn(0, bitmap.width - 1)
-    val top = box.top.coerceIn(0, bitmap.height - 1)
-    val right = box.right.coerceIn(left + 1, bitmap.width)
-    val bottom = box.bottom.coerceIn(top + 1, bitmap.height)
-    val width = right - left
-    val height = bottom - top
-    val pixels = try {
-      IntArray(width * height).also { bitmap.getPixels(it, 0, width, left, top, width, height) }
-    } catch (error: Throwable) {
-      return cells.toList()
-    }
+  /**
+   * Illumination-normalized skin grid over the forehead, both cheeks and the chin. RGB is
+   * stored as chromaticity (r/sum, g/sum), which is independent of exposure and white
+   * balance, and luma relative to the average of the sampled face, which keeps structure.
+   */
+  private fun skinSignature(bitmap: Bitmap, box: Rect): List<Double> {
+    val sums = DoubleArray(FACE_SKIN_CELLS * 3)
+    val counts = IntArray(FACE_SKIN_CELLS)
+    val boxLeft = box.left.toDouble()
+    val boxTop = box.top.toDouble()
+    val boxWidth = maxOf(1, box.width()).toDouble()
+    val boxHeight = maxOf(1, box.height()).toDouble()
+    var cell = 0
 
-    val counts = IntArray(FACE_GRID * FACE_GRID)
-    for (y in 0 until height) {
-      val row = (y * FACE_GRID / height).coerceIn(0, FACE_GRID - 1)
-      for (x in 0 until width) {
-        val column = (x * FACE_GRID / width).coerceIn(0, FACE_GRID - 1)
-        val cell = row * FACE_GRID + column
-        val pixel = pixels[y * width + x]
-        cells[cell * 3] += ((pixel shr 16) and 0xFF) / 255.0
-        cells[cell * 3 + 1] += ((pixel shr 8) and 0xFF) / 255.0
-        cells[cell * 3 + 2] += (pixel and 0xFF) / 255.0
-        counts[cell]++
+    for (region in FACE_SKIN_REGIONS) {
+      val left = boxLeft + boxWidth * region[0]
+      val top = boxTop + boxHeight * region[1]
+      val right = boxLeft + boxWidth * region[2]
+      val bottom = boxTop + boxHeight * region[3]
+      val cellWidth = (right - left) / FACE_SKIN_GRID
+      val cellHeight = (bottom - top) / FACE_SKIN_GRID
+
+      for (row in 0 until FACE_SKIN_GRID) {
+        for (column in 0 until FACE_SKIN_GRID) {
+          val startX = (left + cellWidth * column).toInt().coerceIn(0, bitmap.width - 1)
+          val startY = (top + cellHeight * row).toInt().coerceIn(0, bitmap.height - 1)
+          val endX = (left + cellWidth * (column + 1)).toInt().coerceIn(startX + 1, bitmap.width)
+          val endY = (top + cellHeight * (row + 1)).toInt().coerceIn(startY + 1, bitmap.height)
+          val width = endX - startX
+          val height = endY - startY
+          val pixels = try {
+            IntArray(width * height).also {
+              bitmap.getPixels(it, 0, width, startX, startY, width, height)
+            }
+          } catch (error: Throwable) {
+            cell++
+            continue
+          }
+          var red = 0.0
+          var green = 0.0
+          var blue = 0.0
+          for (pixel in pixels) {
+            red += ((pixel shr 16) and 0xFF) / 255.0
+            green += ((pixel shr 8) and 0xFF) / 255.0
+            blue += (pixel and 0xFF) / 255.0
+          }
+          if (pixels.isNotEmpty()) {
+            sums[cell * 3] = red / pixels.size
+            sums[cell * 3 + 1] = green / pixels.size
+            sums[cell * 3 + 2] = blue / pixels.size
+            counts[cell] = pixels.size
+          }
+          cell++
+        }
       }
     }
-    for (cell in counts.indices) {
-      val count = counts[cell]
-      if (count <= 0) continue
-      cells[cell * 3] /= count
-      cells[cell * 3 + 1] /= count
-      cells[cell * 3 + 2] /= count
+
+    val lumas = DoubleArray(FACE_SKIN_CELLS)
+    var lumaTotal = 0.0
+    var lumaCount = 0
+    for (index in 0 until FACE_SKIN_CELLS) {
+      if (counts[index] <= 0) continue
+      val luma = LUMA_RED * sums[index * 3] +
+        LUMA_GREEN * sums[index * 3 + 1] +
+        LUMA_BLUE * sums[index * 3 + 2]
+      lumas[index] = luma
+      lumaTotal += luma
+      lumaCount++
     }
-    // Mean-centring makes the signature ignore exposure and white balance.
-    val average = cells.average()
-    for (index in cells.indices) cells[index] -= average
-    return cells.toList()
+    val averageLuma = if (lumaCount > 0) maxOf(0.05, lumaTotal / lumaCount) else 1.0
+
+    val result = ArrayList<Double>(FACE_SKIN_CELLS * 3)
+    for (index in 0 until FACE_SKIN_CELLS) {
+      if (counts[index] <= 0) {
+        result.add(1.0 / 3.0)
+        result.add(1.0 / 3.0)
+        result.add(0.0)
+        continue
+      }
+      val red = sums[index * 3]
+      val green = sums[index * 3 + 1]
+      val blue = sums[index * 3 + 2]
+      val total = maxOf(1e-4, red + green + blue)
+      result.add(red / total)
+      result.add(green / total)
+      result.add((lumas[index] / averageLuma).coerceIn(0.0, 2.0) / 2.0)
+    }
+    return result
+  }
+
+  private fun landmark(face: Face, type: Int, box: Rect): PointF {
+    return face.getLandmark(type)?.position ?: PointF(box.exactCenterX(), box.exactCenterY())
+  }
+
+  private fun distance(first: PointF, second: PointF): Double {
+    return hypot((first.x - second.x).toDouble(), (first.y - second.y).toDouble())
+  }
+
+  private fun midpoint(first: PointF, second: PointF): PointF {
+    return PointF((first.x + second.x) / 2f, (first.y + second.y) / 2f)
   }
 
   private fun parseFrameUri(path: String): Uri? {
@@ -701,24 +801,23 @@ class HabitModule : Module() {
     private const val EYES_OPEN_THRESHOLD = 0.6f
     /** Either eye probability below this counts as a blink. */
     private const val EYES_CLOSED_THRESHOLD = 0.4f
-    /** Face-signature colour grid resolution. */
-    private const val FACE_GRID = 4
+    /** First entries of faceSignature are geometry ratios; JS weights these more. */
+    private const val FACE_GEOMETRY_FEATURES = 7
+    /** 2x2 cells per skin region. */
+    private const val FACE_SKIN_GRID = 2
+    /** Forehead, both cheeks and chin: the eye slits are deliberately excluded. */
+    private val FACE_SKIN_REGIONS = arrayOf(
+      floatArrayOf(0.22f, 0.08f, 0.78f, 0.28f),
+      floatArrayOf(0.10f, 0.52f, 0.40f, 0.72f),
+      floatArrayOf(0.60f, 0.52f, 0.90f, 0.72f),
+      floatArrayOf(0.32f, 0.78f, 0.68f, 0.96f)
+    )
+    private val FACE_SKIN_CELLS = FACE_SKIN_REGIONS.size * FACE_SKIN_GRID * FACE_SKIN_GRID
+    private const val LUMA_RED = 0.299
+    private const val LUMA_GREEN = 0.587
+    private const val LUMA_BLUE = 0.114
     private const val FACE_DETECT_TIMEOUT_SECONDS = 5L
     private val EXIF_ORIENTATION = ExifInterface.TAG_ORIENTATION
     private val EXIF_NORMAL = ExifInterface.ORIENTATION_NORMAL
-
-    /** Landmarks that describe face shape: stable for a person, different between people. */
-    private val FACE_LANDMARKS = intArrayOf(
-      FaceLandmark.LEFT_EYE,
-      FaceLandmark.RIGHT_EYE,
-      FaceLandmark.NOSE_BASE,
-      FaceLandmark.MOUTH_LEFT,
-      FaceLandmark.MOUTH_RIGHT,
-      FaceLandmark.MOUTH_BOTTOM,
-      FaceLandmark.LEFT_EAR,
-      FaceLandmark.RIGHT_EAR,
-      FaceLandmark.LEFT_CHEEK,
-      FaceLandmark.RIGHT_CHEEK
-    )
   }
 }

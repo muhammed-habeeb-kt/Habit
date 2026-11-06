@@ -30,8 +30,12 @@ import {
  *
  * The camera streams silent low-res frames every ~450 ms. Each one is analyzed natively
  * by the bundled offline ML Kit detector, which reports the face, the eye-open
- * probabilities (blinks) and a normalized signature. Person 1 blinks, the phone is handed
- * over, then Person 2 must show a *different* signature and blink too. Success calls
+ * probabilities (blinks), head pose, a tracking id and an illumination-normalized identity
+ * signature built from inner features only, so blinking cannot change it.
+ *
+ * Person 1 is averaged over 3 frontal open-eye frames. Person 2 must first pass 3
+ * consecutive frontal open-eye frames with a different tracking id and signature; only
+ * then is a blink accepted, and the post-blink frame is checked again. Success calls
  * `completeFaceUnlock()`, which starts the 30-minute OFF window.
  *
  * 100% on-device: frames are downscaled, measured and deleted; nothing is saved or sent.
@@ -42,8 +46,21 @@ type PersonState = 'VERIFYING' | 'VERIFIED' | 'WAITING';
 const FRAME_INTERVAL_MS = 450;
 const HANDOVER_MS = 2_000;
 const FACE_OFF_WINDOW_MS = 30 * 60 * 1000;
-/** Mean absolute signature difference below this is treated as the same person. */
+/** Weighted mean absolute signature difference below this is treated as the same person. */
 const SAME_FACE_THRESHOLD = 0.05;
+/** The native signature starts with this many scale-free geometry ratios. */
+const GEOMETRY_FEATURES = 7;
+/** Geometry separates people better than skin colour, so it is weighted heavier. */
+const GEOMETRY_WEIGHT = 4;
+/** Strict open-eye gate; a mid-blink frame never counts for identity. */
+const OPEN_EYE_PROBABILITY = 0.72;
+/** A face must be within this many degrees on all three axes to count as frontal. */
+const FRONTAL_LIMIT_DEG = 12;
+/** Open-eye frames required to record Person 1 and to lock in Person 2. */
+const BASELINE_FRAMES = 3;
+const PERSON2_STREAK = 3;
+/** A same-face frame blocks blink acceptance for this long. */
+const SAME_FACE_LOCK_MS = 2_500;
 const VIEWPORT = 240;
 const CAMERA_SIZE = VIEWPORT - 32;
 
@@ -51,15 +68,55 @@ function wait(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-/** Mean absolute difference between two normalized face signatures (0 = identical). */
+/** Weighted mean absolute difference between two signatures (0 = identical). */
 function signatureDistance(first: number[], second: number[]): number {
   const size = Math.min(first.length, second.length);
   if (size === 0) return 1;
   let total = 0;
+  let weight = 0;
   for (let index = 0; index < size; index++) {
-    total += Math.abs((first[index] ?? 0) - (second[index] ?? 0));
+    const featureWeight = index < GEOMETRY_FEATURES ? GEOMETRY_WEIGHT : 1;
+    total += featureWeight * Math.abs((first[index] ?? 0) - (second[index] ?? 0));
+    weight += featureWeight;
   }
-  return total / size;
+  return weight > 0 ? total / weight : 1;
+}
+
+/** Element-wise mean of the Person 1 baseline frames. */
+function averageSignatures(signatures: number[][]): number[] {
+  const size = Math.min(...signatures.map((signature) => signature.length));
+  if (!Number.isFinite(size) || size === 0) return [];
+  const average = new Array<number>(size).fill(0);
+  for (const signature of signatures) {
+    for (let index = 0; index < size; index++) {
+      average[index] += signature[index] ?? 0;
+    }
+  }
+  return average.map((value) => value / signatures.length);
+}
+
+/** Old APKs analyze faces but cannot report pose/tracking; the screen must say so. */
+function supportsPose(frame: FaceFrameAnalysis): boolean {
+  return (
+    typeof frame.eulerX === 'number' &&
+    typeof frame.eulerY === 'number' &&
+    typeof frame.eulerZ === 'number' &&
+    typeof frame.trackingId === 'number'
+  );
+}
+
+function isFrontal(frame: FaceFrameAnalysis): boolean {
+  return (
+    Math.abs(frame.eulerX) <= FRONTAL_LIMIT_DEG &&
+    Math.abs(frame.eulerY) <= FRONTAL_LIMIT_DEG &&
+    Math.abs(frame.eulerZ) <= FRONTAL_LIMIT_DEG
+  );
+}
+
+function hasOpenEyes(frame: FaceFrameAnalysis): boolean {
+  return (
+    frame.leftEyeProb > OPEN_EYE_PROBABILITY && frame.rightEyeProb > OPEN_EYE_PROBABILITY
+  );
 }
 
 function PersonCard({
@@ -117,6 +174,11 @@ export default function FaceUnlockScreen() {
   const seenOpen = useRef(false);
   const seenClosed = useRef(false);
   const firstSignature = useRef<number[]>([]);
+  const baselineSignatures = useRef<number[][]>([]);
+  const baselineTrackingIds = useRef<Set<number>>(new Set());
+  const person2Streak = useRef(0);
+  const person2LockedIn = useRef(false);
+  const sameFaceLockUntil = useRef(0);
 
   const [stage, setStage] = useState<Stage>('person1_scanning');
   const [facing, setFacing] = useState<CameraType>('front');
@@ -162,91 +224,163 @@ export default function FaceUnlockScreen() {
     };
   }, []);
 
-  const verify = useCallback(
-    async (frame: FaceFrameAnalysis) => {
-      if (verifying.current) return;
-      const current = stageRef.current;
-      if (current !== 'person1_scanning' && current !== 'person2_scanning') return;
-      verifying.current = true;
-      try {
-        const signature = frame.faceSignature ?? [];
+  const resetPerson2 = useCallback(() => {
+    person2Streak.current = 0;
+    person2LockedIn.current = false;
+    seenOpen.current = false;
+    seenClosed.current = false;
+  }, []);
 
-        if (current === 'person1_scanning') {
-          firstSignature.current = signature;
-          seenOpen.current = false;
-          seenClosed.current = false;
-          setSameFaceWarning(false);
-          setPhase('handover');
-          setHint('Person 1 verified. Pass the phone to Person 2');
-          return;
-        }
+  /** Same person still in front: drop Person 2's progress and block blinks for a moment. */
+  const flagSameFace = useCallback(() => {
+    sameFaceLockUntil.current = Date.now() + SAME_FACE_LOCK_MS;
+    resetPerson2();
+    setSameFaceWarning(true);
+    setHint('Same face detected — a second person must verify');
+  }, [resetPerson2]);
 
-        // Person 2 must be a different face, otherwise one person could step in twice.
-        const first = firstSignature.current;
-        if (
-          first.length > 0 &&
-          signature.length > 0 &&
-          signatureDistance(first, signature) < SAME_FACE_THRESHOLD
-        ) {
-          seenOpen.current = false;
-          seenClosed.current = false;
-          setSameFaceWarning(true);
-          setHint('Same face detected — a second person must verify');
-          return;
-        }
-
-        const unlocked = await completeFaceUnlock();
-        if (!mounted.current) return;
-        if (!unlocked) {
-          setHint('The face check expired. Start a new one from Unlock Protection.');
-          return;
-        }
-        await refresh();
-        if (!mounted.current) return;
-        setSameFaceWarning(false);
-        setPhase('both_verified');
-        setHint('Two faces verified');
-      } finally {
-        verifying.current = false;
+  const finishUnlock = useCallback(async () => {
+    if (verifying.current) return;
+    verifying.current = true;
+    try {
+      const unlocked = await completeFaceUnlock();
+      if (!mounted.current) return;
+      if (!unlocked) {
+        setHint('The face check expired. Start a new one from Unlock Protection.');
+        return;
       }
+      await refresh();
+      if (!mounted.current) return;
+      setSameFaceWarning(false);
+      setPhase('both_verified');
+      setHint('Two faces verified');
+    } finally {
+      verifying.current = false;
+    }
+  }, [refresh, setPhase]);
+
+  /** Person 1: average three frontal, open-eye frames into the baseline identity. */
+  const handlePerson1 = useCallback(
+    (frame: FaceFrameAnalysis) => {
+      if (!supportsPose(frame)) {
+        setHint('This build cannot verify faces yet — install the updated APK.');
+        return;
+      }
+      if (!frame.faceDetected) {
+        setHint("Position Person 1's face inside the circle");
+        return;
+      }
+      if (!isFrontal(frame) || !hasOpenEyes(frame)) {
+        setHint('Look straight at the camera with both eyes open');
+        return;
+      }
+      const signature = frame.faceSignature ?? [];
+      if (signature.length === 0) return;
+
+      baselineSignatures.current.push(signature);
+      if (frame.trackingId >= 0) baselineTrackingIds.current.add(frame.trackingId);
+      const collected = baselineSignatures.current.length;
+      if (collected < BASELINE_FRAMES) {
+        const remaining = BASELINE_FRAMES - collected;
+        setHint(`Hold still — ${remaining} more scan${remaining === 1 ? '' : 's'}`);
+        return;
+      }
+
+      firstSignature.current = averageSignatures(baselineSignatures.current);
+      seenOpen.current = false;
+      seenClosed.current = false;
+      setSameFaceWarning(false);
+      setPhase('handover');
+      setHint('Person 1 verified. Pass the phone to Person 2');
     },
-    [refresh, setPhase]
+    [setPhase]
   );
 
-  /** Feeds one analyzed frame into the two-step blink state machine. */
+  /** Person 2: open-eye identity gate first, blink second, post-blink recheck last. */
+  const handlePerson2 = useCallback(
+    (frame: FaceFrameAnalysis) => {
+      if (!supportsPose(frame)) {
+        setHint('This build cannot verify faces yet — install the updated APK.');
+        return;
+      }
+      if (!frame.faceDetected) {
+        resetPerson2();
+        setHint("Position Person 2's face inside the circle");
+        return;
+      }
+
+      // Tracking ids survive a blink and a head tilt, so sharing Person 1's id proves the
+      // same person is still there. This check runs even on closed-eye frames.
+      if (frame.trackingId >= 0 && baselineTrackingIds.current.has(frame.trackingId)) {
+        flagSameFace();
+        return;
+      }
+
+      // Identity is never evaluated on a blink frame. A closed frame may only start the
+      // blink after Person 2 has already passed the open-eye identity gate.
+      if (!hasOpenEyes(frame) || frame.eyesClosed) {
+        if (person2LockedIn.current && seenOpen.current && frame.eyesClosed) {
+          seenClosed.current = true;
+          setHint('Blink detected — now look at the camera');
+        } else if (!person2LockedIn.current) {
+          // A blink frame breaks the "3 consecutive open-eye frames" run.
+          person2Streak.current = 0;
+        }
+        return;
+      }
+
+      if (!isFrontal(frame)) {
+        person2Streak.current = 0;
+        setHint('Face the camera straight on');
+        return;
+      }
+
+      // A same-face frame keeps blink acceptance closed for a moment, even if the face
+      // would now look slightly different.
+      if (Date.now() < sameFaceLockUntil.current) return;
+
+      const signature = frame.faceSignature ?? [];
+      if (signature.length === 0) return;
+      const baseline = firstSignature.current;
+      if (baseline.length > 0 && signatureDistance(baseline, signature) < SAME_FACE_THRESHOLD) {
+        flagSameFace();
+        return;
+      }
+
+      if (!person2LockedIn.current) {
+        person2Streak.current += 1;
+        setSameFaceWarning(false);
+        if (person2Streak.current < PERSON2_STREAK) {
+          const remaining = PERSON2_STREAK - person2Streak.current;
+          setHint(`Hold still — ${remaining} more open-eye scan${remaining === 1 ? '' : 's'}`);
+          return;
+        }
+        person2LockedIn.current = true;
+        seenOpen.current = true;
+        seenClosed.current = false;
+        setHint('Person 2 verified. Now blink slowly...');
+        return;
+      }
+
+      if (seenClosed.current) {
+        // This open-eye frame already passed the identity gate above.
+        seenClosed.current = false;
+        void finishUnlock();
+        return;
+      }
+      seenOpen.current = true;
+      setHint('Now blink slowly...');
+    },
+    [finishUnlock, flagSameFace, resetPerson2]
+  );
+
   const handleFrame = useCallback(
     (frame: FaceFrameAnalysis) => {
       if (!mounted.current) return;
-      const person = stageRef.current === 'person2_scanning' ? 2 : 1;
-
-      if (!frame.faceDetected) {
-        seenOpen.current = false;
-        seenClosed.current = false;
-        setHint(`Position Person ${person}'s face inside the circle`);
-        return;
-      }
-
-      if (frame.eyesOpen) {
-        // Closed → open: the blink just finished.
-        if (seenClosed.current) {
-          void verify(frame);
-          return;
-        }
-        seenOpen.current = true;
-        setHint('Face detected! Now blink slowly...');
-        return;
-      }
-
-      if (frame.eyesClosed) {
-        // Open → closed: a blink starts here, so a slow blink is enough.
-        if (seenOpen.current) {
-          void verify(frame);
-          return;
-        }
-        seenClosed.current = true;
-      }
+      if (stageRef.current === 'person1_scanning') handlePerson1(frame);
+      else if (stageRef.current === 'person2_scanning') handlePerson2(frame);
     },
-    [verify]
+    [handlePerson1, handlePerson2]
   );
 
   // Sample a silent low-res frame every ~450 ms while a person is being scanned.
@@ -294,13 +428,12 @@ export default function FaceUnlockScreen() {
     if (stage !== 'handover') return;
     const timer = setTimeout(() => {
       if (!mounted.current) return;
-      seenOpen.current = false;
-      seenClosed.current = false;
+      resetPerson2();
       setPhase('person2_scanning');
       setHint("Position Person 2's face inside the circle");
     }, HANDOVER_MS);
     return () => clearTimeout(timer);
-  }, [setPhase, stage]);
+  }, [resetPerson2, setPhase, stage]);
 
   const flipCamera = () => {
     setReady(false);
@@ -316,7 +449,11 @@ export default function FaceUnlockScreen() {
         ? 'VERIFYING'
         : 'WAITING';
   const handoff = stage === 'handover';
-  const statusLabel = handoff ? 'Pass to Person 2' : 'Blink slowly';
+  const statusLabel = handoff
+    ? 'Pass to Person 2'
+    : stage === 'person1_scanning'
+      ? 'Hold still'
+      : 'Blink slowly';
   const statusIcon: keyof typeof MaterialCommunityIcons.glyphMap = sameFaceWarning
     ? 'account-alert-outline'
     : handoff
@@ -409,6 +546,8 @@ export default function FaceUnlockScreen() {
                   style={StyleSheet.absoluteFill}
                   facing={facing}
                   mirror={facing === 'front'}
+                  animateShutter={false}
+                  flash="off"
                   onCameraReady={() => setReady(true)}
                   onMountError={() => setHint('The camera could not start on this device.')}
                 />

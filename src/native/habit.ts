@@ -73,7 +73,17 @@ export type FaceFrameAnalysis = {
   /** -1 when ML Kit could not classify the eyes. */
   leftEyeProb: number;
   rightEyeProb: number;
-  /** Normalized geometric + colour signature, comparable between frames. */
+  /** Head rotation in degrees; all three stay near 0 only for a frontal face. */
+  eulerX: number;
+  eulerY: number;
+  eulerZ: number;
+  /** ML Kit face-tracking id, or -1 when the detector could not track the face. */
+  trackingId: number;
+  /**
+   * Illumination-normalized inner-feature signature. The first 7 entries are scale-free
+   * geometry ratios; the rest is a skin grid over forehead, cheeks and chin. The eye slits
+   * are excluded, so blinking does not change it.
+   */
   faceSignature: number[];
 };
 
@@ -183,6 +193,15 @@ export const canListInstalledApps =
  */
 export const canAnalyzeFaceFrames =
   native != null && typeof native.analyzeFaceFrame === 'function';
+
+/**
+ * Removing a monitored app or turning AI monitoring off is a protection removal, so it is
+ * locked while Strict/Aggressive is actually protecting the phone. Adding is always allowed.
+ * The temporary unlocked OFF window has protection off, so this returns false there.
+ */
+export function isMonitoringLocked(snapshot: HabitSnapshot | null | undefined): boolean {
+  return snapshot?.protectionEnabled === true && snapshot.mode !== 'normal';
+}
 
 /** Fail closed: without native state, protection is treated as ON. */
 const FALLBACK_UNLOCK: UnlockInfo = {

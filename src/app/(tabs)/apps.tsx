@@ -1,4 +1,5 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { router } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
@@ -6,9 +7,11 @@ import { AppTile, FrostedBanner, NeuCard, NeuSwitch, NeuWell } from '@/component
 import { TabScreen } from '@/components/tab-screen';
 import { Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
 import { useAiMonitoring } from '@/hooks/use-ai-monitoring';
+import { useProtection } from '@/hooks/use-protection';
 import {
   canListInstalledApps,
   getInstalledApps,
+  isMonitoringLocked,
   type InstalledApp,
 } from '@/native/habit';
 
@@ -16,6 +19,7 @@ type Filter = 'all' | 'selected';
 
 export default function AppsScreen() {
   const { settings, busy, toggleMaster, toggleApp } = useAiMonitoring();
+  const { snapshot } = useProtection();
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [apps, setApps] = useState<InstalledApp[]>([]);
@@ -37,6 +41,25 @@ export default function AppsScreen() {
 
   const watched = useMemo(() => settings?.monitoredAppPackages ?? [], [settings]);
   const enabled = settings?.enabled ?? false;
+  const removalLocked = isMonitoringLocked(snapshot);
+
+  // Removing an app or turning monitoring off lowers Strict/Aggressive protection, so
+  // those taps open the unlock sheet instead. Adding protection is always instant.
+  const handleToggleApp = (packageName: string) => {
+    if (removalLocked && watched.includes(packageName)) {
+      router.push('/unlock');
+      return;
+    }
+    void toggleApp(packageName);
+  };
+
+  const handleMasterToggle = (next: boolean) => {
+    if (!next && removalLocked) {
+      router.push('/unlock');
+      return;
+    }
+    void toggleMaster(next);
+  };
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -65,7 +88,7 @@ export default function AppsScreen() {
       key={app.packageName}
       app={app}
       selected={watched.includes(app.packageName)}
-      onPress={() => toggleApp(app.packageName)}
+      onPress={() => handleToggleApp(app.packageName)}
     />
   );
 
@@ -91,7 +114,7 @@ export default function AppsScreen() {
         </View>
         <NeuSwitch
           value={enabled}
-          onValueChange={toggleMaster}
+          onValueChange={handleMasterToggle}
           disabled={busy || !settings}
           label="AI App Monitoring"
         />
