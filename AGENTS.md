@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-06 (Part 8: AI scanner reliability + live diagnostics)_
+_Last updated: 2026-11-06 (Part 9: AI debug session recorder + Download export)_
 
 ## Product
 
@@ -58,6 +58,7 @@ Raising protection is always instant; lowering it in Strict/Aggressive needs an 
 | AI settings hook (JS bridge) | `src/hooks/use-ai-monitoring.ts` |
 | AI settings storage (native) | `HabitStore.kt` (`AiSettings`, `KEY_AI`) |
 | Block overlay source badges | `BlockOverlay.kt` (`BlockSource`), `HabitGuard.onAiMatch` |
+| AI debug session (frames + CSV + Download export) | `AiDebugSession.kt`, `HabitModule.exportAiDebugSession` |
 
 ## Native pieces
 
@@ -245,6 +246,30 @@ are needed — no screen, bridge or storage change.
    failure), and `release()` closes the interpreter/session when the accessibility service
    goes away or `HabitGuard.detach` runs.
 
+### Debug session recorder (Part 9)
+
+Built for threshold calibration, not for protection:
+
+8. **Toggles** — `AiSettings.debugRecordingEnabled` and `AiSettings.debugDryRun`
+   (`HabitStore.setAiDebugRecording` / `setAiDebugDryRun`), surfaced as the two switches in
+   the `Live AI scanner status` card. Dry-run is only live while recording is on, and
+   switching recording off clears it, so blocking can never be suppressed by a stale flag.
+9. **Per frame while recording** — stage 1 runs on all three tiles (full probability vector
+   kept) and stage 2 runs on all three tiles too, even when stage 1 is below 0.20. The whole
+   screenshot is saved as `filesDir/ai_debug_session/frames/frame_0001.jpg` (540 px wide,
+   JPEG 72) and one row is appended to `filesDir/ai_debug_session/scan_log.csv` with the
+   columns `frame_id,image_file,timestamp,package_name,sensitivity_mode,s_mob_max,
+   winning_tile,mob_top,mob_center,mob_bottom,p_porn,p_hentai,p_sexy,p_neutral,p_drawing,
+   s_nude_max,nude_top_class,nude_top_tile,unsure_strikes,would_block,verdict_reason,
+   stage1_ms,stage2_ms,total_ms`.
+10. **Cascade** — `would_block` is still decided by the normal rules on the winning stage-1
+    tile. Record-only mode blocks as usual; dry-run logs `would block (dry run)` and the
+    notification shows `DRY RUN`, so a long scrolling session records uninterrupted.
+11. **Export** — `exportAiDebugSession()` copies `Download/Habit_scan_log_<timestamp>.csv`
+    and `Download/Habit_debug_session_<timestamp>.zip` (CSV + `frames/`) through
+    `MediaStore.Downloads`, which needs no storage permission on Android 10+; the exact
+    paths come back to JS. `clearAiDebugSession()` deletes the CSV and every frame.
+
 ### Rules to keep
 
 - On-device only. No screenshots, embeddings or classifications leave the phone.
@@ -268,6 +293,9 @@ are needed — no screen, bridge or storage change.
 - [x] Part 8 — AI reliability: all-app event routing, centre tile, verified tensors,
   compressed-asset fallback, overlay fallback + `SYSTEM_ALERT_WINDOW`, live notification
   diagnostics and the Apps-tab status card with a model self-test.
+- [x] Part 9 — AI debug session recorder: every frame as a JPEG + CSV row (both stages on
+  all three tiles), dry-run logging, one-tap CSV + ZIP export into `Download/` via
+  `MediaStore`, and a clear button.
 
 ## Build & run (Termux, no PC)
 
@@ -299,6 +327,11 @@ accessibility XML also changed (`typeWindowsChanged`, still no `packageNames`), 
 installing the new APK turn Habit's accessibility service off and on — Android keeps the old
 capabilities until it reconnects. On an older APK the face screen explains that
 the build cannot check faces yet instead of opening a camera that detects nothing.
+
+Part 9 adds the AI debug session bridge (`setAiDebugRecording`, `setAiDebugDryRun`,
+`exportAiDebugSession`, `clearAiDebugSession`), so the development APK must be rebuilt
+again. Nothing in the manifest or the accessibility XML changed, so the accessibility
+service does not need to be toggled off and on after installing it.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,

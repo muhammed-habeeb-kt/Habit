@@ -1,14 +1,24 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, StyleSheet, Text, View } from 'react-native';
 
-import { NeuCard, SecondaryRaisedButton, StatusPill } from '@/components/neumorphic';
+import {
+  NeuCard,
+  NeuSwitch,
+  SecondaryRaisedButton,
+  StatusPill,
+} from '@/components/neumorphic';
 import { FontNames, Palette, Radii, Space, Typography } from '@/constants/theme';
 import {
+  canDebugAiSession,
   canReadAiScannerStatus,
+  clearAiDebugSession,
+  exportAiDebugSession,
   getAiScannerStatus,
   openAccessibilitySettings,
   openOverlaySettings,
+  setAiDebugDryRun,
+  setAiDebugRecording,
   testAiModels,
   type AiModelSelfTest,
   type AiScannerStatus,
@@ -48,6 +58,9 @@ export function AiScannerStatusCard() {
   const [status, setStatus] = useState<AiScannerStatus | null>(null);
   const [test, setTest] = useState<AiModelSelfTest | null>(null);
   const [testing, setTesting] = useState(false);
+  const [savingDebug, setSavingDebug] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const mounted = useRef(true);
 
   const refresh = useCallback(async () => {
@@ -77,11 +90,121 @@ export function AiScannerStatusCard() {
     }
   }, []);
 
+  const toggleRecording = useCallback(
+    async (enabled: boolean) => {
+      setSavingDebug(true);
+      // Optimistic: the native setting is written immediately, the poll confirms it.
+      setStatus((prev) => (prev ? { ...prev, debugRecordingEnabled: enabled } : prev));
+      try {
+        const next = await setAiDebugRecording(enabled);
+        if (!mounted.current) return;
+        setStatus((prev) =>
+          prev
+            ? {
+                ...prev,
+                debugRecordingEnabled: next.debugRecordingEnabled,
+                debugDryRun: next.debugDryRun,
+              }
+            : prev
+        );
+        await refresh();
+      } finally {
+        if (mounted.current) setSavingDebug(false);
+      }
+    },
+    [refresh]
+  );
+
+  const toggleDryRun = useCallback(
+    async (enabled: boolean) => {
+      setSavingDebug(true);
+      setStatus((prev) => (prev ? { ...prev, debugDryRun: enabled } : prev));
+      try {
+        const next = await setAiDebugDryRun(enabled);
+        if (!mounted.current) return;
+        setStatus((prev) =>
+          prev
+            ? {
+                ...prev,
+                debugRecordingEnabled: next.debugRecordingEnabled,
+                debugDryRun: next.debugDryRun,
+              }
+            : prev
+        );
+        await refresh();
+      } finally {
+        if (mounted.current) setSavingDebug(false);
+      }
+    },
+    [refresh]
+  );
+
+  const runExport = useCallback(async () => {
+    setExporting(true);
+    try {
+      const result = await exportAiDebugSession();
+      if (!mounted.current) return;
+      await refresh();
+      if (!mounted.current) return;
+      if (result.ok) {
+        const lines = [result.csvPath, result.zipPath].filter(
+          (line): line is string => typeof line === 'string' && line.length > 0
+        );
+        Alert.alert(
+          'Exported to Download',
+          `${lines.join('\n')}\n\n${result.frames} frame${
+            result.frames === 1 ? '' : 's'
+          } included in the ZIP.`
+        );
+      } else {
+        Alert.alert('Export failed', result.error ?? 'Nothing was saved to Download.');
+      }
+    } finally {
+      if (mounted.current) setExporting(false);
+    }
+  }, [refresh]);
+
+  const runClear = useCallback(async () => {
+    setClearing(true);
+    try {
+      const result = await clearAiDebugSession();
+      if (!mounted.current) return;
+      await refresh();
+      if (!mounted.current) return;
+      if (!result.ok) {
+        Alert.alert('Could not clear the session', result.error ?? 'Try again.');
+      }
+    } finally {
+      if (mounted.current) setClearing(false);
+    }
+  }, [refresh]);
+
+  const confirmClear = useCallback(() => {
+    Alert.alert(
+      'Clear recorded session?',
+      'The CSV and every recorded frame are deleted from this phone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: () => {
+            void runClear();
+          },
+        },
+      ]
+    );
+  }, [runClear]);
+
   const live = status?.running === true;
   const lastError = status?.lastError ?? null;
   const modelError = status?.modelError ?? null;
   const overlayAllowed = status?.overlayAllowed === true;
   const accessibilityEnabled = status?.accessibilityEnabled === true;
+  const recording = status?.debugRecordingEnabled === true;
+  const dryRun = status?.debugDryRun === true;
+  const recordedFrames = status?.recordedFrames ?? 0;
+  const debugBusy = savingDebug || exporting || clearing || status == null;
 
   return (
     <NeuCard style={styles.card}>
@@ -185,6 +308,83 @@ export function AiScannerStatusCard() {
               </Text>
             </View>
           ) : null}
+
+          <View style={styles.debugBox}>
+            <Text style={styles.sectionLabel}>DEBUG SESSION</Text>
+            <View style={styles.toggleRow}>
+              <View style={styles.grow}>
+                <Text style={styles.toggleTitle}>Record Debug CSV & Frames</Text>
+                <Text style={styles.toggleHint}>
+                  Saves every scanned frame and both model scores for calibration.
+                </Text>
+              </View>
+              <NeuSwitch
+                value={recording}
+                onValueChange={(value) => {
+                  void toggleRecording(value);
+                }}
+                disabled={debugBusy || !canDebugAiSession}
+                label="Record Debug CSV and Frames"
+              />
+            </View>
+            <View style={styles.toggleRow}>
+              <View style={styles.grow}>
+                <Text style={styles.toggleTitle}>Dry-Run Mode (Record scores without blocking)</Text>
+                <Text style={styles.toggleHint}>
+                  Logs “would block” without the block screen. Needs recording on.
+                </Text>
+              </View>
+              <NeuSwitch
+                value={dryRun}
+                onValueChange={(value) => {
+                  void toggleDryRun(value);
+                }}
+                disabled={debugBusy || !canDebugAiSession || !recording}
+                label="Dry-run mode"
+              />
+            </View>
+            <Row label="Recorded frames" value={`${recordedFrames} in session`} />
+            <SecondaryRaisedButton
+              label="⬇ Export CSV & Frames to Downloads"
+              onPress={() => {
+                void runExport();
+              }}
+              disabled={debugBusy || !canDebugAiSession || recordedFrames === 0}
+              icon={
+                exporting ? (
+                  <ActivityIndicator color={Palette.textPrimary} size="small" />
+                ) : (
+                  <MaterialCommunityIcons
+                    name="download"
+                    size={18}
+                    color={Palette.textPrimary}
+                  />
+                )
+              }
+            />
+            <SecondaryRaisedButton
+              label="🗑 Clear Recorded Session"
+              onPress={confirmClear}
+              disabled={debugBusy || !canDebugAiSession || recordedFrames === 0}
+              icon={
+                clearing ? (
+                  <ActivityIndicator color={Palette.textPrimary} size="small" />
+                ) : (
+                  <MaterialCommunityIcons
+                    name="delete-outline"
+                    size={18}
+                    color={Palette.textPrimary}
+                  />
+                )
+              }
+            />
+            {!canDebugAiSession ? (
+              <Text style={styles.note}>
+                This build has no debug session bridge. Rebuild the development APK to record
+                and export frames.
+              </Text>
+            ) : null}
+          </View>
         </>
       )}
 
@@ -321,6 +521,33 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.well,
     paddingHorizontal: 12,
     paddingVertical: 10,
+  },
+  debugBox: {
+    gap: 10,
+    borderRadius: Radii.control,
+    backgroundColor: Palette.well,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  sectionLabel: {
+    fontFamily: FontNames.monoRegular,
+    fontSize: 10,
+    lineHeight: 15,
+    letterSpacing: 1.2,
+    color: Palette.amber,
+  },
+  toggleRow: { flexDirection: 'row', alignItems: 'center', gap: Space.sm },
+  toggleTitle: {
+    ...Typography.bodyMd,
+    fontSize: 13,
+    lineHeight: 18,
+    color: Palette.textPrimary,
+  },
+  toggleHint: {
+    ...Typography.bodySm,
+    fontSize: 11,
+    lineHeight: 15,
+    color: Palette.textMuted,
   },
   benign: {
     ...Typography.bodySm,

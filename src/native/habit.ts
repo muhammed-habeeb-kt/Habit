@@ -96,6 +96,35 @@ export type AiSettings = {
   monitoredAppPackages: string[];
   aiSensitivity: AiSensitivity;
   blockAlertsEnabled: boolean;
+  /**
+   * Debug only: every scanned frame is stored as a JPEG with one CSV row of both model
+   * scores, the winning tile and the cascade verdict, for threshold calibration.
+   */
+  debugRecordingEnabled: boolean;
+  /**
+   * Debug only: record "would block" without showing the block screen, so a long session
+   * can be captured in one go. Has no effect unless `debugRecordingEnabled` is on.
+   */
+  debugDryRun: boolean;
+};
+
+/** Result of exporting the debug session into the phone's public Download folder. */
+export type AiDebugExport = {
+  ok: boolean;
+  /** e.g. `Download/Habit_scan_log_20261106_142530.csv`; null when the export failed. */
+  csvPath: string | null;
+  /** e.g. `Download/Habit_debug_session_20261106_142530.zip`; null when it failed. */
+  zipPath: string | null;
+  /** Frames included in the export. */
+  frames: number;
+  error: string | null;
+};
+
+/** Result of deleting the recorded CSV and every recorded frame. */
+export type AiDebugClear = {
+  ok: boolean;
+  framesRemoved: number;
+  error: string | null;
 };
 
 /** An app actually installed on this phone, as reported by the native module. */
@@ -135,6 +164,12 @@ export type AiScannerStatus = {
   monitoredApps: number;
   aiEnabled: boolean;
   protectionEnabled: boolean;
+  /** Debug recording of frames + CSV is on. */
+  debugRecordingEnabled: boolean;
+  /** Dry-run (log without blocking) is active for the current recording. */
+  debugDryRun: boolean;
+  /** Frames stored in the current debug session. */
+  recordedFrames: number;
 };
 
 /** Result of running both bundled models once on a generated bitmap. */
@@ -162,6 +197,8 @@ const DEFAULT_AI_SETTINGS: AiSettings = {
   monitoredAppPackages: [],
   aiSensitivity: 'balanced',
   blockAlertsEnabled: true,
+  debugRecordingEnabled: false,
+  debugDryRun: false,
 };
 
 // Session fallback for Expo Go / web, where the native store does not exist.
@@ -200,6 +237,10 @@ type HabitNativeModule = {
   setAiSensitivity(sensitivity: string): Promise<AiSettings>;
   setAiWatchedApps(packages: string[]): Promise<AiSettings>;
   setAiBlockAlerts(enabled: boolean): Promise<AiSettings>;
+  setAiDebugRecording(enabled: boolean): Promise<AiSettings>;
+  setAiDebugDryRun(enabled: boolean): Promise<AiSettings>;
+  exportAiDebugSession(): Promise<AiDebugExport>;
+  clearAiDebugSession(): Promise<AiDebugClear>;
   getAiScannerStatus(): Promise<AiScannerStatus>;
   testAiModels(): Promise<AiModelSelfTest>;
   canDrawOverlays(): Promise<boolean>;
@@ -484,6 +525,8 @@ function normalizeAiSettings(value: AiSettings | null | undefined): AiSettings {
       : DEFAULT_AI_SETTINGS.monitoredAppPackages,
     aiSensitivity: sensitivity,
     blockAlertsEnabled: value.blockAlertsEnabled !== undefined ? value.blockAlertsEnabled : DEFAULT_AI_SETTINGS.blockAlertsEnabled,
+    debugRecordingEnabled: value.debugRecordingEnabled === true,
+    debugDryRun: value.debugRecordingEnabled === true && value.debugDryRun === true,
   };
 }
 
@@ -537,6 +580,33 @@ export async function setAiBlockAlerts(enabled: boolean): Promise<AiSettings> {
   return fallbackAiSettings;
 }
 
+export async function setAiDebugRecording(enabled: boolean): Promise<AiSettings> {
+  if (!native || typeof native.setAiDebugRecording !== 'function') {
+    fallbackAiSettings = { ...fallbackAiSettings, debugRecordingEnabled: enabled };
+    return fallbackAiSettings;
+  }
+  try {
+    fallbackAiSettings = normalizeAiSettings(await native.setAiDebugRecording(enabled));
+  } catch {
+    fallbackAiSettings = { ...fallbackAiSettings, debugRecordingEnabled: enabled };
+  }
+  return fallbackAiSettings;
+}
+
+/** Dry-run only means something together with recording; native clears it otherwise. */
+export async function setAiDebugDryRun(enabled: boolean): Promise<AiSettings> {
+  if (!native || typeof native.setAiDebugDryRun !== 'function') {
+    fallbackAiSettings = { ...fallbackAiSettings, debugDryRun: enabled };
+    return fallbackAiSettings;
+  }
+  try {
+    fallbackAiSettings = normalizeAiSettings(await native.setAiDebugDryRun(enabled));
+  } catch {
+    fallbackAiSettings = { ...fallbackAiSettings, debugDryRun: enabled };
+  }
+  return fallbackAiSettings;
+}
+
 export async function setAiWatchedApps(watchedApps: string[]): Promise<AiSettings> {
   if (!native) {
     fallbackAiSettings = { ...fallbackAiSettings, monitoredAppPackages: watchedApps };
@@ -559,6 +629,9 @@ export const canReadAiScannerStatus =
   native != null && typeof native.getAiScannerStatus === 'function';
 
 const EMPTY_AI_STATUS: AiScannerStatus = {
+  debugRecordingEnabled: false,
+  debugDryRun: false,
+  recordedFrames: 0,
   running: false,
   packageName: null,
   appLabel: null,
@@ -596,10 +669,44 @@ export async function getAiScannerStatus(): Promise<AiScannerStatus> {
       stage1Score: Number(status.stage1Score) || 0,
       stage2Score: Number(status.stage2Score) || 0,
       monitoredApps: Number(status.monitoredApps) || 0,
+      recordedFrames: Number(status.recordedFrames) || 0,
+      debugRecordingEnabled: status.debugRecordingEnabled === true,
+      debugDryRun: status.debugDryRun === true,
     };
   } catch {
     return EMPTY_AI_STATUS;
   }
+}
+
+/** False on an APK whose native module predates the debug session export. */
+export const canDebugAiSession =
+  native != null && typeof native.exportAiDebugSession === 'function';
+
+/**
+ * Copies the recorded CSV and a ZIP (CSV + frames) into the phone's public `Download`
+ * folder without a storage permission (MediaStore on Android 10+).
+ */
+export async function exportAiDebugSession(): Promise<AiDebugExport> {
+  const fallback: AiDebugExport = {
+    ok: false,
+    csvPath: null,
+    zipPath: null,
+    frames: 0,
+    error: 'this build has no debug export bridge',
+  };
+  if (!native || !canDebugAiSession) return fallback;
+  return safeCall(() => native!.exportAiDebugSession(), fallback);
+}
+
+/** Deletes the recorded CSV and every recorded frame. */
+export async function clearAiDebugSession(): Promise<AiDebugClear> {
+  const fallback: AiDebugClear = {
+    ok: false,
+    framesRemoved: 0,
+    error: 'this build has no debug session bridge',
+  };
+  if (!native || typeof native.clearAiDebugSession !== 'function') return fallback;
+  return safeCall(() => native!.clearAiDebugSession(), fallback);
 }
 
 /**

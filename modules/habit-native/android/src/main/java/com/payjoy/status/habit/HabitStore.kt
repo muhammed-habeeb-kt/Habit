@@ -59,7 +59,18 @@ data class AiSettings(
   /** Package names of the apps the user selected. Empty until they choose some. */
   val monitoredAppPackages: List<String> = emptyList(),
   val aiSensitivity: String = SENSITIVITY_BALANCED,
-  val blockAlertsEnabled: Boolean = true
+  val blockAlertsEnabled: Boolean = true,
+  /**
+   * Debug only: every scanned frame is saved as a JPEG plus one CSV row (both model
+   * scores, the winning tile and the cascade verdict) for threshold calibration.
+   */
+  val debugRecordingEnabled: Boolean = false,
+  /**
+   * Debug only: log and show “would block” without opening the block screen, so a long
+   * scrolling session can be recorded in one go. It has no effect unless
+   * [debugRecordingEnabled] is on; the real cascade still runs in record-only mode.
+   */
+  val debugDryRun: Boolean = false
 ) {
   companion object {
     const val SENSITIVITY_LOW = "low"
@@ -76,7 +87,9 @@ data class AiSettings(
     "enabled" to enabled,
     "monitoredAppPackages" to monitoredAppPackages,
     "aiSensitivity" to aiSensitivity,
-    "blockAlertsEnabled" to blockAlertsEnabled
+    "blockAlertsEnabled" to blockAlertsEnabled,
+    "debugRecordingEnabled" to debugRecordingEnabled,
+    "debugDryRun" to debugDryRun
   )
 }
 
@@ -368,7 +381,9 @@ object HabitStore {
           json.optString("aiSensitivity", AiSettings.SENSITIVITY_BALANCED)
         ),
         monitoredAppPackages = watched,
-        blockAlertsEnabled = json.optBoolean("blockAlertsEnabled", true)
+        blockAlertsEnabled = json.optBoolean("blockAlertsEnabled", true),
+        debugRecordingEnabled = json.optBoolean("debugRecordingEnabled", false),
+        debugDryRun = json.optBoolean("debugDryRun", false)
       )
     } catch (error: Throwable) {
       Log.w(TAG, "AI settings unreadable, using defaults")
@@ -382,6 +397,8 @@ object HabitStore {
       .put("monitoredAppPackages", JSONArray(settings.monitoredAppPackages))
       .put("aiSensitivity", settings.aiSensitivity)
       .put("blockAlertsEnabled", settings.blockAlertsEnabled)
+      .put("debugRecordingEnabled", settings.debugRecordingEnabled)
+      .put("debugDryRun", settings.debugDryRun)
     write(context, KEY_AI, json.toString())
     cachedAi = settings
     onStateChanged?.invoke()
@@ -445,6 +462,37 @@ object HabitStore {
   fun setAiBlockAlerts(context: Context, enabled: Boolean): AiSettings {
     synchronized(lock) {
       val next = aiSettings(context).copy(blockAlertsEnabled = enabled)
+      writeAiSettings(context, next)
+      return next
+    }
+  }
+
+  /**
+   * Turns the debug frame/CSV recording on or off. Recording is a diagnostic, never a
+   * protection change, so it is allowed in every mode.
+   */
+  fun setAiDebugRecording(context: Context, enabled: Boolean): AiSettings {
+    synchronized(lock) {
+      val current = aiSettings(context)
+      // Dry-run only means something together with recording; switching recording off
+      // also leaves dry-run so a later session can never start with blocking suppressed.
+      val next = current.copy(
+        debugRecordingEnabled = enabled,
+        debugDryRun = if (enabled) current.debugDryRun else false
+      )
+      writeAiSettings(context, next)
+      return next
+    }
+  }
+
+  /** Turns dry-run (log without blocking) on or off. Ignored while recording is off. */
+  fun setAiDebugDryRun(context: Context, enabled: Boolean): AiSettings {
+    synchronized(lock) {
+      val current = aiSettings(context)
+      val next = current.copy(
+        debugDryRun = enabled,
+        debugRecordingEnabled = current.debugRecordingEnabled || enabled
+      )
       writeAiSettings(context, next)
       return next
     }
