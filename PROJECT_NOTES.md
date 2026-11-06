@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-01 (Part 5: Soft Black & Amber design system, 3-tab shell, AI monitoring UI + storage)_
+_Last updated: 2026-11-06 (Part 7: on-device AI screenshot cascade)_
 
 ## Product
 
@@ -182,65 +182,60 @@ permanent lock-out.
 **Debug-only tools** (visible only when the app is debuggable, refused in release builds):
 "Short cooldown" (60 s) and "Exit Strict now".
 
-## Future AI Visual Scanner Architecture
+## AI Visual Scanner (on-device screenshot cascade)
 
-The UI, settings and storage for AI App Monitoring are built now. The scanner itself is
-intentionally **not** implemented yet. When it is added, only the parts marked *new* below
-are needed — no screen, bridge or storage change.
+Built in `AiVisualScanner.kt` with every tunable in `AiCascadeConfig.kt`. The settings, bridge
+and UI from Part 5 are unchanged; the engine only reads `HabitStore.aiSettings(context)`.
 
-### What already exists
+### Models and build
 
-- **Persistence (native).** `HabitStore.AiSettings` is stored encrypted under `KEY_AI` as
-  `{ enabled, sensitivity: "low"|"balanced"|"high", watchedApps: [packageName, ...] }`.
-  `HabitStore.aiSettings(context)` reads it; `setAiMonitoringEnabled`,
-  `setAiSensitivity` and `setAiWatchedApps` write it and fire `onStateChanged`. The value
-  is also included in every `getSnapshot()` result under `"ai"`.
-- **JS bridge.** `src/native/habit.ts` exposes `getAiSettings`, `setAiMonitoringEnabled`,
-  `setAiSensitivity`, `setAiWatchedApps`; `src/hooks/use-ai-monitoring.ts` is the single
-  screen-facing hook.
-- **UI.** Apps tab: master switch, search, ALL / SELECTED / SUGGESTED filters, per-app
-  selection (browsers shown as covered by Browser Blocking). Settings tab: AI detection
-  sensitivity selector. Block overlay supports both source badges.
-- **Block screen sources.** `BlockOverlay.kt` now takes a `BlockSource`:
-  `BlockSource.BROWSER` renders `• BROWSER`; `BlockSource.ai(appLabel)` renders
-  `• AI • TELEGRAM` (app label uppercased). Browser text still says “closed this page”;
-  AI text says “closed this screen”.
+- `nsfw_mobilenet_v2.tflite` (17 MB, MobileNetV2 140 224, classes drawings / hentai / neutral /
+  porn / sexy) and `nudenet_320n.onnx` (12 MB, NudeNet YOLOv8n, 18 classes) live in
+  `modules/habit-native/android/src/main/assets/`.
+- Both files are gitignored (about 30 MB) and fetched by `scripts/download-ai-models.sh`, which
+  runs from npm `postinstall` and again as an explicit GitHub Actions step before
+  `expo prebuild`. It verifies the `TFL3` magic, the ONNX protobuf tag and a > 1 MB size.
+- `build.gradle` adds `org.tensorflow:tensorflow-lite:2.16.1` and
+  `com.microsoft.onnxruntime:onnxruntime-android:1.19.2`, and stores `.tflite` / `.onnx`
+  uncompressed so TFLite can map the asset instead of copying it into RAM.
+- The generated accessibility XML declares `android:canTakeScreenshot="true"`; capture needs
+  Android 11 (API 30) or newer.
 
-### Where the engine plugs in
+### Cascade per frame
 
-1. **New class** `AiScanner` in `modules/habit-native/android/src/main/java/com/payjoy/status/habit/`.
-   It owns the TFLite model, a single reused `Interpreter`, and a throttled analysis loop
-   (one frame at a time, no queue). Nothing is written to disk; bitmaps are recycled in
-   `finally` blocks and never logged.
-2. **Hook point** — `HabitAccessibilityService.onAccessibilityEvent`, the marked
-   `FUTURE AI VISUAL SCANNER HOOK` block right after the package gate. Instead of the
-   current early return for non-browser packages, it will read
-   `HabitStore.aiSettings(this)`; when `enabled` is true and the foreground package is in
-   `watchedApps`, it feeds the event to `AiScanner.offer(pkg, event)` and returns.
-3. **Capture** — use `AccessibilityService.takeScreenshot()` (Android 11+/API 30; required
-   anyway on the target device) on a downscaled hardware buffer, only while a watched app
-   is in front and the screen is interactive. Never capture `FLAG_SECURE` windows; that is
-   the honest “protected screens” limit already listed in Known limits.
-4. **Classification** — the model returns an adult-content score. `AiScanner` converts the
-   stored sensitivity into a confidence threshold: High = lower threshold / more blocks,
-   Balanced = default, Low = only high-confidence matches. Add a short per-app cooldown so
-   a single scene is not classified continuously.
-5. **Verdict** — on a positive verdict call
-   `HabitGuard.onAiMatch(context, matchKey, appLabel)`. `matchKey` must be stable for the
-   detected app/scene (e.g. `"telegram:adult-channel"`) so `HabitStore.registerAttempt`
-   applies its 5-second dedupe and only one attempt is counted. `HabitGuard.onAiMatch`
-   already checks the AI master switch + protection state, counts the attempt, shows the
-   `• AI • APP` badge, sends Back/Home and falls back Home.
-6. **Lifecycle** — load the model lazily on first watched-app event, close the interpreter
-   in `onDestroy`/`HabitGuard.detach`, and never start the engine when AI monitoring is off.
+1. `AccessibilityService.takeScreenshot` runs at most once per 1000 ms and only while a
+   selected app is in front, protection is on and the screen is interactive. One capture +
+   inference may be in flight; a tick that arrives meanwhile is dropped.
+2. The hardware buffer is wrapped and copied to an ARGB_8888 software bitmap (hardware
+   bitmaps cannot be read pixel by pixel), then split into upper and lower square tiles.
+3. Stage 1 scores each tile as `P(Porn) + P(Hentai) + 0.3 * P(Sexy)`:
+   below `stage1SafeExit` (0.20) the frame exits, at or above `stage1InstantBlock` (0.88) it
+   blocks immediately, and the gray zone runs Stage 2 on every suspicious tile.
+4. Stage 2 keeps the highest confidence of the explicit exposed classes 2
+   (`BUTTOCKS_EXPOSED`), 3 (`FEMALE_BREAST_EXPOSED`), 4 (`FEMALE_GENITALIA_EXPOSED`),
+   6 (`ANUS_EXPOSED`) and 14 (`MALE_GENITALIA_EXPOSED`). Covered classes and faces are
+   ignored. YOLO rows start with 4 box coordinates, so a class index maps to row `4 + index`;
+   both `[1, 22, 2100]` and its transposed form are read.
+5. `>= stage2ConfirmBlock` (0.55) blocks; `< stage2FalseAlarm` (0.20) clears the frame.
+   Between the two, a strike is counted, and 2 consecutive borderline frames
+   (`TEMPORAL_STRIKES_REQUIRED`) block. Any decisive frame resets the strikes.
+6. `low` / `balanced` / `high` sensitivity shifts the four thresholds; `balanced` is exactly
+   the numbers above.
 
-### Rules to keep
+### Lifecycle and blocking
 
-- On-device only. No screenshots, embeddings or classifications leave the phone.
-- The AI verdict is advisory input to the native block flow; JavaScript can never force a
-  block or write protection state.
-- Settings storage is already final. If new tuning is needed later, add fields to
-  `AiSettings` with defaults, not a second store.
+- `HabitAccessibilityService` starts or stops the loop on `TYPE_WINDOW_STATE_CHANGED`. Habit,
+  SystemUI and the launcher never start it; leaving the app, disabling protection/AI in
+  settings, or showing the overlay stops it immediately and resets the strikes.
+- A verdict calls `HabitGuard.onAiMatch` with the stable key `<package>:ai-screenshot`, so the
+  existing 5-second dedupe counts one attempt, the overlay shows `• AI • APP`, and Back/Home
+  remain the escape actions. The loop stops before the overlay is added.
+- Models load lazily on the single scanner thread, and `release()` closes both interpreters
+  when the accessibility service goes away.
+- Privacy: no frame, embedding or verdict leaves the phone and nothing is written to disk.
+  Every hardware buffer and bitmap is closed or recycled in `finally`.
+- Honest limits: `FLAG_SECURE` windows (banking apps, some streaming apps) refuse screenshots,
+  so they are not scanned; the cascade is advisory input to the native block flow only.
 
 ## Status
 
@@ -251,7 +246,8 @@ are needed — no screen, bridge or storage change.
 - [x] Part 5 — design system “C10 Soft Black & Amber”: fonts, theme tokens, neumorphic kit,
   floating 3-tab navigation, Home/Apps/Settings screens, AI monitoring UI + native settings
   storage, block overlay source badges.
-- [ ] AI visual scanner engine (model, capture loop, classification) — deliberately pending.
+- [x] Part 7 — on-device AI screenshot cascade: both models, two-stage gray-zone scan,
+  two-frame temporal confirmation, lifecycle wired to the accessibility service.
 
 ## Build & run (Termux, no PC)
 
@@ -276,6 +272,11 @@ Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 not a native blur module, so a stale development APK can still render every screen.
 The native bridge gained `getInstalledPackages` and face unlocks now create a 30-minute OFF
 window, so rebuild the development APK once for those two native changes.
+
+Part 7 added TensorFlow Lite and ONNX Runtime as native dependencies and downloads the two
+model assets, so the development APK must be rebuilt once. On a fresh clone run
+`bash scripts/download-ai-models.sh` (npm `postinstall` already does it) before building; the
+installer fails loudly if either model is missing or is an error page instead of a model.
 
 Build profiles live in `eas.json` (`development` = dev client APK, `preview` = release APK).
 The generated `android/` folder is never committed; `expo prebuild` (run by EAS) recreates it
@@ -367,5 +368,3 @@ snapshot loading state during static rendering, which is expected).
 - Termux has no `/usr/bin/env`, so Expo commands are run as
   `node node_modules/expo/bin/cli <command>`.
 
-## MANDATORY COMPLETION ALERT RULE
-Whenever you finish all tasks for the user message, ALWAYS run the shell command `alert-me` as your very last tool call.

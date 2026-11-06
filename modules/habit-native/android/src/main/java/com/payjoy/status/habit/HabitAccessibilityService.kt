@@ -4,6 +4,8 @@ import android.accessibilityservice.AccessibilityService
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
@@ -27,6 +29,9 @@ class HabitAccessibilityService : AccessibilityService() {
       HabitGuard.attach(this)
       // Starts the keep-alive only when protection (or an unlock timer) needs it.
       HabitUnlock.resumeAfterBoot(this)
+      // If Habit was enabled while a watched app was already open, no window change
+      // will arrive, so arm the cascade from the current window once.
+      rootInActiveWindow?.packageName?.toString()?.let { updateAiScanner(it) }
     } catch (error: Throwable) {
       Log.w(TAG, "onServiceConnected failed: ${error.message}")
     }
@@ -43,19 +48,14 @@ class HabitAccessibilityService : AccessibilityService() {
     }
 
     val pkg = safeEvent.packageName?.toString() ?: return
+
+    // Watched apps are guarded by the screenshot cascade, not by text scanning. The
+    // window change is also how a closed/minimised app stops the loop immediately.
+    if (safeEvent.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+      updateAiScanner(pkg)
+    }
+
     if (pkg == packageName) return
-
-    // FUTURE AI VISUAL SCANNER HOOK -------------------------------------------------
-    // When the on-device analyzer is added, this is the branch for watched apps:
-    //   val ai = HabitStore.aiSettings(this)
-    //   if (ai.enabled && pkg in ai.watchedApps) {
-    //     AiScanner.offer(pkg, safeEvent)   // throttled capture + classify, then
-    //     // HabitGuard.onAiMatch(this, matchKey, appLabel) on an adult verdict
-    //     return
-    //   }
-    // See PROJECT_NOTES.md, "Future AI Visual Scanner Architecture".
-    // -------------------------------------------------------------------------------
-
     if (pkg !in BROWSER_PACKAGES) return
 
     val now = SystemClock.elapsedRealtime()
@@ -75,12 +75,45 @@ class HabitAccessibilityService : AccessibilityService() {
 
   override fun onInterrupt() = Unit
 
+  /** Routes the foreground app: start the cascade for a selected app, stop it otherwise. */
+  private fun updateAiScanner(pkg: String) {
+    try {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+      if (pkg == packageName || pkg == SYSTEM_UI_PACKAGE || pkg == homePackage()) {
+        AiVisualScanner.stop()
+        return
+      }
+
+      val state = HabitStore.state(this)
+      val ai = HabitStore.aiSettings(this)
+      if (state.protectionEnabled && ai.enabled && pkg in ai.monitoredAppPackages) {
+        AiVisualScanner.start(this, pkg)
+      } else {
+        AiVisualScanner.stop()
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "AI scanner routing failed: ${error.message}")
+    }
+  }
+
+  private fun homePackage(): String? = try {
+    val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+    packageManager
+      .resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
+      ?.activityInfo
+      ?.packageName
+  } catch (error: Throwable) {
+    null
+  }
+
   override fun onUnbind(intent: Intent?): Boolean {
+    AiVisualScanner.stop()
     HabitGuard.detach()
     return super.onUnbind(intent)
   }
 
   override fun onDestroy() {
+    AiVisualScanner.release()
     HabitGuard.detach()
     super.onDestroy()
   }
@@ -175,6 +208,7 @@ class HabitAccessibilityService : AccessibilityService() {
 
   companion object {
     private const val TAG = "HabitA11y"
+    private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
     private const val SCAN_INTERVAL_MS = 180L
     private const val MAX_DEPTH = 10
     private const val NODE_BUDGET = 220

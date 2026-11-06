@@ -24,6 +24,7 @@ object HabitGuard {
   }
 
   fun detach() {
+    AiVisualScanner.stop()
     hideOverlay()
     // The next service instance must build a fresh overlay: a window added through a
     // destroyed accessibility connection can never be shown again.
@@ -41,12 +42,11 @@ object HabitGuard {
   }
 
   /**
-   * Entry point for the future on-device AI visual scanner.
+   * Entry point for the on-device AI visual scanner.
    *
-   * HabitAccessibilityService will call this (instead of onPageText) after its AI
-   * module classifies a screenshot of a watched app as adult content. The AI engine
-   * itself does not exist yet; the settings and storage behind it are already live.
-   * `matchKey` should be stable per app + detected scene so the 5-second dedupe works.
+   * AiVisualScanner calls this after the screenshot cascade confirms adult content in a
+   * watched app. `matchKey` is stable per app + detected scene, so the 5-second dedupe
+   * counts one attempt instead of one per analyzed frame.
    */
   fun onAiMatch(context: Context, matchKey: String, appLabel: String) {
     if (!HabitStore.aiSettings(context).enabled) return
@@ -61,6 +61,8 @@ object HabitGuard {
     attemptsToday: Int,
     source: BlockSource
   ) {
+    // A covered screen must never be classified again; stop before the overlay is added.
+    AiVisualScanner.onOverlayShown()
     val currentService = service ?: return
     mainHandler.post {
       try {

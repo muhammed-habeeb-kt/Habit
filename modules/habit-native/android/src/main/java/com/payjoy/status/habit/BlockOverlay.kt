@@ -25,8 +25,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 
 /**
- * Where a block came from. Browser blocks come from the URL/text filter; AI blocks
- * will come from the future on-device visual scanner and carry the app name.
+ * Where a block came from. Browser blocks come from the URL/text filter; AI blocks come
+ * from the on-device screenshot cascade and carry the app name.
  */
 data class BlockSource(
   val kind: String,
