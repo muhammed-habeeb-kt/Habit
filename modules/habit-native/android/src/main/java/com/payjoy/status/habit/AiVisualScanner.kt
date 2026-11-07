@@ -28,17 +28,21 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 import kotlin.math.min
 
 /**
  * On-device NSFW screenshot cascade.
  *
- * One frame per second while a watched app is in front, and only one frame in flight:
- *  - Stage 1 (TFLite MobileNetV2, 224x224) scores the top and bottom square of the screen.
- *    A low score exits immediately; a very high score blocks immediately.
- *  - Stage 2 (ONNX NudeNet 320n, 320x320) confirms the gray zone using only explicit
- *    exposed classes. A false alarm clears the frame.
+ * One frame per second while a watched app is in front (2.2 s after a run of safe frames),
+ * and only one frame in flight:
+ *  - Stage 1 (TFLite MobileNetV2, 224x224, XNNPACK + fp16) scores three squares of the
+ *    screen. A confident score blocks immediately; NudeNet can never veto it.
+ *  - Stage 2 (ONNX NudeNet 320n, 320x320) is additive only: it runs on the tiles stage 1
+ *    found suspicious and catches small thumbnails stage 1 missed.
  *  - Stage 3 is temporal: two consecutive borderline frames are needed before blocking.
+ *  - Stage 0 is free: a 16x16 pixel-diff gate skips both models when the screen is static,
+ *    and a run of safe frames relaxes the capture interval.
  *
  * Nothing is written to disk unless debug recording is on: then every frame becomes a
  * downscaled JPEG plus one CSV row under `filesDir/ai_debug_session` (see [AiDebugSession])
@@ -97,6 +101,8 @@ object AiVisualScanner {
     AiCascadeConfig.STAGE2_INPUT_SIZE * AiCascadeConfig.STAGE2_INPUT_SIZE
   private const val STAGE1_BYTES = STAGE1_PIXELS * 3 * 4
   private const val STAGE2_BYTES = STAGE2_PIXELS * 3 * 4
+  private const val STATIC_GRID_PIXELS =
+    AiCascadeConfig.STATIC_DIFF_GRID * AiCascadeConfig.STATIC_DIFF_GRID
 
   private val mainHandler = Handler(Looper.getMainLooper())
   private val worker: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
@@ -106,12 +112,18 @@ object AiVisualScanner {
   /** One capture + inference in flight; a tick that arrives meanwhile is dropped. */
   private val isProcessing = AtomicBoolean(false)
   private val unsureStrikeCount = AtomicInteger(0)
+  /** Frames the static-screen gate skipped; diagnostics only, they cost no inference. */
+  @Volatile private var skippedFrames = 0
 
   @Volatile private var running = false
   @Volatile private var activePackage: String? = null
   @Volatile private var activeService: AccessibilityService? = null
 
   @Volatile private var lastCaptureAt = 0L
+  /** Current tick delay: 1 s on interaction, 2.2 s while a safe scene stays unchanged. */
+  @Volatile private var captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
+  /** Consecutive safe frames; at [AiCascadeConfig.RELAXED_AFTER_SAFE_FRAMES] the loop relaxes. */
+  @Volatile private var safeStreak = 0
 
   // region diagnostics
   @Volatile private var appLabel: String? = null
@@ -133,6 +145,11 @@ object AiVisualScanner {
   private val stage1Pixels = IntArray(STAGE1_PIXELS)
   private val stage2Pixels = IntArray(STAGE2_PIXELS)
 
+  /** 16x16 RGB grid of the current frame and of the last completely safe frame. */
+  private val gridPixels = IntArray(STATIC_GRID_PIXELS)
+  private val lastSafeGrid = IntArray(STATIC_GRID_PIXELS)
+  private var hasSafeGrid = false
+
   private var stage1: Interpreter? = null
   private var stage1Input: ByteBuffer? = null
   private var ortEnv: OrtEnvironment? = null
@@ -146,7 +163,7 @@ object AiVisualScanner {
     override fun run() {
       if (!running) return
       captureFrame()
-      if (running) mainHandler.postDelayed(this, AiCascadeConfig.CAPTURE_INTERVAL_MS)
+      if (running) mainHandler.postDelayed(this, captureIntervalMs)
     }
   }
 
@@ -171,7 +188,11 @@ object AiVisualScanner {
     appLabel = appLabelFor(service.applicationContext, packageName)
     running = true
     frameCount = 0
+    skippedFrames = 0
     unsureStrikeCount.set(0)
+    safeStreak = 0
+    captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
+    hasSafeGrid = false
     lastVerdict = "starting"
     mainHandler.removeCallbacks(tick)
     mainHandler.post(tick)
@@ -184,7 +205,26 @@ object AiVisualScanner {
     activeService = null
     activePackage = null
     unsureStrikeCount.set(0)
+    safeStreak = 0
+    captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
+    // The next app starts on a new screen, so its first frame is always analyzed.
+    hasSafeGrid = false
     if (!lastVerdict.startsWith("blocked") && lastVerdict != "idle") lastVerdict = "stopped"
+  }
+
+  /**
+   * Called for a real interaction (scroll, typed text, window change) from the
+   * accessibility service. Never let the battery saver outlive the moment the user moved
+   * on: a relaxed loop is snapped back to the fast interval immediately instead of after
+   * the current 2.2 s sleep.
+   */
+  fun noteUserActivity() {
+    val wasRelaxed = captureIntervalMs != AiCascadeConfig.CAPTURE_INTERVAL_MS
+    safeStreak = 0
+    captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
+    if (!running || !wasRelaxed) return
+    mainHandler.removeCallbacks(tick)
+    mainHandler.post(tick)
   }
 
   /** Called the moment the block screen appears: no point classifying a covered screen. */
@@ -232,6 +272,8 @@ object AiVisualScanner {
       "packageName" to activePackage,
       "appLabel" to appLabel,
       "frames" to frameCount,
+      "skippedFrames" to skippedFrames,
+      "captureIntervalMs" to captureIntervalMs,
       "blocks" to blockCount,
       "stage1Score" to lastStage1Score.toDouble(),
       "stage2Score" to lastStage2Score.toDouble(),
@@ -345,7 +387,7 @@ object AiVisualScanner {
 
     val probe1 = probeBitmap(AiCascadeConfig.STAGE1_INPUT_SIZE)
     try {
-      stage1Score = stage1Score(probe1)
+      stage1Score = stage1Score(probe1, AiCascadeConfig.thresholds(context).sexyWeight)
       stage1Ok = true
     } catch (error: Throwable) {
       stage1Error = describe(error)
@@ -408,7 +450,7 @@ object AiVisualScanner {
     if (!isScreenInteractive(service)) return
 
     val now = SystemClock.elapsedRealtime()
-    if (now - lastCaptureAt < AiCascadeConfig.CAPTURE_INTERVAL_MS) return
+    if (now - lastCaptureAt < captureIntervalMs) return
     if (!isProcessing.compareAndSet(false, true)) return
     lastCaptureAt = now
 
@@ -448,11 +490,6 @@ object AiVisualScanner {
       if (!isActive(pkg)) return
       val service = activeService ?: return
       val context = service.applicationContext
-      if (!ensureModels(context)) {
-        // Keep the loop alive: the model load is retried, and the notification shows why.
-        lastVerdict = "model error"
-        return
-      }
 
       // HARDWARE bitmaps cannot be read pixel by pixel, so copy once to ARGB_8888.
       val hardwareBitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)
@@ -498,6 +535,27 @@ object AiVisualScanner {
     val dryRun = recording && ai.debugDryRun
     dryRunActive = dryRun
 
+    // Stage 0, free: a 16x16 grid tells whether the screen still shows the same safe
+    // scene, and then neither model runs at all.
+    val grid = sampleGrid(screen)
+    val staticSkip = hasSafeGrid &&
+      unsureStrikeCount.get() == 0 &&
+      lastStage1Score < AiCascadeConfig.STATIC_SKIP_MAX_SCORE &&
+      meanGridDiff(grid, lastSafeGrid) < AiCascadeConfig.STATIC_DIFF_THRESHOLD
+    if (staticSkip) {
+      skippedFrames += 1
+      lastFrameAt = SystemClock.elapsedRealtime()
+      lastVerdict = "skipped (unchanged screen)"
+      return
+    }
+
+    // Models load only after the free gate, so a static screen never pays for them.
+    if (!ensureModels(context)) {
+      // Keep the loop alive: the model load is retried, and the notification shows why.
+      lastVerdict = "model error"
+      return
+    }
+
     // Three overlapping square tiles (top, centre, bottom) instead of one squashed tall
     // frame. A full-screen photo or a media viewer fills the centre, while a chat column
     // fills the middle band, so the centre tile is the one that actually catches content
@@ -518,7 +576,7 @@ object AiVisualScanner {
       for (index in tiles.indices) {
         val output = stage1Probabilities(tiles[index])
         probabilities[index] = output
-        scores[index] = combinedStage1Score(output)
+        scores[index] = combinedStage1Score(output, thresholds.sexyWeight)
       }
       val stage1Ms = SystemClock.elapsedRealtime() - stage1Started
       val strongest = scores.maxOrNull() ?: 0f
@@ -529,28 +587,55 @@ object AiVisualScanner {
       lastFrameAt = SystemClock.elapsedRealtime()
       frameCount += 1
 
+      // Stage 1 blocks on its own: glamour, bikini, cleavage and adult frames never wait
+      // for NudeNet, so nothing can turn a real hit into a "false alarm" any more.
+      val stage1BlockIndex = scores.indices.firstOrNull { index ->
+        val output = probabilities[index] ?: return@firstOrNull false
+        val explicit = probability(output, 3) + probability(output, 1)
+        scores[index] >= thresholds.stage1Block ||
+          explicit >= thresholds.stage1BlockExplicit ||
+          probability(output, 4) >= thresholds.stage1BlockSexy
+      }
+      val stage1BlockReason = stage1BlockIndex?.let { index ->
+        "stage1 ${format(scores[index])} on ${TILE_NAMES.getOrElse(index) { "center" }}" +
+          " instant block"
+      }
+
+      // Stage 2 is additive only: it runs on the tiles stage 1 called suspicious, and it
+      // never runs at all once stage 1 already blocked the frame.
+      val gated = if (stage1BlockIndex != null) {
+        emptyList()
+      } else {
+        scores.indices.filter { index ->
+          val output = probabilities[index] ?: return@filter false
+          scores[index] >= AiCascadeConfig.STAGE2_GATE_SCORE ||
+            probability(output, 3) >= AiCascadeConfig.STAGE2_GATE_PORN ||
+            probability(output, 4) >= AiCascadeConfig.STAGE2_GATE_SEXY
+        }
+      }
+
       val stage2Started = SystemClock.elapsedRealtime()
       val nudity = arrayOfNulls<NudeResult>(tiles.size)
       if (recording) {
         // A calibration log needs both scores for every tile on every frame, even when
-        // stage 1 already left the gray zone.
+        // stage 1 already blocked or left the gray zone. The verdict below still reads the
+        // gated tiles only, so a recorded log never disagrees with production behaviour.
         for (index in tiles.indices) nudity[index] = stage2Detail(tiles[index])
-      } else if (strongest >= thresholds.stage1SafeExit &&
-        strongest < thresholds.stage1InstantBlock && winnerIndex >= 0
-      ) {
-        // Normal mode keeps stage 2 to the strongest suspicious tile: one extra inference
-        // per frame keeps the 1 s cadence on mid-range phones.
-        nudity[winnerIndex] = stage2Detail(tiles[winnerIndex])
+      } else {
+        for (index in gated) nudity[index] = stage2Detail(tiles[index])
       }
       val stage2Ms = SystemClock.elapsedRealtime() - stage2Started
 
-      val winnerNude = if (winnerIndex >= 0) nudity[winnerIndex]?.score ?: 0f else 0f
       val scored = nudity.indices.filter { nudity[it] != null }
       val nudeTopIndex = scored.maxByOrNull { nudity[it]?.score ?: 0f }
       val nudeTop = nudeTopIndex?.let { nudity[it] }
-      lastStage2Score = if (recording) nudeTop?.score ?: 0f else winnerNude
+      // Only a gated tile may block: a tile stage 1 read as pure text must not start
+      // blocking through a NudeNet run that exists only for the debug log.
+      val verdictNude = if (gated.isEmpty()) 0f else gated.maxOf { nudity[it]?.score ?: 0f }
+      lastStage2Score = nudeTop?.score ?: verdictNude
 
-      val verdict = evaluate(strongest, winnerNude, thresholds)
+      val verdict =
+        evaluate(strongest, stage1BlockReason, gated.isNotEmpty(), verdictNude, thresholds)
 
       if (recording) {
         val winnerTile = TILE_NAMES.getOrElse(winnerIndex) { "center" }
@@ -589,6 +674,13 @@ object AiVisualScanner {
         }
       }
 
+      // Only a genuinely safe frame may become the reference for the free pixel gate.
+      if (verdict.strikes == 0 && strongest < AiCascadeConfig.STATIC_SKIP_MAX_SCORE) {
+        System.arraycopy(grid, 0, lastSafeGrid, 0, grid.size)
+        hasSafeGrid = true
+      }
+      adaptCaptureInterval(strongest, lastStage2Score)
+
       lastVerdict = if (dryRun && verdict.wouldBlock) "would block (dry run)" else verdict.text
       if (verdict.wouldBlock && !dryRun) {
         blockCount += 1
@@ -610,60 +702,66 @@ object AiVisualScanner {
   )
 
   /**
-   * The cascade rules, unchanged by debug recording: stage 1 leaves early below the safe
-   * exit or blocks instantly above the instant threshold, stage 2 confirms or clears the
-   * gray zone and two consecutive unsure frames block.
+   * The cascade rules, unchanged by debug recording:
+   *  - a stage 1 direct block wins and clears the strikes,
+   *  - a frame whose tiles never crossed the stage 2 gate is safe,
+   *  - NudeNet at [AiCascadeConfig.Thresholds.nudeBlock] blocks immediately,
+   *  - a borderline frame (NudeNet or stage 1) counts as a strike; two in a row block,
+   *  - anything else clears the strikes. NudeNet can never clear a stage 1 block.
    */
   private fun evaluate(
     strongest: Float,
+    stage1BlockReason: String?,
+    gated: Boolean,
     nude: Float,
     thresholds: AiCascadeConfig.Thresholds
   ): Verdict {
     return when {
-      strongest < thresholds.stage1SafeExit -> {
+      stage1BlockReason != null -> {
         unsureStrikeCount.set(0)
-        Verdict(false, 0, "stage1 ${format(strongest)} below safe exit", "safe")
+        Verdict(true, 0, stage1BlockReason, "blocked (stage 1 ${format(strongest)})")
       }
-      strongest >= thresholds.stage1InstantBlock -> {
+      !gated -> {
+        unsureStrikeCount.set(0)
+        Verdict(false, 0, "stage1 ${format(strongest)} below stage 2 gate", "safe")
+      }
+      nude >= thresholds.nudeBlock -> {
         unsureStrikeCount.set(0)
         Verdict(
           true,
           0,
-          "stage1 ${format(strongest)} instant block",
-          "blocked (stage 1 ${format(strongest)})"
-        )
-      }
-      nude >= thresholds.stage2ConfirmBlock -> {
-        unsureStrikeCount.set(0)
-        Verdict(
-          true,
-          0,
-          "nudenet ${format(nude)} confirm",
+          "nudenet ${format(nude)} instant block",
           "blocked (nudenet ${format(nude)})"
         )
       }
-      nude < thresholds.stage2FalseAlarm -> {
-        unsureStrikeCount.set(0)
-        Verdict(false, 0, "nudenet ${format(nude)} false alarm", "safe")
-      }
-      else -> {
+      nude >= thresholds.nudeTemporal || strongest >= thresholds.stage1Temporal -> {
         val strikes = unsureStrikeCount.incrementAndGet()
+        val detail = "nudenet ${format(nude)}, stage1 ${format(strongest)}"
         if (strikes >= thresholds.strikesRequired) {
           unsureStrikeCount.set(0)
           Verdict(
             true,
             strikes,
-            "temporal $strikes unsure frames",
+            "temporal $strikes unsure frames ($detail)",
             "blocked ($strikes unsure frames)"
           )
         } else {
           Verdict(
             false,
             strikes,
-            "unsure $strikes/${thresholds.strikesRequired}",
+            "unsure $strikes/${thresholds.strikesRequired} ($detail)",
             "unsure ($strikes/${thresholds.strikesRequired})"
           )
         }
+      }
+      else -> {
+        unsureStrikeCount.set(0)
+        Verdict(
+          false,
+          0,
+          "nudenet ${format(nude)} under ${format(thresholds.nudeTemporal)}",
+          "safe"
+        )
       }
     }
   }
@@ -682,8 +780,14 @@ object AiVisualScanner {
     return try {
       closeModels()
 
-      val interpreter =
-        Interpreter(loadTflite(context), Interpreter.Options().setNumThreads(STAGE1_THREADS))
+      // XNNPACK is the only delegate that keeps a 224px MobileNet inside a few ms, and fp16
+      // accumulation (ARMv8.2+) halves its memory traffic; unsupported CPUs fall back to
+      // fp32 kernels of the same graph without failing the load.
+      val options = Interpreter.Options()
+        .setNumThreads(STAGE1_THREADS)
+        .setUseXNNPACK(true)
+        .setAllowFp16PrecisionForFp32(true)
+      val interpreter = Interpreter(loadTflite(context), options)
       stage1Info = describeTflite(interpreter)
 
       val inputShape = interpreter.getInputTensor(0).shape()
@@ -807,14 +911,16 @@ object AiVisualScanner {
       val output = interpreter.getOutputTensor(0)
       "${AiCascadeConfig.STAGE1_ASSET} ${input.dataType()} " +
         input.shape().joinToString("x", "[", "]") +
-        " -> " + output.shape().joinToString("x", "[", "]")
+        " -> " + output.shape().joinToString("x", "[", "]") +
+        " (XNNPACK, fp16)"
     } catch (error: Throwable) {
       AiCascadeConfig.STAGE1_ASSET
     }
   }
 
-  /** Stage 1 combined score: Porn + Hentai + 0.3 * Sexy. */
-  private fun stage1Score(crop: Bitmap): Float = combinedStage1Score(stage1Probabilities(crop))
+  /** Stage 1 combined score for the self-test. */
+  private fun stage1Score(crop: Bitmap, sexyWeight: Float): Float =
+    combinedStage1Score(stage1Probabilities(crop), sexyWeight)
 
   /**
    * Stage 1 raw output: RGB / 255, NHWC [1, 224, 224, 3] -> one probability per class, in
@@ -851,9 +957,14 @@ object AiVisualScanner {
     }
   }
 
-  private fun combinedStage1Score(probabilities: FloatArray): Float = when {
+  /**
+   * Stage 1 combined score: Porn + Hentai + sexyWeight * Sexy. The sexy weight is the
+   * sensitivity preset's (`0.85` in high, `0.60` in balanced, `0.30` in low), so bikini,
+   * cleavage and lingerie frames score high enough to block without NudeNet.
+   */
+  private fun combinedStage1Score(probabilities: FloatArray, sexyWeight: Float): Float = when {
     probabilities.size >= STAGE1_CLASSES ->
-      probabilities[3] + probabilities[1] + 0.3f * probabilities[4]
+      probabilities[3] + probabilities[1] + sexyWeight * probabilities[4]
     probabilities.size == 1 -> probabilities[0]
     probabilities.isEmpty() -> 0f
     // Unknown class order: treat every non-zero class as explicit rather than ignoring it.
@@ -969,6 +1080,60 @@ object AiVisualScanner {
     // Stop before the overlay exists so the covered screen is never classified again.
     stop()
     HabitGuard.onAiMatch(context, "$pkg:ai-screenshot", label)
+  }
+
+  /**
+   * 16x16 RGB sample of the whole screen: 256 `getPixel` reads cost well under a millisecond,
+   * which is nothing compared to a stage 1 inference, and they are enough to tell "same
+   * screen" from "something moved".
+   */
+  private fun sampleGrid(screen: Bitmap): IntArray {
+    val step = AiCascadeConfig.STATIC_DIFF_GRID
+    val maxX = (screen.width - 1).coerceAtLeast(0)
+    val maxY = (screen.height - 1).coerceAtLeast(0)
+    for (gy in 0 until step) {
+      val y = ((gy + 0.5f) * screen.height / step).toInt().coerceIn(0, maxY)
+      for (gx in 0 until step) {
+        val x = ((gx + 0.5f) * screen.width / step).toInt().coerceIn(0, maxX)
+        gridPixels[gy * step + gx] = screen.getPixel(x, y)
+      }
+    }
+    return gridPixels
+  }
+
+  /** Mean absolute per-channel difference of two grids, on the 0..255 scale. */
+  private fun meanGridDiff(current: IntArray, previous: IntArray): Float {
+    if (current.size != previous.size || current.isEmpty()) return Float.MAX_VALUE
+    var sum = 0L
+    for (index in current.indices) {
+      val a = current[index]
+      val b = previous[index]
+      sum += abs(((a shr 16) and 0xFF) - ((b shr 16) and 0xFF)).toLong()
+      sum += abs(((a shr 8) and 0xFF) - ((b shr 8) and 0xFF)).toLong()
+      sum += abs((a and 0xFF) - (b and 0xFF)).toLong()
+    }
+    return sum.toFloat() / (current.size * 3)
+  }
+
+  /**
+   * Battery saver for long stretches of normal video: after
+   * [AiCascadeConfig.RELAXED_AFTER_SAFE_FRAMES] safe frames the tick relaxes to
+   * [AiCascadeConfig.RELAXED_CAPTURE_INTERVAL_MS], and any score at or above
+   * [AiCascadeConfig.ADAPTIVE_FAST_SCORE] snaps it straight back to one second.
+   */
+  private fun adaptCaptureInterval(strongest: Float, nude: Float) {
+    val signal = strongest >= AiCascadeConfig.ADAPTIVE_FAST_SCORE
+    val safe = strongest < AiCascadeConfig.ADAPTIVE_SAFE_SCORE &&
+      nude < AiCascadeConfig.ADAPTIVE_SAFE_NUDE
+    if (signal || !safe) {
+      safeStreak = 0
+      captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
+      return
+    }
+    safeStreak += 1
+    if (safeStreak >= AiCascadeConfig.RELAXED_AFTER_SAFE_FRAMES) {
+      captureIntervalMs = AiCascadeConfig.RELAXED_CAPTURE_INTERVAL_MS
+    }
   }
 
   private fun shouldScan(service: AccessibilityService, pkg: String): Boolean {

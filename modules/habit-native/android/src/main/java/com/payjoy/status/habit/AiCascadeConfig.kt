@@ -5,19 +5,25 @@ import android.content.Context
 /**
  * Every tunable of the on-device AI NSFW screenshot cascade lives here.
  *
- * The pipeline is two-stage so a normal screen costs one small classifier run:
- *  - Stage 1 is a 224x224 MobileNetV2 NSFW classifier (`.tflite`, LiteRT). A score below
- *    [Thresholds.stage1SafeExit] ends the frame immediately; a score at or above
- *    [Thresholds.stage1InstantBlock] is a confident hit; anything in between is the
- *    "gray zone" that goes to stage 2.
- *  - Stage 2 is a 320x320 NudeNet YOLOv8n detector (`.onnx`, ONNX Runtime). It confirms
- *    the gray zone ([Thresholds.stage2ConfirmBlock]) or calls it a false alarm.
- *  - [TEMPORAL_STRIKES_REQUIRED] consecutive confirmed frames are needed before the block
- *    flow runs, so a single unlucky frame (a thumbnail, a poster) cannot close an app.
+ * The pipeline is two-stage so a normal screen costs at most one small classifier run:
+ *  - Stage 1 is a 224x224 MobileNetV2 NSFW classifier (`.tflite`, LiteRT). Its score is
+ *    `p_porn + p_hentai + sexyWeight * p_sexy`, so glamour, bikini, cleavage and lingerie
+ *    frames score high even when nothing is explicitly exposed. A confident stage 1 score
+ *    blocks the frame on its own — NudeNet never gets a chance to veto it.
+ *  - Stage 2 is a 320x320 NudeNet YOLOv8n detector (`.onnx`, ONNX Runtime) and is strictly
+ *    additive: it only runs on the tiles stage 1 found suspicious, and only to catch small
+ *    thumbnails stage 1 missed. It can never clear a stage 1 hit.
+ *  - [Thresholds.strikesRequired] consecutive unsure frames are needed before the block flow
+ *    runs, so a single unlucky frame cannot close an app.
  *
- * The numbers below are the `balanced` preset. `high` blocks more (lower thresholds,
- * more sensitivity), `low` only blocks confident matches (higher thresholds). Models are
- * downloaded into `src/main/assets` by `scripts/download-ai-models.sh`.
+ * Power is kept down by three gates:
+ *  - a 16x16 pixel-diff check skips the whole cascade when the screen did not change,
+ *  - stage 2 only runs on tiles that crossed [STAGE2_GATE_SCORE] / the explicit gates,
+ *  - a run of safe frames relaxes the capture interval to [RELAXED_CAPTURE_INTERVAL_MS].
+ *
+ * The numbers below are the `balanced` preset. `high` blocks more (lower thresholds, more
+ * sensitivity), `low` only blocks confident matches. Models are downloaded into
+ * `src/main/assets` by `scripts/download-ai-models.sh`.
  */
 object AiCascadeConfig {
   const val STAGE1_ASSET = "nsfw_mobilenet_v2.tflite"
@@ -25,49 +31,95 @@ object AiCascadeConfig {
 
   /** One frame at a time, no queue: never analyze the same scene more than once a second. */
   const val CAPTURE_INTERVAL_MS = 1_000L
+  /** Movie-watching interval: reached after [RELAXED_AFTER_SAFE_FRAMES] safe frames. */
+  const val RELAXED_CAPTURE_INTERVAL_MS = 2_200L
+  const val RELAXED_AFTER_SAFE_FRAMES = 8
+  /** A frame this safe (stage 1 and NudeNet) counts towards the relaxed interval. */
+  const val ADAPTIVE_SAFE_SCORE = 0.06f
+  const val ADAPTIVE_SAFE_NUDE = 0.08f
+  /** Any stage 1 signal at or above this keeps the fast interval. */
+  const val ADAPTIVE_FAST_SCORE = 0.08f
+  /** "No separate rule": the combined score already folds `p_sexy` in. */
+  val NEVER = Float.MAX_VALUE
+
+  /** Zero-power gate: 16x16 RGB grid, mean absolute difference out of 255. */
+  const val STATIC_DIFF_GRID = 16
+  const val STATIC_DIFF_THRESHOLD = 3.0f
+  /** The pixel gate only applies when the previous frame was this safe. */
+  const val STATIC_SKIP_MAX_SCORE = 0.12f
+
+  /**
+   * Stage 2 gate: a tile needs at least one of these before NudeNet runs on it. Pure text
+   * and UI tiles stay at zero, so a chat screen costs one stage 1 run and nothing else.
+   */
+  const val STAGE2_GATE_SCORE = 0.04f
+  const val STAGE2_GATE_PORN = 0.01f
+  const val STAGE2_GATE_SEXY = 0.05f
 
   const val STAGE1_INPUT_SIZE = 224
   const val STAGE2_INPUT_SIZE = 320
 
-  const val STAGE1_SAFE_EXIT_THRESHOLD = 0.20f
-  const val STAGE1_INSTANT_BLOCK_THRESHOLD = 0.88f
-  const val STAGE2_CONFIRM_BLOCK_THRESHOLD = 0.55f
-  const val STAGE2_FALSE_ALARM_THRESHOLD = 0.20f
-  const val TEMPORAL_STRIKES_REQUIRED = 2
-
-  /** Sensitivity-adjusted thresholds. `balanced` is exactly the constants above. */
+  /** Sensitivity-adjusted thresholds. `balanced` is the default aggressive preset. */
   data class Thresholds(
-    val stage1SafeExit: Float,
-    val stage1InstantBlock: Float,
-    val stage2ConfirmBlock: Float,
-    val stage2FalseAlarm: Float,
+    /** Combined stage 1 score that blocks without NudeNet. */
+    val stage1Block: Float,
+    /** `p_porn + p_hentai` that blocks without NudeNet. */
+    val stage1BlockExplicit: Float,
+    /** `p_sexy` that blocks without NudeNet (glamour / bikini / lingerie). */
+    val stage1BlockSexy: Float,
+    /** Weight of `p_sexy` inside the combined stage 1 score. */
+    val sexyWeight: Float,
+    /** NudeNet score that blocks immediately. */
+    val nudeBlock: Float,
+    /** NudeNet score that makes the frame "unsure" (two in a row block). */
+    val nudeTemporal: Float,
+    /** Stage 1 score that makes the frame unsure even when NudeNet is low. */
+    val stage1Temporal: Float,
     val strikesRequired: Int
   )
 
+  /**
+   * Default preset: a combined stage 1 of 0.58 or `p_porn + p_hentai` of 0.35 blocks on its
+   * own, and a NudeNet hit at 0.35 blocks a borderline tile. There is no separate `p_sexy`
+   * rule: the combined score already weighs it at 0.60.
+   */
   val BALANCED = Thresholds(
-    stage1SafeExit = STAGE1_SAFE_EXIT_THRESHOLD,
-    stage1InstantBlock = STAGE1_INSTANT_BLOCK_THRESHOLD,
-    stage2ConfirmBlock = STAGE2_CONFIRM_BLOCK_THRESHOLD,
-    stage2FalseAlarm = STAGE2_FALSE_ALARM_THRESHOLD,
-    strikesRequired = TEMPORAL_STRIKES_REQUIRED
+    stage1Block = 0.58f,
+    stage1BlockExplicit = 0.35f,
+    stage1BlockSexy = NEVER,
+    sexyWeight = 0.60f,
+    nudeBlock = 0.35f,
+    nudeTemporal = 0.14f,
+    stage1Temporal = 0.24f,
+    strikesRequired = 2
   )
 
-  /** Catches more: exits the safe branch sooner and confirms the gray zone more easily. */
+  /**
+   * Most aggressive preset: any tile with a combined 0.45, `p_porn + p_hentai >= 0.25` or
+   * `p_sexy >= 0.55` blocks in stage 1, and NudeNet only has to reach 0.25 to block a tile
+   * stage 1 called borderline.
+   */
   val HIGH = Thresholds(
-    stage1SafeExit = 0.14f,
-    stage1InstantBlock = 0.80f,
-    stage2ConfirmBlock = 0.45f,
-    stage2FalseAlarm = 0.15f,
-    strikesRequired = TEMPORAL_STRIKES_REQUIRED
+    stage1Block = 0.45f,
+    stage1BlockExplicit = 0.25f,
+    stage1BlockSexy = 0.55f,
+    sexyWeight = 0.85f,
+    nudeBlock = 0.25f,
+    nudeTemporal = 0.14f,
+    stage1Temporal = 0.24f,
+    strikesRequired = 2
   )
 
   /** Blocks only high-confidence matches, accepting that some adult scenes get through. */
   val LOW = Thresholds(
-    stage1SafeExit = 0.30f,
-    stage1InstantBlock = 0.94f,
-    stage2ConfirmBlock = 0.70f,
-    stage2FalseAlarm = 0.30f,
-    strikesRequired = TEMPORAL_STRIKES_REQUIRED
+    stage1Block = 0.94f,
+    stage1BlockExplicit = NEVER,
+    stage1BlockSexy = NEVER,
+    sexyWeight = 0.30f,
+    nudeBlock = 0.70f,
+    nudeTemporal = 0.30f,
+    stage1Temporal = 0.45f,
+    strikesRequired = 2
   )
 
   fun thresholds(sensitivity: String?): Thresholds = when (sensitivity) {

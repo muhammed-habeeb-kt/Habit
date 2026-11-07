@@ -23,6 +23,9 @@ class HabitAccessibilityService : AccessibilityService() {
   /** Throttles the AI router: content-changed events arrive many times per second. */
   private var lastRoutedPackage: String? = null
   private var lastRoutedAt = 0L
+  /** Throttles the zero-power text trap, which runs on every accepted event. */
+  private var lastTextTrapPackage: String? = null
+  private var lastTextTrapAt = 0L
   /** The launcher package never changes while the service runs. */
   @Volatile private var cachedHomePackage: String? = null
 
@@ -55,6 +58,10 @@ class HabitAccessibilityService : AccessibilityService() {
 
     val pkg = safeEvent.packageName?.toString() ?: return
 
+    // A scroll, a typed word or an app switch means a new frame can be in view, so the
+    // relaxed battery interval is dropped before it can hide content the user just opened.
+    if (safeEvent.eventType in INTERACTION_EVENTS) AiVisualScanner.noteUserActivity()
+
     // Watched apps are guarded by the screenshot cascade, not by text or URL scanning.
     // Every event is offered to the router, not just a window-state change: Telegram can
     // become visible through a notification, a share sheet or a split-screen resume without
@@ -63,6 +70,10 @@ class HabitAccessibilityService : AccessibilityService() {
     // so the extra events cost nothing, and it stops the loop as soon as another app is in
     // front.
     updateAiScanner(pkg)
+
+    // Zero-power trap: a watched app that already shows an adult indicator as text blocks
+    // right here, before any screenshot or model runs.
+    scanWatchedAppText(pkg)
 
     if (pkg == packageName) return
     if (pkg !in BROWSER_PACKAGES) return
@@ -119,6 +130,77 @@ class HabitAccessibilityService : AccessibilityService() {
     } catch (error: Throwable) {
       Log.w(TAG, "AI scanner routing failed: ${error.message}")
     }
+  }
+
+  /**
+   * Zero-power text trap for watched apps.
+   *
+   * A screenshot arrives at most once a second, but a channel list, a forwarded caption or
+   * a search box shows the adult indicator as text the moment it appears. Reading the
+   * visible node text takes well under a millisecond and needs no capture, permission or
+   * model, so the block screen appears instantly instead of after the next frame.
+   *
+   * Nothing is stored or uploaded: the text is only compared with a fixed keyword list.
+   */
+  private fun scanWatchedAppText(pkg: String) {
+    // Habit's own UI (onboarding, settings, block screen) is never inspected.
+    if (pkg == packageName) return
+    val now = SystemClock.elapsedRealtime()
+    if (pkg == lastTextTrapPackage && now - lastTextTrapAt < TEXT_TRAP_INTERVAL_MS) return
+    lastTextTrapPackage = pkg
+    lastTextTrapAt = now
+
+    try {
+      if (!HabitStore.state(this).protectionEnabled) return
+      val ai = HabitStore.aiSettings(this)
+      if (!ai.enabled || pkg !in ai.monitoredAppPackages) return
+      // A calibration dry-run must not block, exactly like the screenshot cascade.
+      if (ai.debugRecordingEnabled && ai.debugDryRun) return
+
+      val root = try {
+        rootInActiveWindow
+      } catch (error: Throwable) {
+        null
+      } ?: return
+      // Only the window that really belongs to the app in front: the notification shade or
+      // Habit's own block overlay must never be read as the app's content.
+      if (root.packageName?.toString() != pkg) return
+
+      val builder = StringBuilder()
+      try {
+        val title = root.window?.title
+        if (!title.isNullOrEmpty()) builder.append(title).append(' ')
+      } catch (error: Throwable) {
+        // window info can disappear mid-traversal
+      }
+      collectText(root, builder, 0, intArrayOf(TEXT_TRAP_NODE_BUDGET))
+      if (builder.isEmpty()) return
+
+      if (adultTextIndicator(builder.toString()) == null) return
+      // Stop before the overlay exists so the covered screen is never classified again.
+      AiVisualScanner.stop()
+      HabitGuard.onAiMatch(this, "$pkg:ai-text", labelFor(pkg))
+    } catch (error: Throwable) {
+      Log.w(TAG, "AI text trap failed: ${error.message}")
+    }
+  }
+
+  /**
+   * First indicator found in [text], or null. Matched case-insensitively as a substring, so
+   * `Kambi`, `kambi_story` and `kambikatha` all hit, and the emoji / Malayalam words are
+   * matched exactly as written.
+   */
+  private fun adultTextIndicator(text: String): String? {
+    val lower = text.lowercase()
+    return AI_TEXT_INDICATORS.firstOrNull { lower.contains(it) }
+  }
+
+  @Suppress("DEPRECATION")
+  private fun labelFor(pkg: String): String = try {
+    val info = packageManager.getApplicationInfo(pkg, 0)
+    packageManager.getApplicationLabel(info).toString().ifBlank { pkg }
+  } catch (error: Throwable) {
+    pkg
   }
 
   /** Package of the window in front right now, or null when Android hides it. */
@@ -248,9 +330,52 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
     private const val SCAN_INTERVAL_MS = 180L
     private const val ROUTE_INTERVAL_MS = 1_000L
+    private const val TEXT_TRAP_INTERVAL_MS = 250L
     private const val MAX_DEPTH = 10
     private const val NODE_BUDGET = 220
+    private const val TEXT_TRAP_NODE_BUDGET = 160
     private const val MAX_TEXT_LENGTH = 5000
+
+    /**
+     * Adult indicators a watched app shows as text (channel titles, captions, search text).
+     * Matched case-insensitively as substrings, so transliterations such as `kambikatha`
+     * are caught without a word boundary.
+     */
+    private val AI_TEXT_INDICATORS = listOf(
+      "🔞",
+      "കാമം",
+      "തുണ്ട്",
+      "കമ്പി",
+      "നീലതടാകം",
+      "kambi",
+      "thund",
+      "pooru",
+      "mula",
+      "kunna",
+      "vedi",
+      "mallu hot",
+      "desi leaked",
+      "onlyfans",
+      "nsfw",
+      "xxx",
+      "porn",
+      "nude",
+      "sex video",
+      "ullu",
+      "altbalaji"
+    )
+
+    /**
+     * Events where the user actually touched, typed, scrolled or switched something. The
+     * noisy TYPE_WINDOW_CONTENT_CHANGED (a video, a chat, a seek bar) is deliberately left
+     * out so a long safe movie can relax the capture interval.
+     */
+    private val INTERACTION_EVENTS = setOf(
+      AccessibilityEvent.TYPE_VIEW_SCROLLED,
+      AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
+      AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+      AccessibilityEvent.TYPE_WINDOWS_CHANGED
+    )
 
     val BROWSER_PACKAGES: Set<String> = setOf(
       "com.android.chrome",

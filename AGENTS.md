@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-06 (Part 9: AI debug session recorder + Download export)_
+_Last updated: 2026-11-07 (Part 10: stage-1 direct blocks, additive NudeNet, static-frame + battery gates, app text trap)_
 
 ## Product
 
@@ -217,10 +217,12 @@ are needed — no screen, bridge or storage change.
 
 ### The engine (implemented, Part 7–8)
 
-1. **`AiVisualScanner.kt`** owns both models (TFLite `Interpreter` + ONNX `OrtSession`), one
-   reused input buffer each, and a 1000 ms loop with at most one frame in flight. Tunables
-   live in `AiCascadeConfig.kt`. Nothing is written to disk; buffers and bitmaps are closed
-   or recycled in `finally`.
+1. **`AiVisualScanner.kt`** owns both models (TFLite `Interpreter` with XNNPACK + fp16, and
+   ONNX `OrtSession`), one reused input buffer each, and a loop with at most one frame in
+   flight: 1000 ms normally, 2200 ms after 8 fully safe frames (battery saver for normal
+   video), snapped back to 1000 ms by any interaction. Tunables live in
+   `AiCascadeConfig.kt`. Nothing is written to disk; buffers and bitmaps are closed or
+   recycled in `finally`.
 2. **Hook point** — `HabitAccessibilityService.updateAiScanner(pkg)` runs for every accepted
    event (window state changed, windows changed, content changed, text changed, scrolled),
    because a monitored app can become visible without a window-state change. The router
@@ -232,9 +234,12 @@ are needed — no screen, bridge or storage change.
    ARGB_8888 and cut into top, centre and bottom squares. `FLAG_SECURE` windows are the
    honest “protected screens” limit.
 4. **Classification** — stage 1 (NSFW MobileNetV2, `FLOAT32 [1,224,224,3] -> [1,5]`) scores
-   `Porn + Hentai + 0.3*Sexy`, stage 2 (NudeNet 320n, `FLOAT32 [N,3,H,W] -> [N,22,A]`) keeps
-   the explicit exposed classes only, and two consecutive borderline frames are needed to
-   block. Sensitivity picks the `AiCascadeConfig` threshold preset.
+   `Porn + Hentai + sexyWeight*Sexy` (`0.85` high, `0.60` balanced, `0.30` low) and blocks on
+   its own: high = combined 0.45, `Porn + Hentai` 0.25 or `Sexy` 0.55; balanced = combined
+   0.58 or `Porn + Hentai` 0.35. Stage 2 (NudeNet 320n, `FLOAT32 [N,3,H,W] -> [N,22,A]`) is
+   additive only — it never clears a stage 1 hit, runs only on tiles that crossed the 0.04
+   gate, blocks at 0.25 (high) / 0.35 (balanced), and two consecutive borderline tiles
+   (NudeNet 0.14 or stage 1 0.24) still block. Sensitivity picks the preset.
 5. **Verdict** — `HabitGuard.onAiMatch(context, "<pkg>:ai-screenshot", appLabel)` keeps the
    5-second dedupe stable, shows `• AI • APP`, presses Back before the overlay takes focus,
    and falls back to Home when the overlay was refused.
@@ -255,20 +260,36 @@ Built for threshold calibration, not for protection:
    the `Live AI scanner status` card. Dry-run is only live while recording is on, and
    switching recording off clears it, so blocking can never be suppressed by a stale flag.
 9. **Per frame while recording** — stage 1 runs on all three tiles (full probability vector
-   kept) and stage 2 runs on all three tiles too, even when stage 1 is below 0.20. The whole
-   screenshot is saved as `filesDir/ai_debug_session/frames/frame_0001.jpg` (540 px wide,
+   kept) and stage 2 runs on all three tiles too, even when stage 1 is blocked or below the
+   gate. The whole screenshot is saved as `filesDir/ai_debug_session/frames/frame_0001.jpg` (540 px wide,
    JPEG 72) and one row is appended to `filesDir/ai_debug_session/scan_log.csv` with the
    columns `frame_id,image_file,timestamp,package_name,sensitivity_mode,s_mob_max,
    winning_tile,mob_top,mob_center,mob_bottom,p_porn,p_hentai,p_sexy,p_neutral,p_drawing,
    s_nude_max,nude_top_class,nude_top_tile,unsure_strikes,would_block,verdict_reason,
    stage1_ms,stage2_ms,total_ms`.
-10. **Cascade** — `would_block` is still decided by the normal rules on the winning stage-1
-    tile. Record-only mode blocks as usual; dry-run logs `would block (dry run)` and the
-    notification shows `DRY RUN`, so a long scrolling session records uninterrupted.
+10. **Cascade** — `would_block` is still decided by the normal rules, on the gated tiles
+    only, so a recorded log never disagrees with production. Record-only mode blocks as
+    usual; dry-run logs `would block (dry run)` and the notification shows `DRY RUN`, so a
+    long scrolling session records uninterrupted.
 11. **Export** — `exportAiDebugSession()` copies `Download/Habit_scan_log_<timestamp>.csv`
     and `Download/Habit_debug_session_<timestamp>.zip` (CSV + `frames/`) through
     `MediaStore.Downloads`, which needs no storage permission on Android 10+; the exact
     paths come back to JS. `clearAiDebugSession()` deletes the CSV and every frame.
+
+### Aggressive accuracy + power gates (Part 10)
+
+12. **Free static gate** — before any model, a 16x16 RGB sample of the screen is compared with
+    the last completely safe frame (mean absolute diff `< 3.0` of 255); with 0 strikes and a
+    last stage-1 score under 0.12 the frame is skipped entirely (0 ms of inference, counted
+    as `skippedFrames` in the status map).
+13. **Battery saver** — 8 consecutive safe frames (`stage1 < 0.06` and NudeNet `< 0.08`)
+    relax the loop to 2200 ms; a scroll, typed text, window change or any score `>= 0.08`
+    snaps it back to 1000 ms via `AiVisualScanner.noteUserActivity()`.
+14. **Text/emoji trap** — `HabitAccessibilityService.scanWatchedAppText` reads the visible
+    node text of a selected app (no screenshot, no model) and blocks immediately on adult
+    indicators (`🔞`, `കാമം`, `kambi`, `mallu hot`, `onlyfans`, `nsfw`, `ullu`, …). It is
+    throttled to 250 ms, skips Habit's own UI, respects protection state and AI dry-run, and
+    blocks through the same `HabitGuard.onAiMatch("<pkg>:ai-text")` flow.
 
 ### Rules to keep
 
@@ -296,6 +317,10 @@ Built for threshold calibration, not for protection:
 - [x] Part 9 — AI debug session recorder: every frame as a JPEG + CSV row (both stages on
   all three tiles), dry-run logging, one-tap CSV + ZIP export into `Download/` via
   `MediaStore`, and a clear button.
+- [x] Part 10 — accuracy and battery: stage 1 blocks on its own (NudeNet can no longer veto
+  it), NudeNet runs only on gated tiles, a 16x16 pixel gate skips unchanged screens, safe
+  video relaxes to a 2.2 s interval, XNNPACK + fp16 on the TFLite interpreter, and the
+  instant text/emoji trap inside watched apps.
 
 ## Build & run (Termux, no PC)
 
