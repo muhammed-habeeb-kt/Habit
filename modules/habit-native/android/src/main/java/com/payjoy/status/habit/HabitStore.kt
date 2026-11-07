@@ -58,6 +58,11 @@ data class AiSettings(
   val enabled: Boolean = true,
   /** Package names of the apps the user selected. Empty until they choose some. */
   val monitoredAppPackages: List<String> = emptyList(),
+  /**
+   * Browser website domains (e.g. `web.telegram.org`) that arm the screenshot scanner while
+   * the user is on that site inside a watched browser. Stored normalized and lowercase.
+   */
+  val monitoredDomains: List<String> = emptyList(),
   val aiSensitivity: String = SENSITIVITY_BALANCED,
   val blockAlertsEnabled: Boolean = true,
   /**
@@ -86,6 +91,7 @@ data class AiSettings(
   fun toMap(): Map<String, Any?> = mapOf(
     "enabled" to enabled,
     "monitoredAppPackages" to monitoredAppPackages,
+    "monitoredDomains" to monitoredDomains,
     "aiSensitivity" to aiSensitivity,
     "blockAlertsEnabled" to blockAlertsEnabled,
     "debugRecordingEnabled" to debugRecordingEnabled,
@@ -375,12 +381,23 @@ object HabitStore {
           if (pkg.isNotEmpty() && !watched.contains(pkg)) watched.add(pkg)
         }
       }
+      val storedDomains = json.optJSONArray("monitoredDomains")
+      val domains = ArrayList<String>()
+      if (storedDomains != null) {
+        for (index in 0 until storedDomains.length()) {
+          val domain = AdultFilter.normalizeDomain(storedDomains.optString(index, ""))
+          if (domain.isNotEmpty() && domain.contains('.') && !domains.contains(domain)) {
+            domains.add(domain)
+          }
+        }
+      }
       AiSettings(
         enabled = json.optBoolean("enabled", true),
         aiSensitivity = AiSettings.normalizeSensitivity(
           json.optString("aiSensitivity", AiSettings.SENSITIVITY_BALANCED)
         ),
         monitoredAppPackages = watched,
+        monitoredDomains = domains,
         blockAlertsEnabled = json.optBoolean("blockAlertsEnabled", true),
         debugRecordingEnabled = json.optBoolean("debugRecordingEnabled", false),
         debugDryRun = json.optBoolean("debugDryRun", false)
@@ -395,6 +412,7 @@ object HabitStore {
     val json = JSONObject()
       .put("enabled", settings.enabled)
       .put("monitoredAppPackages", JSONArray(settings.monitoredAppPackages))
+      .put("monitoredDomains", JSONArray(settings.monitoredDomains))
       .put("aiSensitivity", settings.aiSensitivity)
       .put("blockAlertsEnabled", settings.blockAlertsEnabled)
       .put("debugRecordingEnabled", settings.debugRecordingEnabled)
@@ -454,6 +472,30 @@ object HabitStore {
         return current
       }
       val next = current.copy(monitoredAppPackages = cleaned)
+      writeAiSettings(context, next)
+      return next
+    }
+  }
+
+  /**
+   * Replaces the watched browser websites. Each entry is normalized to a lowercase
+   * hostname; removing a site lowers a Strict/Aggressive lock, so it is refused natively
+   * while locked while adding new sites stays instant.
+   */
+  fun setAiMonitoredDomains(context: Context, domains: List<String>): AiSettings {
+    synchronized(lock) {
+      val current = aiSettings(context)
+      val cleaned = domains
+        .asSequence()
+        .map { AdultFilter.normalizeDomain(it) }
+        .filter { it.isNotEmpty() && it.contains('.') }
+        .distinct()
+        .take(200)
+        .toList()
+      if (isMonitoringLocked(context) && current.monitoredDomains.any { it !in cleaned }) {
+        return current
+      }
+      val next = current.copy(monitoredDomains = cleaned)
       writeAiSettings(context, next)
       return next
     }

@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-07 (Part 10: stage-1 direct blocks, additive NudeNet, static-frame + battery gates, app text trap)_
+_Last updated: 2026-11-07 (Part 11: AI tab with Apps/Browser modes, watched websites, AI block badge per domain)_
 
 ## Product
 
@@ -52,9 +52,9 @@ Raising protection is always instant; lowering it in Strict/Aggressive needs an 
 | Design tokens (colors, radii, shadows, type) | `src/constants/theme.ts` |
 | Neumorphic component kit | `src/components/neumorphic/` |
 | Floating 3-tab bar | `src/components/floating-tab-bar.tsx` |
-| Tabs: Home / Apps / Settings | `src/app/(tabs)/` |
+| Tabs: Home / AI / Settings | `src/app/(tabs)/` |
 | Browser Blocking screen | `src/app/browsers.tsx` |
-| AI app catalogue and selection UI | `src/data/apps.ts`, `src/app/(tabs)/apps.tsx` |
+| AI app + watched website UI | `src/app/(tabs)/apps.tsx` |
 | AI settings hook (JS bridge) | `src/hooks/use-ai-monitoring.ts` |
 | AI settings storage (native) | `HabitStore.kt` (`AiSettings`, `KEY_AI`) |
 | Block overlay source badges | `BlockOverlay.kt` (`BlockSource`), `HabitGuard.onAiMatch` |
@@ -191,25 +191,29 @@ permanent lock-out.
 **Debug-only tools** (visible only when the app is debuggable, refused in release builds):
 "Short cooldown" (60 s) and "Exit Strict now".
 
-## Future AI Visual Scanner Architecture
+## AI Visual Scanner Architecture
 
-The UI, settings and storage for AI App Monitoring are built now. The scanner itself is
-intentionally **not** implemented yet. When it is added, only the parts marked *new* below
-are needed — no screen, bridge or storage change.
+The UI, settings, storage and the on-device engine for AI monitoring are all built. This
+section lists the surface area and the rules the engine keeps.
 
 ### What already exists
 
 - **Persistence (native).** `HabitStore.AiSettings` is stored encrypted under `KEY_AI` as
-  `{ enabled, sensitivity: "low"|"balanced"|"high", watchedApps: [packageName, ...] }`.
-  `HabitStore.aiSettings(context)` reads it; `setAiMonitoringEnabled`,
-  `setAiSensitivity` and `setAiWatchedApps` write it and fire `onStateChanged`. The value
-  is also included in every `getSnapshot()` result under `"ai"`.
+  `{ enabled, sensitivity: "low"|"balanced"|"high", watchedApps: [packageName, ...],
+  watchedDomains: [hostname, ...] }`. `HabitStore.aiSettings(context)` reads it;
+  `setAiMonitoringEnabled`, `setAiSensitivity`, `setAiWatchedApps` and
+  `setAiMonitoredDomains` write it and fire `onStateChanged`. The value is also included in
+  every `getSnapshot()` result under `"ai"`.
 - **JS bridge.** `src/native/habit.ts` exposes `getAiSettings`, `setAiMonitoringEnabled`,
-  `setAiSensitivity`, `setAiWatchedApps`; `src/hooks/use-ai-monitoring.ts` is the single
-  screen-facing hook.
-- **UI.** Apps tab: master switch, search, ALL / SELECTED / SUGGESTED filters, per-app
-  selection (browsers shown as covered by Browser Blocking). Settings tab: AI detection
-  sensitivity selector. Block overlay supports both source badges.
+  `setAiSensitivity`, `setAiWatchedApps`, `setAiMonitoredDomains` and `normalizeDomain`;
+  `src/hooks/use-ai-monitoring.ts` is the single screen-facing hook and re-reads the
+  settings on native state changes.
+- **UI.** AI tab (`/apps`): master panel with the master switch, **Apps** / **Browser**
+  mode boxes, the app list (search, ALL / SELECTED, per-app checkboxes), the watched-website
+  editor (domain input, quick-add chips, `• AI WATCHING` rows) and the Live AI scanner
+  status card. Home shows an **AI Monitoring** summary card with the same switch that opens
+  the AI tab. Settings tab: AI detection sensitivity selector. Block overlay supports both
+  source badges.
 - **Block screen sources.** `BlockOverlay.kt` now takes a `BlockSource`:
   `BlockSource.BROWSER` renders `• BROWSER`; `BlockSource.ai(appLabel)` renders
   `• AI • TELEGRAM` (app label uppercased). Browser text still says “closed this page”;
@@ -291,6 +295,24 @@ Built for threshold calibration, not for protection:
     throttled to 250 ms, skips Habit's own UI, respects protection state and AI dry-run, and
     blocks through the same `HabitGuard.onAiMatch("<pkg>:ai-text")` flow.
 
+### Watched websites (Part 11)
+
+15. **Storage + bridge** — `AiSettings.monitoredDomains` holds normalized lowercase hosts
+    (`web.telegram.org`). JS normalizes every input (`https://www.X.com/a` → `x.com`) and
+    `HabitStore.setAiMonitoredDomains` normalizes again, so no junk can be persisted.
+    Removing a site while Strict/Aggressive is locked is refused natively; adding is always
+    instant (same rule as watched apps).
+16. **Arming** — for a watched browser, `HabitAccessibilityService.updateAiScanner` reads
+    the URL bar host (on a 500 ms throttle) and compares it with `monitoredDomains` through
+    `AdultFilter.monitoredDomainFor` (subdomain-aware, so `telegram.org` covers
+    `web.telegram.org`). A match starts `AiVisualScanner.start(service, pkg, domain)`; a
+    non-matching host, leaving the browser, protection off or AI off stops the loop. If the
+    URL bar is empty while a page loads, a loop that already belongs to that browser is
+    kept (fail closed).
+17. **Badge** — a browser hit blocks through the normal `HabitGuard.onAiMatch` flow with
+    the source `BlockSource.ai(domain.uppercase())`, so the block screen says
+    `• AI • TELEGRAM.ORG` instead of an app name; app hits keep the app label.
+
 ### Rules to keep
 
 - On-device only. No screenshots, embeddings or classifications leave the phone.
@@ -313,7 +335,7 @@ Built for threshold calibration, not for protection:
 - [x] Part 7 — on-device AI screenshot cascade (both models, lifecycle, overlay sources).
 - [x] Part 8 — AI reliability: all-app event routing, centre tile, verified tensors,
   compressed-asset fallback, overlay fallback + `SYSTEM_ALERT_WINDOW`, live notification
-  diagnostics and the Apps-tab status card with a model self-test.
+  diagnostics and the AI-tab status card with a model self-test.
 - [x] Part 9 — AI debug session recorder: every frame as a JPEG + CSV row (both stages on
   all three tiles), dry-run logging, one-tap CSV + ZIP export into `Download/` via
   `MediaStore`, and a clear button.
@@ -321,6 +343,11 @@ Built for threshold calibration, not for protection:
   it), NudeNet runs only on gated tiles, a 16x16 pixel gate skips unchanged screens, safe
   video relaxes to a 2.2 s interval, XNNPACK + fp16 on the TFLite interpreter, and the
   instant text/emoji trap inside watched apps.
+- [x] Part 11 — AI monitoring UI + watched websites: middle tab renamed to AI with a
+  four-point sparkle, Home AI summary card, AI tab master panel with Apps/Browser mode
+  boxes, domain add/quick-add/remove list, `monitoredDomains` in encrypted storage and the
+  bridge, browser-URL arming of the screenshot scanner, and per-domain `• AI • DOMAIN`
+  block badges.
 
 ## Build & run (Termux, no PC)
 
@@ -357,6 +384,10 @@ Part 9 adds the AI debug session bridge (`setAiDebugRecording`, `setAiDebugDryRu
 `exportAiDebugSession`, `clearAiDebugSession`), so the development APK must be rebuilt
 again. Nothing in the manifest or the accessibility XML changed, so the accessibility
 service does not need to be toggled off and on after installing it.
+
+Part 11 adds the watched-website bridge (`setAiMonitoredDomains`) and browser-domain
+arming, so the development APK must be rebuilt again. The manifest and the accessibility
+XML are unchanged, so the service does not need to be toggled off and on.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,
@@ -409,9 +440,15 @@ from `app.json` + `plugins/withHabitAndroid.js`.
 - **Routes.** The three tabs live in `src/app/(tabs)/` (`index`, `apps`, `settings`); unlock,
   face-unlock and onboarding stay as modal routes on the root stack. The old
   `src/app/index.tsx` was replaced by `src/app/(tabs)/index.tsx`.
-- **AI app catalogue.** `src/data/apps.ts` is a curated offline catalogue rather than a live
-  Android package query. The native scanner only needs the stored package names, so the
-  list can grow without touching storage; browsers are shown as covered by Browser Blocking.
+- **AI app list.** The Apps box lists the phone's own installed packages
+  (`getInstalledApps`), never a bundled catalogue. The native scanner only needs the stored
+  package names, so the list can grow without touching storage; browsers are handled by the
+  Browser box instead.
+- **Watched websites.** `monitoredDomains` stores bare lowercase hostnames and matching is
+  subdomain-aware in `AdultFilter.monitoredDomainFor` (`telegram.org` covers
+  `web.telegram.org`). A browser loop is armed from the URL bar only — never the page title
+  — and a page whose URL bar is momentarily empty keeps an already-running loop rather than
+  dropping protection. The block badge names the watched site (`• AI • TELEGRAM.ORG`).
 - **Honest permission count.** `HabitStore.snapshot` reports all five checks live
   (accessibility, notifications incl. `POST_NOTIFICATIONS`, battery-optimisation exemption,
   restricted settings, device admin), and both Setup and Settings count from that one
@@ -435,9 +472,7 @@ render crash shows the error message and a “Try again” button instead of a b
 - **Render check.** `expo export --platform web` statically renders every route; it was used
 to confirm `/`, `/apps`, `/settings` and `/browsers` build and render (Home shows its native
 snapshot loading state during static rendering, which is expected).
-- **No AI engine yet.** Per the plan, the master switch, sensitivity and app selection only
-  persist settings today. `HabitGuard.onAiMatch` and the marked hook in
-  `HabitAccessibilityService` are the only native entry points the future engine needs.
+
 - **Browser install status.** The Browser Blocking screen asks Android's PackageManager
   (`getInstalledPackages`) which of the eight watched browsers are installed. The manifest
   already declares `<queries>` for all of them, so the check works on Android 11+ without

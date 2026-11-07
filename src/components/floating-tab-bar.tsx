@@ -13,7 +13,9 @@ type TabVisual = {
 
 const VISUALS: Record<string, TabVisual> = {
   index: { label: 'Home', icon: 'home-outline', activeIcon: 'home' },
-  apps: { label: 'Apps', icon: 'view-grid-outline', activeIcon: 'view-grid' },
+  // A four-point sparkle keeps the same thin stroke weight as the house and the gear,
+  // so the middle tab reads as AI without looking bulkier than its neighbours.
+  apps: { label: 'AI', icon: 'star-four-points-outline', activeIcon: 'star-four-points' },
   settings: { label: 'Settings', icon: 'cog-outline', activeIcon: 'cog' },
 };
 

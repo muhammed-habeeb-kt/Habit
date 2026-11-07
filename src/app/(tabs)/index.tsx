@@ -31,6 +31,7 @@ import {
   Space,
   Typography,
 } from '@/constants/theme';
+import { useAiMonitoring } from '@/hooks/use-ai-monitoring';
 import { useProtection } from '@/hooks/use-protection';
 import { activateDeviceAdmin, getInstalledApps, type ProtectionMode } from '@/native/habit';
 
@@ -55,6 +56,12 @@ const BROWSERS = [
 
 export default function HomeScreen() {
   const { snapshot, busy, toggle } = useProtection();
+  // The AI summary mirrors the native settings, so the counts match the AI tab exactly.
+  const {
+    settings: aiSettings,
+    busy: aiBusy,
+    toggleMaster: toggleAiMaster,
+  } = useAiMonitoring();
   const askedForSetup = useRef(false);
   const [browserIcons, setBrowserIcons] = useState<Record<string, string>>({});
 
@@ -103,6 +110,23 @@ export default function HomeScreen() {
       return;
     }
     toggle();
+  };
+
+  const aiOn = aiSettings?.enabled ?? false;
+  const aiSubtitle = aiOn
+    ? `Active • ${aiSettings?.monitoredAppPackages.length ?? 0} apps • ${
+        aiSettings?.monitoredDomains.length ?? 0
+      } sites watched`
+    : 'Paused';
+
+  // Turning AI monitoring off removes protection, so a locked Strict/Aggressive setup asks
+  // for the unlock first. Turning it on is always instant.
+  const handleAiToggle = (next: boolean) => {
+    if (!next && locked) {
+      router.push('/unlock');
+      return;
+    }
+    void toggleAiMaster(next);
   };
 
   const handleMode = (id: ProtectionMode) => {
@@ -258,6 +282,36 @@ export default function HomeScreen() {
                 muted={!enabled}
               />
             ))}
+          </View>
+        </NeuCard>
+      </Pressable>
+
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Open AI Monitoring"
+        onPress={() => router.push('/apps')}
+        style={({ pressed }) => [pressed && styles.pressed]}>
+        <NeuCard style={styles.browserCard}>
+          <View style={styles.rowBetween}>
+            <View style={styles.browserLabel}>
+              <View style={styles.iconWell}>
+                <MaterialCommunityIcons
+                  name="star-four-points-outline"
+                  size={20}
+                  color={aiOn ? Palette.amber : Palette.textMuted}
+                />
+              </View>
+              <View style={styles.grow}>
+                <Text style={styles.cardTitle}>AI Monitoring</Text>
+                <Text style={styles.cardSubtitle}>{aiSubtitle}</Text>
+              </View>
+            </View>
+            <NeuSwitch
+              value={aiOn}
+              onValueChange={handleAiToggle}
+              disabled={aiBusy || !aiSettings}
+              label="AI Monitoring"
+            />
           </View>
         </NeuCard>
       </Pressable>

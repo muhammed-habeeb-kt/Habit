@@ -117,6 +117,8 @@ object AiVisualScanner {
 
   @Volatile private var running = false
   @Volatile private var activePackage: String? = null
+  /** Monitored website that armed this loop inside a browser, or null for a watched app. */
+  @Volatile private var activeDomain: String? = null
   @Volatile private var activeService: AccessibilityService? = null
 
   @Volatile private var lastCaptureAt = 0L
@@ -170,22 +172,33 @@ object AiVisualScanner {
   val isRunning: Boolean
     get() = running
 
-  fun isRunningFor(pkg: String): Boolean = running && activePackage == pkg
+  fun isRunningFor(pkg: String, domain: String? = null): Boolean =
+    running && activePackage == pkg && activeDomain == domain
+
+  /** True while the loop belongs to [pkg], whatever app or website armed it. */
+  fun isRunningForPackage(pkg: String): Boolean = running && activePackage == pkg
 
   /**
    * Starts (or keeps) the loop for [packageName]. The caller has already checked that
-   * protection is on, AI monitoring is enabled and the app is selected.
+   * protection is on, AI monitoring is enabled and either the app is selected or
+   * [domain] is one of the watched websites open in that browser.
    */
-  fun start(service: AccessibilityService, packageName: String) {
+  fun start(service: AccessibilityService, packageName: String, domain: String? = null) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
       recordError("Screenshots need Android 11 or newer")
       return
     }
-    if (running && activePackage == packageName && activeService === service) return
+    if (running && activePackage == packageName && activeService === service &&
+      activeDomain == domain
+    ) {
+      return
+    }
 
     activeService = service
     activePackage = packageName
-    appLabel = appLabelFor(service.applicationContext, packageName)
+    activeDomain = domain
+    // A website block names the site (`• AI • TELEGRAM.ORG`); an app block names the app.
+    appLabel = domain?.uppercase() ?: appLabelFor(service.applicationContext, packageName)
     running = true
     frameCount = 0
     skippedFrames = 0
@@ -204,6 +217,7 @@ object AiVisualScanner {
     mainHandler.removeCallbacks(tick)
     activeService = null
     activePackage = null
+    activeDomain = null
     unsureStrikeCount.set(0)
     safeStreak = 0
     captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
@@ -443,7 +457,7 @@ object AiVisualScanner {
       return
     }
 
-    if (!shouldScan(service, pkg)) {
+    if (!shouldScan(service, pkg, activeDomain)) {
       stop()
       return
     }
@@ -1076,10 +1090,12 @@ object AiVisualScanner {
   private fun triggerBlock(pkg: String) {
     val service = activeService ?: return
     val context = service.applicationContext
-    val label = appLabel ?: appLabelFor(context, pkg)
+    val domain = activeDomain
+    // A browser block names the website (`• AI • TELEGRAM.ORG`), an app block the app.
+    val label = appLabel ?: domain?.uppercase() ?: appLabelFor(context, pkg)
     // Stop before the overlay exists so the covered screen is never classified again.
     stop()
-    HabitGuard.onAiMatch(context, "$pkg:ai-screenshot", label)
+    HabitGuard.onAiMatch(context, "$pkg:ai-screenshot${domain?.let { ":$it" } ?: ""}", label)
   }
 
   /**
@@ -1136,12 +1152,22 @@ object AiVisualScanner {
     }
   }
 
-  private fun shouldScan(service: AccessibilityService, pkg: String): Boolean {
+  private fun shouldScan(
+    service: AccessibilityService,
+    pkg: String,
+    domain: String?
+  ): Boolean {
     val context = service.applicationContext
     val state = HabitStore.state(context)
     if (!state.protectionEnabled) return false
     val ai = HabitStore.aiSettings(context)
-    return ai.enabled && pkg in ai.monitoredAppPackages
+    if (!ai.enabled) return false
+    // A browser loop lives only as long as its website is still one of the watched ones.
+    if (domain != null) {
+      val wanted = AdultFilter.normalizeDomain(domain)
+      return ai.monitoredDomains.any { AdultFilter.normalizeDomain(it) == wanted }
+    }
+    return pkg in ai.monitoredAppPackages
   }
 
   private fun isActive(pkg: String): Boolean = running && activePackage == pkg

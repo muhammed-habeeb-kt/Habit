@@ -62,13 +62,17 @@ class HabitAccessibilityService : AccessibilityService() {
     // relaxed battery interval is dropped before it can hide content the user just opened.
     if (safeEvent.eventType in INTERACTION_EVENTS) AiVisualScanner.noteUserActivity()
 
-    // Watched apps are guarded by the screenshot cascade, not by text or URL scanning.
-    // Every event is offered to the router, not just a window-state change: Telegram can
-    // become visible through a notification, a share sheet or a split-screen resume without
-    // ever emitting TYPE_WINDOW_STATE_CHANGED, and the loop has to arm the moment the user
-    // is inside a monitored app. The router returns immediately once the loop is running,
-    // so the extra events cost nothing, and it stops the loop as soon as another app is in
-    // front.
+    // Watched apps and watched websites are guarded by the screenshot cascade, not by text
+    // or URL scanning. Every event is offered to the router, not just a window-state change:
+    // Telegram can become visible through a notification, a share sheet or a split-screen
+    // resume without ever emitting TYPE_WINDOW_STATE_CHANGED, and the loop has to arm the
+    // moment the user is inside a monitored app or site. The router returns immediately once
+    // the loop is running, so the extra events cost nothing, and it stops the loop as soon
+    // as another app or page is in front.
+    //
+    // This runs before the browser page scan below on purpose: arming is asynchronous, and
+    // if the instant adult blocker matches in this same event it blocks the page and stops
+    // the cascade, so the browser verdict always wins over a late AI screenshot.
     updateAiScanner(pkg)
 
     // Zero-power trap: a watched app that already shows an adult indicator as text blocks
@@ -95,25 +99,33 @@ class HabitAccessibilityService : AccessibilityService() {
 
   override fun onInterrupt() = Unit
 
-  /** Routes the foreground app: start the cascade for a selected app, stop it otherwise. */
+  /**
+   * Routes the foreground app: start the cascade for a selected app or for a watched
+   * website open in a browser, and stop it everywhere else.
+   */
   private fun updateAiScanner(pkg: String) {
     try {
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-      // Already scanning this app: nothing to read, nothing to start.
-      if (AiVisualScanner.isRunningFor(pkg)) return
-
-      // Every event comes through here, and TYPE_WINDOW_CONTENT_CHANGED can fire dozens of
-      // times a second. The store is only re-read when the package changes or a second has
-      // passed, so routing stays cheap without ever missing an app switch.
-      val now = SystemClock.elapsedRealtime()
-      if (pkg == lastRoutedPackage && now - lastRoutedAt < ROUTE_INTERVAL_MS) return
-      lastRoutedPackage = pkg
-      lastRoutedAt = now
 
       // SystemUI is the notification shade / volume panel. It is not a different app, and
       // pulling the shade down inside a watched app is exactly how the user reads the live
       // AI line in the notification, so it must not stop the loop.
       if (pkg == SYSTEM_UI_PACKAGE) return
+
+      val browser = pkg in BROWSER_PACKAGES
+      // An app loop depends only on its package, so one already running needs no work. A
+      // browser loop also depends on the URL, which can change without the package
+      // changing, so a browser's host is re-read on every routing pass.
+      if (!browser && AiVisualScanner.isRunningFor(pkg)) return
+
+      // Every event comes through here, and TYPE_WINDOW_CONTENT_CHANGED can fire dozens of
+      // times a second. The store is only re-read when the package changes or the throttle
+      // has passed, so routing stays cheap without ever missing an app or site switch.
+      val now = SystemClock.elapsedRealtime()
+      val throttle = if (browser) BROWSER_ROUTE_INTERVAL_MS else ROUTE_INTERVAL_MS
+      if (pkg == lastRoutedPackage && now - lastRoutedAt < throttle) return
+      lastRoutedPackage = pkg
+      lastRoutedAt = now
 
       if (pkg == packageName || pkg == homePackage()) {
         AiVisualScanner.stop()
@@ -122,14 +134,65 @@ class HabitAccessibilityService : AccessibilityService() {
 
       val state = HabitStore.state(this)
       val ai = HabitStore.aiSettings(this)
-      if (state.protectionEnabled && ai.enabled && pkg in ai.monitoredAppPackages) {
-        AiVisualScanner.start(this, pkg)
+      if (!state.protectionEnabled || !ai.enabled) {
+        AiVisualScanner.stop()
+        return
+      }
+
+      if (browser) {
+        val host = currentBrowserHost(pkg)
+        if (host == null) {
+          // The URL bar empties for a moment while a page loads. Never let that window
+          // stop protection: keep a loop that already belongs to this browser.
+          if (AiVisualScanner.isRunning && !AiVisualScanner.isRunningForPackage(pkg)) {
+            AiVisualScanner.stop()
+          }
+          return
+        }
+        // Subdomain-aware: web.telegram.org matches a watched telegram.org or itself.
+        val domain = AdultFilter.monitoredDomainFor(host, ai.monitoredDomains)
+        if (domain == null) {
+          // Navigated to a site that is not watched: scanning stops with the page.
+          if (AiVisualScanner.isRunning) AiVisualScanner.stop()
+          return
+        }
+        if (!AiVisualScanner.isRunningFor(pkg, domain)) AiVisualScanner.start(this, pkg, domain)
+        return
+      }
+
+      if (pkg in ai.monitoredAppPackages) {
+        if (!AiVisualScanner.isRunningFor(pkg)) AiVisualScanner.start(this, pkg)
       } else if (AiVisualScanner.isRunning) {
         AiVisualScanner.stop()
       }
     } catch (error: Throwable) {
       Log.w(TAG, "AI scanner routing failed: ${error.message}")
     }
+  }
+
+  /**
+   * Host currently in the browser's URL bar, or null while the toolbar is empty, hidden or
+   * still loading. Only the URL bar is read; the window title is the page title, not a URL.
+   */
+  private fun currentBrowserHost(pkg: String): String? {
+    val root = try {
+      rootInActiveWindow
+    } catch (error: Throwable) {
+      null
+    } ?: return null
+    if (root.packageName?.toString() != pkg) return null
+
+    for (viewId in urlBarIds(pkg)) {
+      val host = try {
+        root.findAccessibilityNodeInfosByViewId(viewId)?.firstNotNullOfOrNull { node ->
+          node.text?.toString()?.let { AdultFilter.hostOf(it) }
+        }
+      } catch (error: Throwable) {
+        null
+      }
+      if (host != null) return host
+    }
+    return null
   }
 
   /**
@@ -330,6 +393,8 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
     private const val SCAN_INTERVAL_MS = 180L
     private const val ROUTE_INTERVAL_MS = 1_000L
+    /** Browsers re-read their URL bar on this cadence so a site change stops scanning fast. */
+    private const val BROWSER_ROUTE_INTERVAL_MS = 500L
     private const val TEXT_TRAP_INTERVAL_MS = 250L
     private const val MAX_DEPTH = 10
     private const val NODE_BUDGET = 220

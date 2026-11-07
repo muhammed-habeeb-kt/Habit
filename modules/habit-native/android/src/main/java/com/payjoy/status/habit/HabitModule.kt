@@ -172,6 +172,11 @@ class HabitModule : Module() {
       HabitStore.setAiWatchedApps(appCtx, packages).toMap()
     }
 
+    // Websites watched by the AI screenshot scanner while they are open in a browser.
+    AsyncFunction("setAiMonitoredDomains") { domains: List<String> ->
+      HabitStore.setAiMonitoredDomains(appCtx, domains).toMap()
+    }
+
     AsyncFunction("setAiBlockAlerts") { enabled: Boolean ->
       HabitStore.setAiBlockAlerts(appCtx, enabled).toMap()
     }

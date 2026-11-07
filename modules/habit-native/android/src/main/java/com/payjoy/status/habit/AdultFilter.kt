@@ -46,6 +46,39 @@ object AdultFilter {
     return "kw:" + found.value.lowercase()
   }
 
+  /**
+   * The monitored AI website [host] belongs to, or null.
+   *
+   * Matching is subdomain-aware in both directions of what the user configured: a host of
+   * `web.telegram.org` matches a monitored `telegram.org` or `web.telegram.org`. The stored
+   * entry itself is returned, so a block can name exactly what the user added.
+   */
+  fun monitoredDomainFor(host: String, domains: List<String>): String? {
+    if (domains.isEmpty()) return null
+    var candidate = normalizeDomain(host)
+    if (candidate.isEmpty()) return null
+    while (true) {
+      for (entry in domains) {
+        if (normalizeDomain(entry) == candidate) return entry
+      }
+      val dot = candidate.indexOf('.')
+      if (dot < 0) return null
+      candidate = candidate.substring(dot + 1)
+    }
+  }
+
+  /**
+   * Host of a URL, a domain or a browser URL bar text, or null when the text has none.
+   * `https://web.telegram.org/a/#123` becomes `web.telegram.org`.
+   */
+  fun hostOf(value: String): String? {
+    val text = value.trim()
+    if (text.isEmpty()) return null
+    val lowered = if (text.contains('%')) decodeSafe(text).lowercase() else text.lowercase()
+    val match = hostRegex.find(lowered) ?: return null
+    return match.groupValues[1].trimEnd('.')
+  }
+
   private fun isBlockedHost(host: String, set: Set<String>): Boolean {
     if (set.contains(host)) return true
     var candidate = host
@@ -58,7 +91,8 @@ object AdultFilter {
     return false
   }
 
-  private fun normalizeDomain(value: String): String {
+  /** Cleans user input into a bare lowercase hostname: no scheme, `www.`, path or port. */
+  fun normalizeDomain(value: String): String {
     var domain = value.trim().lowercase()
     for (prefix in listOf("https://", "http://", "www.")) {
       if (domain.startsWith(prefix)) domain = domain.substring(prefix.length)

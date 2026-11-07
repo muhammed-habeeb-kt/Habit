@@ -94,6 +94,11 @@ export type AiSettings = {
   enabled: boolean;
   /** Package names of the apps the user selected. Empty until they choose some. */
   monitoredAppPackages: string[];
+  /**
+   * Browser websites (e.g. `web.telegram.org`) that arm the screenshot scanner while the
+   * user is on that site inside a watched browser. Stored as lowercase hostnames.
+   */
+  monitoredDomains: string[];
   aiSensitivity: AiSensitivity;
   blockAlertsEnabled: boolean;
   /**
@@ -130,7 +135,7 @@ export type AiDebugClear = {
 /** An app actually installed on this phone, as reported by the native module. */
 /**
  * Live state of the on-device AI screenshot scanner. Every field is a real observation
- * from the running native scanner, so the Apps tab can show why nothing is being blocked
+ * from the running native scanner, so the AI tab can show why nothing is being blocked
  * instead of guessing.
  */
 export type AiScannerStatus = {
@@ -195,6 +200,7 @@ export type InstalledApp = {
 const DEFAULT_AI_SETTINGS: AiSettings = {
   enabled: true,
   monitoredAppPackages: [],
+  monitoredDomains: [],
   aiSensitivity: 'balanced',
   blockAlertsEnabled: true,
   debugRecordingEnabled: false,
@@ -236,6 +242,7 @@ type HabitNativeModule = {
   setAiMonitoringEnabled(enabled: boolean): Promise<AiSettings>;
   setAiSensitivity(sensitivity: string): Promise<AiSettings>;
   setAiWatchedApps(packages: string[]): Promise<AiSettings>;
+  setAiMonitoredDomains(domains: string[]): Promise<AiSettings>;
   setAiBlockAlerts(enabled: boolean): Promise<AiSettings>;
   setAiDebugRecording(enabled: boolean): Promise<AiSettings>;
   setAiDebugDryRun(enabled: boolean): Promise<AiSettings>;
@@ -274,7 +281,7 @@ export const canQueryInstalledPackages =
 
 /**
  * False on an older development APK whose native module predates
- * `getInstalledApps`. The Apps screen then explains the build is out of date
+ * `getInstalledApps`. The AI screen then explains the build is out of date
  * instead of pretending the phone has no apps.
  */
 export const canListInstalledApps =
@@ -523,6 +530,9 @@ function normalizeAiSettings(value: AiSettings | null | undefined): AiSettings {
     monitoredAppPackages: Array.isArray(value.monitoredAppPackages)
       ? value.monitoredAppPackages.filter((item): item is string => typeof item === 'string')
       : DEFAULT_AI_SETTINGS.monitoredAppPackages,
+    monitoredDomains: Array.isArray(value.monitoredDomains)
+      ? value.monitoredDomains.filter((item): item is string => typeof item === 'string')
+      : DEFAULT_AI_SETTINGS.monitoredDomains,
     aiSensitivity: sensitivity,
     blockAlertsEnabled: value.blockAlertsEnabled !== undefined ? value.blockAlertsEnabled : DEFAULT_AI_SETTINGS.blockAlertsEnabled,
     debugRecordingEnabled: value.debugRecordingEnabled === true,
@@ -618,6 +628,44 @@ export async function setAiWatchedApps(watchedApps: string[]): Promise<AiSetting
     fallbackAiSettings = { ...fallbackAiSettings, monitoredAppPackages: watchedApps };
   }
   return fallbackAiSettings;
+}
+
+export async function setAiMonitoredDomains(domains: string[]): Promise<AiSettings> {
+  if (!native || typeof native.setAiMonitoredDomains !== 'function') {
+    fallbackAiSettings = { ...fallbackAiSettings, monitoredDomains: domains };
+    return fallbackAiSettings;
+  }
+  try {
+    fallbackAiSettings = normalizeAiSettings(await native.setAiMonitoredDomains(domains));
+  } catch {
+    fallbackAiSettings = { ...fallbackAiSettings, monitoredDomains: domains };
+  }
+  return fallbackAiSettings;
+}
+
+/** False on an APK whose native module predates the watched-website bridge. */
+export const canSetAiDomains =
+  native != null && typeof native.setAiMonitoredDomains === 'function';
+
+/**
+ * Cleans typed or pasted website text into a bare lowercase hostname: the scheme, `www.`,
+ * credentials, port, path, query and trailing dots are stripped, so `HTTPS://WWW.X.com/a`
+ * becomes `x.com`. Returns an empty string when the text holds no hostname at all, so the
+ * caller can refuse it instead of storing junk.
+ */
+export function normalizeDomain(input: string): string {
+  // A pasted URL: drop the scheme, credentials and everything after the host.
+  let value = input.trim().toLowerCase().split(' ')[0] ?? '';
+  const scheme = value.indexOf('://');
+  if (scheme >= 0) value = value.slice(scheme + 3);
+  const at = value.indexOf('@');
+  if (at >= 0) value = value.slice(at + 1);
+  const hostEnd = value.search(/[/?#:@]/);
+  if (hostEnd >= 0) value = value.slice(0, hostEnd);
+  if (value.startsWith('www.')) value = value.slice(4);
+  while (value.endsWith('.')) value = value.slice(0, -1);
+  if (!/^[a-z0-9-]+([.][a-z0-9-]+)+$/.test(value)) return '';
+  return value;
 }
 
 export function isAccessibilityEnabled(): Promise<boolean> {

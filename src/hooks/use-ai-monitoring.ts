@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import {
+  addStateListener,
   getAiSettings,
+  normalizeDomain,
   setAiBlockAlerts,
+  setAiMonitoredDomains,
   setAiMonitoringEnabled,
   setAiSensitivity,
   setAiWatchedApps,
@@ -11,9 +14,13 @@ import {
 } from '@/native/habit';
 
 /**
- * Reads/writes the AI monitoring settings through the native bridge.
- * No AI engine is running yet: these settings are stored so the future scanner
- * only has to read them.
+ * Reads/writes the AI monitoring settings through the native bridge: the master switch, the
+ * sensitivity, the watched apps and the watched browser websites.
+ *
+ * Every write comes back as the store's own value, so a native refusal (removing a watch
+ * while Strict/Aggressive is locked) can never leave the screen showing something that was
+ * not persisted. The native store also emits a state event, which keeps Home and the AI tab
+ * in sync while both are mounted.
  */
 export function useAiMonitoring() {
   const [settings, setSettings] = useState<AiSettings | null>(null);
@@ -24,8 +31,14 @@ export function useAiMonitoring() {
     getAiSettings().then((next) => {
       if (mounted) setSettings(next);
     });
+    const unsubscribe = addStateListener(() => {
+      getAiSettings().then((next) => {
+        if (mounted) setSettings(next);
+      });
+    });
     return () => {
       mounted = false;
+      unsubscribe();
     };
   }, []);
 
@@ -76,5 +89,50 @@ export function useAiMonitoring() {
     [settings]
   );
 
-  return { settings, busy, toggleMaster, toggleBlockAlerts, changeSensitivity, toggleApp };
+  /**
+   * Adds one website. The input is normalized here (`https://www.X.com/a` -> `x.com`) so
+   * the stored value is always a bare hostname; a duplicate or a non-domain is ignored.
+   */
+  const addDomain = useCallback(
+    async (input: string) => {
+      if (!settings) return;
+      const domain = normalizeDomain(input);
+      if (!domain || settings.monitoredDomains.includes(domain)) return;
+      const next = [...settings.monitoredDomains, domain];
+      setBusy(true);
+      setSettings({ ...settings, monitoredDomains: next });
+      try {
+        setSettings(await setAiMonitoredDomains(next));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [settings]
+  );
+
+  const removeDomain = useCallback(
+    async (domain: string) => {
+      if (!settings) return;
+      const next = settings.monitoredDomains.filter((item) => item !== domain);
+      setBusy(true);
+      setSettings({ ...settings, monitoredDomains: next });
+      try {
+        setSettings(await setAiMonitoredDomains(next));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [settings]
+  );
+
+  return {
+    settings,
+    busy,
+    toggleMaster,
+    toggleBlockAlerts,
+    changeSensitivity,
+    toggleApp,
+    addDomain,
+    removeDomain,
+  };
 }
