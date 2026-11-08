@@ -152,6 +152,14 @@ object HabitStore {
   private const val KEY_UNLOCK = "unlock"
   private const val KEY_AI = "ai"
   private const val KEY_RESTRICTED_SETTINGS = "restricted_settings"
+  private const val KEY_TAMPER_GRACE = "tamper_grace"
+
+  /**
+   * How long the tamper shield stands down after Habit itself opened the battery or
+   * autostart settings from a "Fix" button. It never covers the accessibility toggle or
+   * the force-stop / clear-data / uninstall controls.
+   */
+  const val TAMPER_GRACE_MS = 12_000L
   private const val KEYSTORE = "AndroidKeyStore"
   private const val KEY_ALIAS = "habit_state_key_v1"
   private const val PREFIX_ENC = "enc1:"
@@ -170,6 +178,7 @@ object HabitStore {
   @Volatile private var cachedKeywords: List<String>? = null
   @Volatile private var cachedAi: AiSettings? = null
   @Volatile private var cachedRestrictedVisited: Boolean? = null
+  @Volatile private var tamperGraceEndWall: Long? = null
 
   /** Called on a background thread after an attempt is counted. */
   @Volatile var onAttemptsChanged: ((Int) -> Unit)? = null
@@ -808,6 +817,35 @@ object HabitStore {
       cachedRestrictedVisited = visited
     }
     onStateChanged?.invoke()
+  }
+
+  // endregion
+
+  // region tamper shield
+
+  /**
+   * Starts the short stand-down the tamper shield gives the battery / autostart screens
+   * Habit itself opened. Written by the native bridge only, right before the intent.
+   */
+  fun markTamperGrace(context: Context, durationMs: Long = TAMPER_GRACE_MS) {
+    val endWall = System.currentTimeMillis() + durationMs
+    synchronized(lock) {
+      write(context, KEY_TAMPER_GRACE, endWall.toString())
+      tamperGraceEndWall = endWall
+    }
+  }
+
+  /** Milliseconds left of the battery / autostart stand-down, 0 when none is running. */
+  fun tamperGraceRemainingMs(context: Context): Long {
+    val endWall = tamperGraceEndWall ?: loadTamperGrace(context)
+    return (endWall - System.currentTimeMillis()).coerceAtLeast(0L)
+  }
+
+  private fun loadTamperGrace(context: Context): Long = synchronized(lock) {
+    val stored = tamperGraceEndWall
+      ?: (read(context, KEY_TAMPER_GRACE)?.toLongOrNull() ?: 0L)
+    tamperGraceEndWall = stored
+    stored
   }
 
   // endregion

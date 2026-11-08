@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-07 (Part 11: AI tab with Apps/Browser modes, watched websites, AI block badge per domain)_
+_Last updated: 2026-11-08 (Part 12: instant Settings tamper shield in Strict/Aggressive)_
 
 ## Product
 
@@ -59,6 +59,7 @@ Raising protection is always instant; lowering it in Strict/Aggressive needs an 
 | AI settings storage (native) | `HabitStore.kt` (`AiSettings`, `KEY_AI`) |
 | Block overlay source badges | `BlockOverlay.kt` (`BlockSource`), `HabitGuard.onAiMatch` |
 | AI debug session (frames + CSV + Download export) | `AiDebugSession.kt`, `HabitModule.exportAiDebugSession` |
+| Settings tamper shield (zero-power) | `HabitAccessibilityService.scanTamperShield`, `HabitGuard.onTamperDetected` |
 
 ## Native pieces
 
@@ -132,9 +133,8 @@ Part 4 / 6:
 - Watchdog: while Aggressive, if the accessibility service or device admin is off, Habit shows
   a high-importance warning notification and a red banner on Home. The mode never silently
   downgrades — protection stays failing closed.
-- Self-protection is deliberately **not** the "block the Settings screens" variant: Habit does
-  not fight the user inside Android Settings. The device admin only forces an
-  uninstall confirmation.
+- The device admin only forces an uninstall confirmation. The Settings screens themselves
+  are guarded by the Part 12 tamper shield, which applies to Strict as well as Aggressive.
 
 ## Clocks, reboots, alarms
 
@@ -313,7 +313,41 @@ Built for threshold calibration, not for protection:
     the source `BlockSource.ai(domain.uppercase())`, so the block screen says
     `• AI • TELEGRAM.ORG` instead of an app name; app hits keep the app label.
 
-### Rules to keep
+### Settings tamper shield (Part 12)
+
+An instant, zero-power guard that keeps the user out of the Android Settings that would end
+protection. No screenshot, no model, nothing captured or stored.
+
+1. **When it is armed** — `HabitGuard.tamperShieldActive`: mode is Strict or Aggressive while
+   protection is ON, plus the locked state between an unlock request and its OFF window.
+   Normal mode and a running OFF window leave Settings alone. Unreadable state fails closed.
+2. **Cost** — node text only, and only when the front package is `com.android.settings`,
+   `com.miui.securitycenter`, `com.google.android.packageinstaller` or
+   `com.miui.packageinstaller`. Every accepted event from those packages is inspected with a
+   220-node budget, so the verdict is a few hundred reads, not a frame.
+3. **Screen A (accessibility toggle)** — blocked as soon as the visible text contains
+   `Use Habit`, `Habit shortcut` or `Habit blocks adult websites`, or when a tap on a `Habit`
+   item happens on a screen that also shows `Accessibility` / `Downloaded apps`. Grace never
+   covers this screen.
+4. **Screen B (app info / data / uninstall / admin)** — blocked when the screen mentions
+   Habit (`Habit`, `com.payjoy.status`, `com.habit.guardian`) and exposes `Force stop`,
+   `Clear data`, `Clear all data`, `Uninstall`, `Remove` or `Deactivate`. A tap on any of
+   those labels, and their confirmation dialogs (`force stop an app`, `clear app data`,
+   `all of this app's data`, `uninstall this app`, `deactivate this device admin`), are
+   refused even during grace.
+5. **Grace window** — `HabitModule.openBatterySettings` / `openAutostartSettings` mark
+   `HabitStore.markTamperGrace` (`TAMPER_GRACE_MS`, 12 s) before starting the intent, so the
+   plain app-info page the battery/autostart "Fix" buttons need can be read. It is never
+   applied to Screen A or to a destructive tap/dialog.
+6. **Kick-out** — `HabitGuard.onTamperDetected` fires `GLOBAL_ACTION_BACK` and
+   `GLOBAL_ACTION_HOME` at once, repeats Home 120 ms later, and shows the block screen with
+   the `• TAMPER SHIELD` badge and “Habit is locked. Unlock inside the Habit app before
+   changing system settings.” One kick-out per 1.2 s, so event storms cannot flicker it.
+7. **Event type** — the accessibility XML now declares `typeViewClicked` (Screen A's list
+   tap, Screen B's button taps). After installing an APK with this change the accessibility
+   service must be switched off and on once, like every earlier XML change.
+
+## Rules to keep
 
 - On-device only. No screenshots, embeddings or classifications leave the phone.
 - The AI verdict is advisory input to the native block flow; JavaScript can never force a
@@ -343,6 +377,10 @@ Built for threshold calibration, not for protection:
   it), NudeNet runs only on gated tiles, a 16x16 pixel gate skips unchanged screens, safe
   video relaxes to a 2.2 s interval, XNNPACK + fp16 on the TFLite interpreter, and the
   instant text/emoji trap inside watched apps.
+- [x] Part 12 — Settings tamper shield: Strict/Aggressive kick the user out of Habit's
+  accessibility toggle and app-info / clear-data / uninstall / device-admin screens from the
+  node tree only (zero frames), with a 12 s battery/autostart grace window, `• TAMPER SHIELD`
+  block badge and `typeViewClicked` in the accessibility XML.
 - [x] Part 11 — AI monitoring UI + watched websites: middle tab renamed to AI with a
   four-point sparkle, Home AI summary card, AI tab master panel with Apps/Browser mode
   boxes, domain add/quick-add/remove list, `monitoredDomains` in encrypted storage and the
@@ -388,6 +426,11 @@ service does not need to be toggled off and on after installing it.
 Part 11 adds the watched-website bridge (`setAiMonitoredDomains`) and browser-domain
 arming, so the development APK must be rebuilt again. The manifest and the accessibility
 XML are unchanged, so the service does not need to be toggled off and on.
+
+Part 12 adds the Settings tamper shield and declares `typeViewClicked` in the accessibility
+XML, so the APK must be rebuilt and the accessibility service toggled off and on once after
+installing it (Android keeps the old event types until the service reconnects). Nothing in
+the manifest changed.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,

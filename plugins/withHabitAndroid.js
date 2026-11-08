@@ -56,9 +56,11 @@ const ACCESSIBILITY_PERMISSION = 'android.permission.BIND_ACCESSIBILITY_SERVICE'
 // window event from Telegram and the other watched apps, so the AI screenshot loop could
 // never arm. The service receives events from all apps and decides in Kotlin (browser text
 // scan vs. watched-app screenshot cascade). keep-screen-on is off, interactive windows on.
+// `typeViewClicked` is what the tamper shield listens to: a tap on "Habit" in the
+// accessibility list, on "Force stop" or on "Clear data" arrives as a click.
 const accessibilityXml = (applicationPackage) => `<?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeWindowContentChanged|typeViewTextChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeWindowContentChanged|typeViewTextChanged|typeViewClicked"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
     android:canRetrieveWindowContent="true"

@@ -26,8 +26,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 
 /**
- * Where a block came from. Browser blocks come from the URL/text filter; AI blocks come
- * from the on-device screenshot cascade and carry the app name.
+ * Where a block came from. Browser blocks come from the URL/text filter, AI blocks come
+ * from the on-device screenshot cascade and carry the app name, and the tamper shield
+ * blocks Android Settings while the protection lock is armed.
  */
 data class BlockSource(
   val kind: String,
@@ -36,11 +37,18 @@ data class BlockSource(
   val isAi: Boolean
     get() = kind == KIND_AI
 
+  val isTamper: Boolean
+    get() = kind == KIND_TAMPER
+
   companion object {
     const val KIND_BROWSER = "browser"
     const val KIND_AI = "ai"
+    const val KIND_TAMPER = "tamper"
 
     val BROWSER = BlockSource(KIND_BROWSER)
+
+    /** The Settings / security-centre shield, not a content verdict. */
+    val TAMPER = BlockSource(KIND_TAMPER)
 
     fun ai(appLabel: String): BlockSource = BlockSource(KIND_AI, appLabel)
   }
@@ -193,10 +201,11 @@ class BlockOverlay(private val service: HabitAccessibilityService) {
 
     card.addView(
       label(
-        if (source.isAi) {
-          "Habit closed this screen to protect you."
-        } else {
-          "Habit closed this page to protect you."
+        when {
+          source.isTamper ->
+            "Habit is locked. Unlock inside the Habit app before changing system settings."
+          source.isAi -> "Habit closed this screen to protect you."
+          else -> "Habit closed this page to protect you."
         },
         14f,
         BODY,
@@ -248,10 +257,10 @@ class BlockOverlay(private val service: HabitAccessibilityService) {
   }
 
   private fun sourceChip(source: BlockSource): View {
-    val text = if (source.isAi) {
-      "• AI • ${source.appLabel?.uppercase() ?: "APP"}"
-    } else {
-      "• BROWSER"
+    val text = when {
+      source.isTamper -> "• TAMPER SHIELD"
+      source.isAi -> "• AI • ${source.appLabel?.uppercase() ?: "APP"}"
+      else -> "• BROWSER"
     }
     val chip = label(text, 11f, AMBER, Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)).apply {
       letterSpacing = 0.08f
@@ -337,7 +346,11 @@ class BlockOverlay(private val service: HabitAccessibilityService) {
     )
     row.addView(
       label(
-        if (source.isAi) "ON-DEVICE MODEL PROTECTION" else "REAL-TIME PROTECTION ACTIVE",
+        when {
+          source.isTamper -> "TAMPER SHIELD ACTIVE"
+          source.isAi -> "ON-DEVICE MODEL PROTECTION"
+          else -> "REAL-TIME PROTECTION ACTIVE"
+        },
         9f,
         MUTED,
         Typeface.MONOSPACE

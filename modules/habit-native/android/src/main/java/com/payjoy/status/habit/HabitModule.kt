@@ -793,6 +793,9 @@ class HabitModule : Module() {
   }
 
   private fun openBatterySettingsInternal(): Boolean {
+    // The tamper shield stands down for 12 s so the user can actually reach the battery
+    // screen; force stop, clear data and the accessibility toggle stay blocked.
+    HabitStore.markTamperGrace(appCtx)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
       if (isBatteryOptimizationIgnored()) return true
       val direct = Intent(
@@ -815,6 +818,9 @@ class HabitModule : Module() {
   }
 
   private fun openAutostartSettingsInternal(): Boolean {
+    // Same short stand-down as the battery screen: autostart lives in the vendor security
+    // app, which otherwise shows Habit's app-info controls next to it.
+    HabitStore.markTamperGrace(appCtx)
     if (!Build.MANUFACTURER.equals("xiaomi", ignoreCase = true)) {
       // Non-Xiaomi devices: the app details screen is where the battery settings live.
       if (openIntent(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))) return true
