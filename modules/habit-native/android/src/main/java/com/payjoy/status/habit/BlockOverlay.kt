@@ -515,7 +515,9 @@ class BlockOverlay(private val service: HabitAccessibilityService) {
   private inner class OverlayRoot(context: Context) : FrameLayout(context) {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
       if (event.keyCode == KeyEvent.KEYCODE_BACK) {
-        if (event.action == KeyEvent.ACTION_UP) goBack()
+        // The tamper shield must outlive the escape pulses fired at it: a swallowed Back
+        // belongs to the Settings page being closed underneath, never to the shield itself.
+        if (!currentSource.isTamper && event.action == KeyEvent.ACTION_UP) goBack()
         return true
       }
       return super.dispatchKeyEvent(event)

@@ -14,10 +14,13 @@ import android.util.Log
 object HabitGuard {
   private const val TAG = "HabitGuard"
   private const val HOME_FALLBACK_DELAY_MS = 1_200L
-  /** Repeat of Home after a tamper block, so Settings cannot stay in front. */
-  private const val TAMPER_HOME_REPEAT_MS = 120L
-  /** One kick-out per settings screen, not one per accessibility event. */
-  private const val TAMPER_KICK_COOLDOWN_MS = 1_200L
+  /**
+   * Escape pulses for a tamper block: each one fires Back twice then Home, so a fragment
+   * transition that swallows the first Back cannot leave Settings in front.
+   */
+  private val TAMPER_PULSE_DELAYS_MS = longArrayOf(0L, 80L, 180L, 320L)
+  /** Short guard so the 100 ms poll cannot stack kick-outs, never a reason to miss one. */
+  private const val TAMPER_KICK_COOLDOWN_MS = 400L
   private const val TAMPER_ATTEMPT_KEY = "tamper:shield"
 
   private val mainHandler = Handler(Looper.getMainLooper())
@@ -69,17 +72,18 @@ object HabitGuard {
   /**
    * True while Android Settings must be off-limits.
    *
-   * That is Strict or Aggressive with protection on, plus the locked state between an
-   * unlock and its OFF window. Normal mode and a running OFF window leave Settings alone,
-   * because the user is meant to be free there. Unreadable state fails closed.
+   * Any mode with protection ON is protected: Normal mode can run protection too, and the
+   * Settings switch that kills the service must be unreachable there as well. Strict and
+   * Aggressive stay armed during a cooldown wait as well (`mode != normal`), because the
+   * lock is still held until the unlock completes. Only a Normal mode OFF window leaves
+   * Settings alone, which is exactly when the user is meant to be free. Unreadable state
+   * fails closed.
    */
   fun tamperShieldActive(context: Context): Boolean {
     return try {
       val state = HabitStore.state(context)
-      if (state.mode == ProtectionState.MODE_NORMAL) return false
       if (state.protectionEnabled) return true
-      val offWindow = HabitStore.unlockState(context).offWindow
-      HabitUnlock.remainingOffMs(offWindow) <= 0L
+      state.mode != ProtectionState.MODE_NORMAL
     } catch (error: Throwable) {
       Log.w(TAG, "Tamper shield state unreadable, failing closed: ${error.message}")
       true
@@ -88,9 +92,9 @@ object HabitGuard {
 
   /**
    * Entry point for the tamper shield: the Settings screen in front would let the user end
-   * protection. Back leaves the page, Home takes Settings out of the foreground and a repeat
-   * Home 120 ms later makes sure it cannot come straight back, then the block screen
-   * explains why.
+   * protection. The opaque shield is shown first, in the same frame as the verdict, so the
+   * control under the user's finger is covered before anything else happens; then four
+   * escape pulses close the page underneath it.
    */
   fun onTamperDetected(context: Context) {
     val now = SystemClock.elapsedRealtime()
@@ -110,14 +114,12 @@ object HabitGuard {
       AiVisualScanner.noteOverlayError("tamper block skipped: accessibility service is not attached")
       return
     }
-    mainHandler.post {
-      try {
-        currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
-        currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
-      } catch (error: Throwable) {
-        Log.w(TAG, "Tamper escape action failed: ${error.message}")
-      }
-
+    // Runs inline when the shield was detected on the main thread (the 100 ms watch and the
+    // event callback both are), so the shield really appears at 0 ms instead of one hop later.
+    runOnMain {
+      // FIRST, at 0 ms: the full-screen opaque shield. It is the front window and swallows
+      // touch, so the accessibility switch / "Turn off" button is physically unreachable
+      // from this same frame on.
       val shown = try {
         val screen = overlay ?: BlockOverlay(currentService).also { overlay = it }
         screen.show(attemptsToday, BlockSource.TAMPER)
@@ -130,14 +132,33 @@ object HabitGuard {
           "tamper overlay blocked by the launcher — allow \"display over other apps\" for Habit"
         )
       }
-    }
-    mainHandler.postDelayed({
-      try {
-        service?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
-      } catch (error: Throwable) {
-        Log.w(TAG, "Tamper Home repeat failed: ${error.message}")
+
+      // SECOND: Back twice then Home, repeated four times. HyperOS slides the fragment in
+      // over ~250 ms and can swallow a single Back, and the last Home makes sure Settings
+      // is out of the foreground even if every Back was lost.
+      TAMPER_PULSE_DELAYS_MS.forEach { delay ->
+        if (delay <= 0L) {
+          tamperEscapePulse()
+        } else {
+          mainHandler.postDelayed({ tamperEscapePulse() }, delay)
+        }
       }
-    }, TAMPER_HOME_REPEAT_MS)
+    }
+  }
+
+  private fun runOnMain(block: () -> Unit) {
+    if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post { block() }
+  }
+
+  private fun tamperEscapePulse() {
+    val currentService = service ?: return
+    try {
+      currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+      currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+      currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+    } catch (error: Throwable) {
+      Log.w(TAG, "Tamper escape action failed: ${error.message}")
+    }
   }
 
   private fun showBlockScreen(

@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-08 (Part 12: instant Settings tamper shield in Strict/Aggressive)_
+_Last updated: 2026-11-08 (Part 13: 100 ms Settings tamper shield in every protected mode)_
 
 ## Product
 
@@ -59,7 +59,7 @@ Raising protection is always instant; lowering it in Strict/Aggressive needs an 
 | AI settings storage (native) | `HabitStore.kt` (`AiSettings`, `KEY_AI`) |
 | Block overlay source badges | `BlockOverlay.kt` (`BlockSource`), `HabitGuard.onAiMatch` |
 | AI debug session (frames + CSV + Download export) | `AiDebugSession.kt`, `HabitModule.exportAiDebugSession` |
-| Settings tamper shield (zero-power) | `HabitAccessibilityService.scanTamperShield`, `HabitGuard.onTamperDetected` |
+| Settings tamper shield (zero-power) | `HabitAccessibilityService.scanTamperWindows` + `armTamperWatch`, `HabitGuard.onTamperDetected` |
 
 ## Native pieces
 
@@ -313,39 +313,44 @@ Built for threshold calibration, not for protection:
     the source `BlockSource.ai(domain.uppercase())`, so the block screen says
     `• AI • TELEGRAM.ORG` instead of an app name; app hits keep the app label.
 
-### Settings tamper shield (Part 12)
+### Settings tamper shield (Part 12–13)
 
-An instant, zero-power guard that keeps the user out of the Android Settings that would end
-protection. No screenshot, no model, nothing captured or stored.
+An instant, zero-screenshot guard that keeps the user out of the Android Settings that would
+end protection. No screenshot, no model, nothing captured or stored.
 
-1. **When it is armed** — `HabitGuard.tamperShieldActive`: mode is Strict or Aggressive while
-   protection is ON, plus the locked state between an unlock request and its OFF window.
-   Normal mode and a running OFF window leave Settings alone. Unreadable state fails closed.
-2. **Cost** — node text only, and only when the front package is `com.android.settings`,
-   `com.miui.securitycenter`, `com.google.android.packageinstaller` or
-   `com.miui.packageinstaller`. Every accepted event from those packages is inspected with a
-   220-node budget, so the verdict is a few hundred reads, not a frame.
-3. **Screen A (accessibility toggle)** — blocked as soon as the visible text contains
-   `Use Habit`, `Habit shortcut` or `Habit blocks adult websites`, or when a tap on a `Habit`
-   item happens on a screen that also shows `Accessibility` / `Downloaded apps`. Grace never
-   covers this screen.
-4. **Screen B (app info / data / uninstall / admin)** — blocked when the screen mentions
-   Habit (`Habit`, `com.payjoy.status`, `com.habit.guardian`) and exposes `Force stop`,
-   `Clear data`, `Clear all data`, `Uninstall`, `Remove` or `Deactivate`. A tap on any of
-   those labels, and their confirmation dialogs (`force stop an app`, `clear app data`,
-   `all of this app's data`, `uninstall this app`, `deactivate this device admin`), are
-   refused even during grace.
-5. **Grace window** — `HabitModule.openBatterySettings` / `openAutostartSettings` mark
-   `HabitStore.markTamperGrace` (`TAMPER_GRACE_MS`, 12 s) before starting the intent, so the
-   plain app-info page the battery/autostart "Fix" buttons need can be read. It is never
-   applied to Screen A or to a destructive tap/dialog.
-6. **Kick-out** — `HabitGuard.onTamperDetected` fires `GLOBAL_ACTION_BACK` and
-   `GLOBAL_ACTION_HOME` at once, repeats Home 120 ms later, and shows the block screen with
-   the `• TAMPER SHIELD` badge and “Habit is locked. Unlock inside the Habit app before
-   changing system settings.” One kick-out per 1.2 s, so event storms cannot flicker it.
-7. **Event type** — the accessibility XML now declares `typeViewClicked` (Screen A's list
-   tap, Screen B's button taps). After installing an APK with this change the accessibility
-   service must be switched off and on once, like every earlier XML change.
+1. **When it is armed** — `HabitGuard.tamperShieldActive`: protection is ON in **any** mode
+   (Normal included, because Normal can run protection too), or `mode != normal` while a
+   Strict/Aggressive cooldown is still running. Only a Normal-mode OFF window leaves Settings
+   alone. Unreadable state fails closed.
+2. **Cost** — node text only, and only while the front package is a Settings package:
+   `com.android.settings` (plus `*.settings` variants), `com.miui.securitycenter`,
+   `com.google.android.packageinstaller`, `com.miui.packageinstaller` (`isSettingsPackage`).
+   Nothing is throttled inside them.
+3. **Polling** — `armTamperWatch`: the first Settings event scans at 0 ms, repeats at
+   80/180/300/500 ms and starts a 100 ms `Handler` loop that keeps scanning while a Settings
+   package is in front. The loop’s first tick outside Settings stops it, so nothing polls
+   anywhere else. The watch also arms from any event whose *front window* is Settings (an
+   event can be attributed to SystemUI or the launcher) and from `onServiceConnected`.
+4. **Deep multi-window scan** — `scanTamperWindows` walks every `service.windows` root of a
+   Settings package plus `rootInActiveWindow`, reading `text` and `contentDescription`, with a
+   6 000-node / depth 60 runaway guard instead of a page-sized cap, because “Turn off Habit?”
+   is a separate dialog window.
+5. **Triggers (case-insensitive)** — `Use Habit`, `Habit shortcut`, `Turn off Habit`,
+   `Habit blocks adult websites`; a tap on a `Habit` row while the window shows
+   `Accessibility` / `Downloaded apps`; Habit’s name next to `App info` + `Settings`; Habit’s
+   name next to `Force stop`, `Clear data`, `Clear all data`, `Uninstall`, `Deactivate` or
+   `Remove admin`. Destructive taps and their confirmation dialogs are refused even during
+   grace.
+6. **Grace window** — `HabitModule.openBatterySettings` / `openAutostartSettings` /
+   `openAppDetails` mark `HabitStore.markTamperGrace` (`TAMPER_GRACE_MS`, 12 s) before starting
+   the intent, so the plain app-info page those “Fix” buttons need can be read. It never
+   covers the accessibility screen, a destructive tap or a dialog.
+7. **Kick-out** — `HabitGuard.onTamperDetected` shows the opaque `BlockOverlay` with the
+   `• TAMPER SHIELD` badge first, at 0 ms, so the switch under the finger is covered, then
+   fires four escape pulses at 0/80/180/320 ms, each one BACK, BACK, HOME. The tamper shield
+   swallows BACK itself so a pulse can never dismiss it. One kick-out per 400 ms.
+8. **Event type** — the accessibility XML declares `typeViewClicked` (Part 12). After
+   installing an APK with that change the service must be switched off and on once.
 
 ## Rules to keep
 
@@ -381,6 +386,11 @@ protection. No screenshot, no model, nothing captured or stored.
   accessibility toggle and app-info / clear-data / uninstall / device-admin screens from the
   node tree only (zero frames), with a 12 s battery/autostart grace window, `• TAMPER SHIELD`
   block badge and `typeViewClicked` in the accessibility XML.
+- [x] Part 13 — the shield never misses a Settings screen again: untrottled scanning in every
+  protected mode, a 100 ms poll while a Settings package is in front (stopped anywhere else),
+  follow-up scans at 80/180/300/500 ms, a deep walk of all Settings windows (text +
+  contentDescription), the shield shown before the escape pulses, and BACK×2+HOME repeated four
+  times with the shield swallowing BACK.
 - [x] Part 11 — AI monitoring UI + watched websites: middle tab renamed to AI with a
   four-point sparkle, Home AI summary card, AI tab master panel with Apps/Browser mode
   boxes, domain add/quick-add/remove list, `monitoredDomains` in encrypted storage and the
@@ -431,6 +441,10 @@ Part 12 adds the Settings tamper shield and declares `typeViewClicked` in the ac
 XML, so the APK must be rebuilt and the accessibility service toggled off and on once after
 installing it (Android keeps the old event types until the service reconnects). Nothing in
 the manifest changed.
+
+Part 13 changes Kotlin only (the 100 ms Settings watch and the new kick-out order), so the
+development APK must be rebuilt. The manifest and the accessibility XML are unchanged, so the
+service does not need to be toggled off and on after installing it.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,

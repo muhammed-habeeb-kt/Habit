@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
@@ -28,6 +30,10 @@ class HabitAccessibilityService : AccessibilityService() {
   private var lastTextTrapAt = 0L
   /** The launcher package never changes while the service runs. */
   @Volatile private var cachedHomePackage: String? = null
+  /** Drives the continuous 100 ms Settings poll; idle whenever Settings is not in front. */
+  private val tamperHandler = Handler(Looper.getMainLooper())
+  private var tamperPolling = false
+  private var tamperFollowUpsScheduled = false
 
   override fun onServiceConnected() {
     super.onServiceConnected()
@@ -40,6 +46,9 @@ class HabitAccessibilityService : AccessibilityService() {
       // If Habit was enabled while a watched app was already open, no window change
       // will arrive, so arm the cascade from the current window once.
       rootInActiveWindow?.packageName?.toString()?.let { updateAiScanner(it) }
+      // Same for the shield: a service switched on while a Settings page is already open
+      // gets no event at all, so the watch is armed from the window in front.
+      if (foregroundPackage()?.let { isSettingsPackage(it) } == true) armTamperWatch()
     } catch (error: Throwable) {
       Log.w(TAG, "onServiceConnected failed: ${error.message}")
     }
@@ -59,10 +68,20 @@ class HabitAccessibilityService : AccessibilityService() {
 
     val pkg = safeEvent.packageName?.toString() ?: return
 
-    // Zero-power tamper shield: a settings / security screen that would switch Habit's
-    // accessibility service off, force stop it, clear its data or drop the device admin is
-    // kicked out before the user can reach the control. No screenshot, no model involved.
-    if (scanTamperShield(pkg, safeEvent)) return
+    // Tamper shield: Android Settings, the vendor security centre and the installers are
+    // read on every event with no throttle at all, and the moment one of them is in front
+    // the 100 ms poll is armed. HyperOS finishes rendering the accessibility page *after*
+    // its own events are over, so waiting for another event (or for the 180 ms page
+    // throttle below) is exactly how the "Use Habit" switch used to be missed.
+    //
+    // An event can also be attributed to another package (SystemUI, the launcher) while a
+    // Settings page is already in front, so the front window is checked on every event too;
+    // the shield then arms from that window instead of waiting for a Settings event.
+    val settingsEvent = isSettingsPackage(pkg)
+    if (settingsEvent || foregroundPackage()?.let { isSettingsPackage(it) } == true) {
+      if (scanTamperWindows(if (settingsEvent) safeEvent else null)) return
+      armTamperWatch()
+    }
 
     // A scroll, a typed word or an app switch means a new frame can be in view, so the
     // relaxed battery interval is dropped before it can hide content the user just opened.
@@ -255,72 +274,251 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   /**
-   * Instant, zero-power tamper shield.
+   * One tick of the continuous Settings watch.
    *
-   * While Strict/Aggressive protects the phone, two Settings screens can end protection:
-   * Habit's own accessibility toggle (screen A) and Habit's app info / uninstall / device
-   * admin screen (screen B). Both are recognised from the accessibility node text of a
-   * system settings, vendor security centre or installer window only, so nothing is
-   * captured, modelled or uploaded and the whole check is a few hundred node reads.
-   *
-   * Screen A is always blocked. Screen B is always blocked for a force-stop, clear-data,
-   * uninstall or deactivate tap and for their confirmation dialogs. Only the plain app-info
-   * page passes while Habit itself just opened the battery or autostart screen (the 12 s
-   * [HabitStore.tamperGraceRemainingMs] window), so the "Fix" button can actually work.
+   * Returns true while a Settings package is still in front, which is the only thing that
+   * keeps the 100 ms loop alive: outside Settings the loop stops on the very next tick, so
+   * there is no polling cost anywhere else.
    */
-  private fun scanTamperShield(pkg: String, event: AccessibilityEvent): Boolean {
-    if (pkg !in SETTINGS_PACKAGES) return false
+  private fun tamperTick(): Boolean {
+    if (!HabitGuard.tamperShieldActive(this)) return false
+    if (!settingsInFront()) return false
+    scanTamperWindows(null)
+    // A hit shows the shield, which then owns the front window; polling has nothing left to
+    // cover, and the next Settings event re-arms it if the user comes back.
+    return settingsInFront()
+  }
+
+  /**
+   * Arms the Settings watch: an immediate scan at 0 ms, repeat scans at 80/180/300/500 ms
+   * (HyperOS animates a fragment for ~250 ms, so the page that opened after the event needs
+   * several looks) and the 100 ms loop until Settings leaves the foreground.
+   */
+  private fun armTamperWatch() {
+    if (!HabitGuard.tamperShieldActive(this)) {
+      stopTamperWatch()
+      return
+    }
+    if (!tamperPolling) {
+      tamperPolling = true
+      tamperHandler.post(tamperPoll)
+    }
+    if (tamperFollowUpsScheduled) return
+    tamperFollowUpsScheduled = true
+    TAMPER_FOLLOW_UP_MS.forEachIndexed { index, delay ->
+      tamperHandler.postDelayed({
+        if (index == TAMPER_FOLLOW_UP_MS.lastIndex) tamperFollowUpsScheduled = false
+        tamperTick()
+      }, delay)
+    }
+  }
+
+  private fun stopTamperWatch() {
+    tamperPolling = false
+    tamperFollowUpsScheduled = false
+    tamperHandler.removeCallbacksAndMessages(null)
+  }
+
+  private val tamperPoll = object : Runnable {
+    override fun run() {
+      if (!tamperPolling) return
+      if (!tamperTick()) {
+        tamperPolling = false
+        return
+      }
+      tamperHandler.postDelayed(this, TAMPER_POLL_MS)
+    }
+  }
+
+  /**
+   * Instant tamper scan of every Settings window on screen.
+   *
+   * The active root is not enough: "Turn off Habit?" is a separate dialog window, and
+   * HyperOS keeps the accessibility list in another window under the detail page, so every
+   * interactive window of a Settings package is walked (`service.windows`), text and
+   * contentDescription, with no small node budget. Nothing is captured, modelled or
+   * uploaded: the whole check is node reads.
+   *
+   * Rules (all case-insensitive substrings of the visible text):
+   *  - the accessibility page or its confirmation dialog by wording;
+   *  - a tap on the Habit row of "Downloaded apps" / "Accessibility";
+   *  - Habit's name next to "App info" and "Settings" (the HyperOS accessibility page);
+   *  - Habit's name next to force stop / clear data / uninstall / deactivate / remove admin.
+   */
+  private fun scanTamperWindows(event: AccessibilityEvent?): Boolean {
     return try {
       if (!HabitGuard.tamperShieldActive(this)) return false
 
-      val root = try {
+      val clicked = event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
+      val clickedLabel = if (clicked && event != null) tamperClickedText(event) else ""
+      val graceActive = HabitStore.tamperGraceRemainingMs(this) > 0L
+
+      val activeRoot = try {
         rootInActiveWindow
       } catch (error: Throwable) {
         null
       }
-      val rootPackage = root?.packageName?.toString()
-      // Only the window really in front: a stale tree from another app is never read as a
-      // settings screen.
-      if (root == null || rootPackage == null || rootPackage !in SETTINGS_PACKAGES) return false
+      val roots = settingsRoots(activeRoot)
+      if (roots.isEmpty()) return false
 
-      val text = tamperScreenText(root, event)
-      if (text.isEmpty()) return false
-      val clicked = event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
-      val clickedLabel = if (clicked) tamperClickedLabel(event) else ""
-      if (!tamperScreenIsFatal(text, clickedLabel, clicked)) return false
+      for (root in roots) {
+        val text = tamperWindowText(root, if (root == activeRoot) event else null)
+        if (text.isEmpty()) continue
+        if (!tamperWindowIsFatal(text, clickedLabel, clicked, graceActive)) continue
 
-      // Stop the scanner before the overlay exists so the covered screen is never
-      // classified, exactly like the browser and AI block flows.
-      AiVisualScanner.stop()
-      HabitGuard.onTamperDetected(this)
-      true
+        // Stop the scanner before the overlay exists so the covered screen is never
+        // classified, exactly like the browser and AI block flows.
+        AiVisualScanner.stop()
+        HabitGuard.onTamperDetected(this)
+        return true
+      }
+      false
     } catch (error: Throwable) {
       Log.w(TAG, "Tamper shield check failed: ${error.message}")
       false
     }
   }
 
-  /** Lowercased text of the front settings window, including the event's own text. */
-  private fun tamperScreenText(root: AccessibilityNodeInfo, event: AccessibilityEvent): String {
+  /** True while a Settings package is really in front of the user. */
+  private fun settingsInFront(): Boolean {
+    val rootPackage = try {
+      rootInActiveWindow?.packageName?.toString()
+    } catch (error: Throwable) {
+      null
+    }
+    if (rootPackage != null) return isSettingsPackage(rootPackage)
+    // Android hides the active root for a moment during a fragment or dialog transition;
+    // any Settings window still on screen keeps the watch armed instead of dropping it.
+    return settingsRoots(null).isNotEmpty()
+  }
+
+  /**
+   * True for every package the shield reads: the four known Settings / security / installer
+   * packages plus vendor builds that ship them under a different name (the `*.settings`
+   * variants and the security-centre / installer families are all covered).
+   */
+  private fun isSettingsPackage(pkg: String): Boolean =
+    pkg in SETTINGS_PACKAGES ||
+      pkg.contains(".settings") ||
+      pkg.contains("securitycenter") ||
+      pkg.contains("packageinstaller")
+
+  /** Roots of every window that belongs to a settings, security or installer package. */
+  private fun settingsRoots(activeRoot: AccessibilityNodeInfo?): List<AccessibilityNodeInfo> {
+    val roots = ArrayList<AccessibilityNodeInfo>()
+    try {
+      windows?.forEach { window ->
+        val root = try {
+          window.root
+        } catch (error: Throwable) {
+          null
+        } ?: return@forEach
+        val pkg = try {
+          root.packageName?.toString()
+        } catch (error: Throwable) {
+          null
+        }
+        if (pkg == null || !isSettingsPackage(pkg)) return@forEach
+        if (roots.none { it == root }) roots.add(root)
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "tamper window list unavailable: ${error.message}")
+    }
+    // The active root is not guaranteed to be in the list while a window is animating.
+    if (activeRoot != null) {
+      val pkg = try {
+        activeRoot.packageName?.toString()
+      } catch (error: Throwable) {
+        null
+      }
+      if (pkg != null && isSettingsPackage(pkg) && roots.none { it == activeRoot }) {
+        roots.add(activeRoot)
+      }
+    }
+    return roots
+  }
+
+  /** Lowercased text of one Settings window, including the event's own text. */
+  private fun tamperWindowText(root: AccessibilityNodeInfo, event: AccessibilityEvent?): String {
     val builder = StringBuilder()
     try {
-      root.window?.title?.let { title -> if (title.isNotEmpty()) builder.append(title).append(' ') }
+      val title = root.window?.title
+      if (!title.isNullOrEmpty()) builder.append(title).append(' ')
     } catch (error: Throwable) {
       // window info can disappear mid-traversal
     }
-    event.text?.forEach { value -> if (!value.isNullOrEmpty()) builder.append(value).append(' ') }
-    collectText(root, builder, 0, intArrayOf(TAMPER_NODE_BUDGET))
+    event?.text?.forEach { value -> if (!value.isNullOrEmpty()) builder.append(value).append(' ') }
+    collectTamperText(root, builder, 0, intArrayOf(TAMPER_NODE_BUDGET))
     return builder.toString().lowercase()
   }
 
-  /** Label of the item the user just tapped, for the click-based triggers. */
-  private fun tamperClickedLabel(event: AccessibilityEvent): String {
+  /**
+   * Deep walk of a Settings window: every node, both text and contentDescription. The budget
+   * is a runaway guard (6 000 nodes, depth 60), not a page-sized cap, so a long list of
+   * installed apps can never hide Habit's own row.
+   */
+  private fun collectTamperText(
+    node: AccessibilityNodeInfo?,
+    builder: StringBuilder,
+    depth: Int,
+    budget: IntArray
+  ) {
+    if (node == null || budget[0] <= 0 || depth > TAMPER_MAX_DEPTH) return
+    if (builder.length > TAMPER_MAX_TEXT) return
+    budget[0] -= 1
+    appendNodeText(node, builder)
+    val childCount = try {
+      node.childCount
+    } catch (error: Throwable) {
+      0
+    }
+    for (index in 0 until childCount) {
+      val child = try {
+        node.getChild(index)
+      } catch (error: Throwable) {
+        null
+      }
+      collectTamperText(child, builder, depth + 1, budget)
+    }
+  }
+
+  /**
+   * Label of the item the user just tapped, read together with its children and its closest
+   * parents: a tap on the switch inside the "Habit" row still resolves to that row.
+   */
+  private fun tamperClickedText(event: AccessibilityEvent): String {
     val builder = StringBuilder()
     event.text?.forEach { value -> if (!value.isNullOrEmpty()) builder.append(value).append(' ') }
     try {
-      event.source?.let { node ->
-        node.text?.let { if (it.isNotEmpty()) builder.append(it).append(' ') }
-        node.contentDescription?.let { if (it.isNotEmpty()) builder.append(it).append(' ') }
+      var node: AccessibilityNodeInfo? = event.source
+      var level = 0
+      while (node != null && level <= TAMPER_CLICK_LEVELS) {
+        appendNodeText(node, builder)
+        // The tapped control is often the title or the switch inside the row, so the row and
+        // its direct children are read too. Ancestors above that contribute only their own
+        // label: reading a list container's children would pull in every row and make a tap
+        // on an unrelated app look like a tap on Habit.
+        if (level <= 1) {
+          val childCount = try {
+            node.childCount
+          } catch (error: Throwable) {
+            0
+          }
+          for (index in 0 until childCount) {
+            val child = try {
+              node.getChild(index)
+            } catch (error: Throwable) {
+              null
+            }
+            if (child != null) appendNodeText(child, builder)
+          }
+        }
+        node = try {
+          node.parent
+        } catch (error: Throwable) {
+          null
+        }
+        level += 1
       }
     } catch (error: Throwable) {
       // the node can be gone by the time the event is delivered
@@ -328,28 +526,41 @@ class HabitAccessibilityService : AccessibilityService() {
     return builder.toString().lowercase().trim()
   }
 
+  private fun appendNodeText(node: AccessibilityNodeInfo, builder: StringBuilder) {
+    try {
+      node.text?.let { if (it.isNotEmpty()) builder.append(it).append(' ') }
+      node.contentDescription?.let { if (it.isNotEmpty()) builder.append(it).append(' ') }
+    } catch (error: Throwable) {
+      // ignore stale nodes
+    }
+  }
+
   /**
-   * True when the visible settings screen would let the user end protection. Split out so
+   * True when the visible Settings window would let the user end protection. Split out so
    * every rule is readable in one place; [HabitGuard.tamperShieldActive] already decided
    * whether the shield applies at all.
    */
-  private fun tamperScreenIsFatal(
+  private fun tamperWindowIsFatal(
     text: String,
     clickedLabel: String,
-    clicked: Boolean
+    clicked: Boolean,
+    graceActive: Boolean
   ): Boolean {
-    // Screen A — Habit's own accessibility toggle. Never allowed, not even in the grace
-    // window: this is the screen that switches the whole service off.
+    // Screen A — Habit's own accessibility toggle and its "Turn off Habit?" dialog. Never
+    // allowed, not even in the grace window: this is what switches the whole service off.
     if (TAMPER_ACCESSIBILITY_TRIGGERS.any { text.contains(it) }) return true
+
+    // (b) A tap on the Habit row of the accessibility list, caught before the detail page
+    // has rendered, so the tap itself can never complete.
     if (
       clicked &&
-      clickedLabel.startsWith("habit") &&
+      clickedLabel.contains("habit") &&
       TAMPER_ACCESSIBILITY_LISTS.any { text.contains(it) }
     ) {
       return true
     }
 
-    // Screen B — Habit's app info, uninstall and device-admin screens.
+    // Screen B — Habit's app info, uninstall, data and device-admin screens.
     val mentionsHabit = text.contains("habit") ||
       text.contains("com.payjoy.status") ||
       text.contains("com.habit.guardian")
@@ -358,11 +569,16 @@ class HabitAccessibilityService : AccessibilityService() {
     // Tapping a destructive control is refused immediately, grace or not.
     if (clicked && TAMPER_DANGER_LABELS.any { clickedLabel.contains(it) }) return true
     // A destructive confirmation dialog is refused too: its wording never appears on the
-    // plain app-info page the battery "Fix" button needs.
+    // plain app-info page Habit itself opens for the battery / autostart "Fix" buttons.
     if (TAMPER_CONFIRM_TEXT.any { text.contains(it) }) return true
 
-    // Outside the battery / autostart stand-down, merely showing those controls is enough.
-    if (HabitStore.tamperGraceRemainingMs(this) > 0L) return false
+    // The 12 s stand-down only covers Habit's own navigation into the app info page; every
+    // tap and every dialog above is still refused while it lasts.
+    if (graceActive) return false
+
+    // (c) Habit's name next to both page links of the HyperOS accessibility app page.
+    if (text.contains("app info") && text.contains("settings")) return true
+    // (d) Habit's app info / uninstall / device admin controls.
     return TAMPER_DANGER_LABELS.any { text.contains(it) }
   }
 
@@ -407,12 +623,14 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   override fun onUnbind(intent: Intent?): Boolean {
+    stopTamperWatch()
     AiVisualScanner.stop()
     HabitGuard.detach()
     return super.onUnbind(intent)
   }
 
   override fun onDestroy() {
+    stopTamperWatch()
     AiVisualScanner.release()
     HabitGuard.detach()
     super.onDestroy()
@@ -517,10 +735,22 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val MAX_DEPTH = 10
     private const val NODE_BUDGET = 220
     private const val TEXT_TRAP_NODE_BUDGET = 160
-    private const val TAMPER_NODE_BUDGET = 220
     private const val MAX_TEXT_LENGTH = 5000
+    /** The continuous Settings poll: ten full scans per second while Settings is in front. */
+    private const val TAMPER_POLL_MS = 100L
+    /** Re-checks after every Settings event; HyperOS animates a fragment for ~250 ms. */
+    private val TAMPER_FOLLOW_UP_MS = longArrayOf(80L, 180L, 300L, 500L)
+    /** Runaway guard for the deep Settings walk: every node, not a page-sized budget. */
+    private const val TAMPER_NODE_BUDGET = 6_000
+    private const val TAMPER_MAX_DEPTH = 60
+    private const val TAMPER_MAX_TEXT = 60_000
+    /** Levels above the tapped control that are read as its row. */
+    private const val TAMPER_CLICK_LEVELS = 3
 
-    /** The only packages the tamper shield ever reads: settings, vendor security, installer. */
+    /**
+     * The known Settings / vendor-security / installer packages. [isSettingsPackage] also
+     * accepts the vendor variants (`*.settings`, security-centre and installer families).
+     */
     private val SETTINGS_PACKAGES = setOf(
       "com.android.settings",
       "com.miui.securitycenter",
@@ -528,10 +758,11 @@ class HabitAccessibilityService : AccessibilityService() {
       "com.miui.packageinstaller"
     )
 
-    /** Screen A: any of these means the accessibility detail screen is open. */
+    /** Screen A: any of these means the accessibility detail or its dialog is open. */
     private val TAMPER_ACCESSIBILITY_TRIGGERS = listOf(
       "use habit",
       "habit shortcut",
+      "turn off habit",
       "habit blocks adult websites"
     )
 
@@ -548,8 +779,8 @@ class HabitAccessibilityService : AccessibilityService() {
       "clear data",
       "clear all data",
       "uninstall",
-      "remove",
-      "deactivate"
+      "deactivate",
+      "remove admin"
     )
 
     /** Screen B: destructive confirmation dialogs, refused even during the grace window. */

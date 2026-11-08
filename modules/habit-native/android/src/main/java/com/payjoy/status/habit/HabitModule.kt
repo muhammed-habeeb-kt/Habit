@@ -782,6 +782,10 @@ class HabitModule : Module() {
   }
 
   private fun openAppDetailsInternal(): Boolean {
+    // Habit itself just navigated to the app info page ("allow restricted settings", the
+    // notification fix, or a battery / autostart fallback), so the shield stands down for
+    // the same 12 s as the battery screen. A Force stop or Uninstall tap is still refused.
+    HabitStore.markTamperGrace(appCtx)
     return openIntent(appDetailsIntent())
   }
 
