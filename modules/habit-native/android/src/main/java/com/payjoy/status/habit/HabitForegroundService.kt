@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -96,7 +97,11 @@ class HabitForegroundService : Service() {
       val cooldown = unlock.cooldown
       when {
         offWindow != null -> {
-          val remaining = HabitUnlock.remainingOffMs(offWindow)
+          val remaining = HabitUnlock.remainingOffMs(
+            offWindow,
+            SystemClock.elapsedRealtime(),
+            HabitStore.bootCount(this)
+          )
           "Protection is off. Turns back on in ${formatRemaining(remaining)}."
         }
         cooldown != null -> "Cooldown running — protection stays on."

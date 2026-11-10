@@ -7,6 +7,7 @@ import ai.onnxruntime.TensorInfo
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Rect
 import android.hardware.HardwareBuffer
 import android.os.Build
 import android.os.Handler
@@ -90,6 +91,8 @@ object AiVisualScanner {
   )
   /** Tile names in the order the squares are cut, used in the verdict reason. */
   private val TILE_NAMES = arrayOf("top", "center", "bottom")
+  /** A crop rectangle smaller than this (either axis) is not a usable window. */
+  private const val MIN_TILE_PX = 24
   /** YOLOv8 output rows: 4 box coordinates, then one row per class. */
   private const val YOLO_BOX_ROWS = 4
   private const val YOLO_CLASS_COUNT = 18
@@ -122,6 +125,11 @@ object AiVisualScanner {
   /** Monitored website that armed this loop inside a browser, or null for a watched app. */
   @Volatile private var activeDomain: String? = null
   @Volatile private var activeService: AccessibilityService? = null
+  /**
+   * On-screen rectangle of the watched floating / split window, in display pixels. Null
+   * means the full screen, which keeps the classic three-tile crop.
+   */
+  @Volatile private var activeBounds: Rect? = null
 
   @Volatile private var lastCaptureAt = 0L
   /** Current tick delay: 1 s on interaction, 2.2 s while a safe scene stays unchanged. */
@@ -179,12 +187,24 @@ object AiVisualScanner {
   /** True while the loop belongs to [pkg], whatever app or website armed it. */
   fun isRunningForPackage(pkg: String): Boolean = running && activePackage == pkg
 
+  /** The website a running browser loop belongs to, or null for an app loop. */
+  fun runningDomain(): String? = if (running) activeDomain else null
+
   /**
    * Starts (or keeps) the loop for [packageName]. The caller has already checked that
    * protection is on, AI monitoring is enabled and either the app is selected or
    * [domain] is one of the watched websites open in that browser.
+   *
+   * [windowBounds] is the watched window's on-screen rectangle when it is not the focused
+   * full-screen app (a freeform floating window or a split-screen half). The scanner crops
+   * to it, so the rest of the display is never classified.
    */
-  fun start(service: AccessibilityService, packageName: String, domain: String? = null) {
+  fun start(
+    service: AccessibilityService,
+    packageName: String,
+    domain: String? = null,
+    windowBounds: Rect? = null
+  ) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
       recordError("Screenshots need Android 11 or newer")
       return
@@ -192,12 +212,16 @@ object AiVisualScanner {
     if (running && activePackage == packageName && activeService === service &&
       activeDomain == domain
     ) {
+      // Same window target: only its rectangle can have changed (a dragged floating
+      // window). No restart, so the cascade never loses its frame history.
+      activeBounds = windowBounds?.let { Rect(it) }
       return
     }
 
     activeService = service
     activePackage = packageName
     activeDomain = domain
+    activeBounds = windowBounds?.let { Rect(it) }
     // A website block names the site (`• AI • TELEGRAM.ORG`); an app block names the app.
     appLabel = domain?.uppercase() ?: appLabelFor(service.applicationContext, packageName)
     running = true
@@ -220,6 +244,7 @@ object AiVisualScanner {
     activeService = null
     activePackage = null
     activeDomain = null
+    activeBounds = null
     unsureStrikeCount.set(0)
     blockConfirmCount.set(0)
     safeStreak = 0
@@ -561,27 +586,18 @@ object AiVisualScanner {
       return
     }
 
-    // Only the central media viewport is classified. The top band (status bar + app header
-    // with its circular profile avatar) and the left gutter (Telegram/Discord chat-list and
-    // message avatars) are deliberately excluded, so scrolling a chat list can never feed
-    // an avatar to a model. Inside that viewport three overlapping squares cover the top,
-    // middle and bottom of where a video or photo actually plays.
-    val mediaLeft = (screen.width * AiCascadeConfig.MEDIA_LEFT_RATIO).toInt()
-    val mediaTop = (screen.height * AiCascadeConfig.MEDIA_TOP_RATIO).toInt()
-    val mediaRight = (screen.width * AiCascadeConfig.MEDIA_RIGHT_RATIO).toInt()
-    val mediaBottom = (screen.height * AiCascadeConfig.MEDIA_BOTTOM_RATIO).toInt()
-    val mediaWidth = (mediaRight - mediaLeft).coerceAtLeast(1)
-    val mediaHeight = (mediaBottom - mediaTop).coerceAtLeast(1)
-    val side = min(mediaWidth, mediaHeight).coerceAtLeast(1)
-    val x = mediaLeft + (mediaWidth - side) / 2
-    val yStart = mediaTop
-    val yEnd = mediaBottom - side
-    val offsets = intArrayOf(yStart, (yStart + yEnd) / 2, yEnd)
-    val tiles = ArrayList<Bitmap>(offsets.size)
+    // Only the watched area is classified: the central media viewport of a full-screen
+    // window, or the floating / split window's own rectangle. The top band (status bar plus
+    // app header with its circular avatar) and the left gutter (chat-list avatars) are
+    // excluded, so scrolling a chat list can never feed an avatar to a model.
+    val plan = planTiles(screen)
+    val tiles = ArrayList<Bitmap>(plan.rects.size)
 
     try {
-      for (offset in offsets) {
-        tiles.add(Bitmap.createBitmap(screen, x, offset, side, side))
+      for (rect in plan.rects) {
+        tiles.add(
+          Bitmap.createBitmap(screen, rect.left, rect.top, rect.width(), rect.height())
+        )
       }
 
       val probabilities = arrayOfNulls<FloatArray>(tiles.size)
@@ -608,7 +624,7 @@ object AiVisualScanner {
           probability(output, 4) >= thresholds.stage1BlockSexy
       }
       val stage1BlockReason = stage1BlockIndex?.let { index ->
-        "stage1 ${format(scores[index])} on ${TILE_NAMES.getOrElse(index) { "center" }}" +
+        "stage1 ${format(scores[index])} on ${plan.names.getOrElse(index) { "center" }}" +
           " instant block"
       }
 
@@ -655,7 +671,7 @@ object AiVisualScanner {
         if (confirmations >= AiCascadeConfig.BLOCK_CONFIRM_FRAMES) {
           blockConfirmCount.set(0)
           blockCount += 1
-          triggerBlock(pkg)
+          triggerBlock(pkg, plan.floating)
         } else {
           // Re-check after ~1.5 s instead of relaxing into the 2.2 s movie interval, so the
           // confirmation really spans a moment of continuous media presence.
@@ -671,6 +687,105 @@ object AiVisualScanner {
       for (tile in tiles) recycle(tile)
     }
   }
+
+  /** Where the models look this frame: rectangles plus a short name for the reason line. */
+  private data class TilePlan(
+    val rects: List<Rect>,
+    val names: List<String>,
+    /** True when the watched window covers only part of the display (floating / split). */
+    val floating: Boolean
+  )
+
+  /**
+   * Smart crop plan.
+   *
+   * Case A — a full-screen window (or no bounds at all): three overlapping squares over the
+   * central media viewport of the display, exactly as before.
+   *
+   * Case B — a floating or split window: the screenshot is cropped to the window first (its
+   * own title bar dropped), so no CPU is spent on the rest of the display. A window that is
+   * already roughly square becomes ONE tile — a third of the stage 1 / stage 2 work at 100%
+   * of the window's pixels. A taller or wider window is covered by two overlapping squares
+   * along its long axis.
+   */
+  private fun planTiles(screen: Bitmap): TilePlan {
+    val screenWidth = screen.width.coerceAtLeast(1)
+    val screenHeight = screen.height.coerceAtLeast(1)
+    val bounds = activeBounds
+    var left = 0
+    var top = 0
+    var right = screenWidth
+    var bottom = screenHeight
+    if (bounds != null) {
+      left = bounds.left.coerceIn(0, screenWidth)
+      top = bounds.top.coerceIn(0, screenHeight)
+      right = bounds.right.coerceIn(0, screenWidth)
+      bottom = bounds.bottom.coerceIn(0, screenHeight)
+    }
+    // A stale or degenerate rectangle must never lose protection: fall back to the screen.
+    if (right - left < MIN_TILE_PX || bottom - top < MIN_TILE_PX) {
+      left = 0
+      top = 0
+      right = screenWidth
+      bottom = screenHeight
+    }
+    val windowWidth = (right - left).coerceAtLeast(1)
+    val windowHeight = (bottom - top).coerceAtLeast(1)
+    val coversScreen =
+      windowWidth >= screenWidth * AiCascadeConfig.WINDOW_FULL_SCREEN_RATIO &&
+        windowHeight >= screenHeight * AiCascadeConfig.WINDOW_FULL_SCREEN_RATIO
+
+    if (!coversScreen) {
+      // The window's own title / drag bar is a control strip, never content.
+      val titleBar = (windowHeight * AiCascadeConfig.WINDOW_TITLE_RATIO).toInt()
+      val contentTop = (top + titleBar).coerceAtMost(bottom - 1)
+      val contentHeight = (bottom - contentTop).coerceAtLeast(1)
+      val ratio =
+        maxOf(windowWidth, contentHeight).toFloat() / minOf(windowWidth, contentHeight).toFloat()
+      val side = minOf(windowWidth, contentHeight).coerceAtLeast(1)
+      if (ratio <= AiCascadeConfig.WINDOW_SQUARE_RATIO) {
+        val x = left + (windowWidth - side) / 2
+        val y = contentTop + (contentHeight - side) / 2
+        return TilePlan(listOf(Rect(x, y, x + side, y + side)), listOf("window"), true)
+      }
+      if (windowWidth >= contentHeight) {
+        val y = contentTop + (contentHeight - side) / 2
+        val xs = intArrayOf(left, right - side).distinct()
+        return TilePlan(
+          xs.map { x -> Rect(x, y, x + side, y + side) },
+          windowTileNames(xs.size),
+          true
+        )
+      }
+      val x = left + (windowWidth - side) / 2
+      val ys = intArrayOf(contentTop, bottom - side).distinct()
+      return TilePlan(
+        ys.map { y -> Rect(x, y, x + side, y + side) },
+        windowTileNames(ys.size),
+        true
+      )
+    }
+
+    val mediaLeft = left + (windowWidth * AiCascadeConfig.MEDIA_LEFT_RATIO).toInt()
+    val mediaTop = top + (windowHeight * AiCascadeConfig.MEDIA_TOP_RATIO).toInt()
+    val mediaRight = left + (windowWidth * AiCascadeConfig.MEDIA_RIGHT_RATIO).toInt()
+    val mediaBottom = top + (windowHeight * AiCascadeConfig.MEDIA_BOTTOM_RATIO).toInt()
+    val mediaWidth = (mediaRight - mediaLeft).coerceAtLeast(1)
+    val mediaHeight = (mediaBottom - mediaTop).coerceAtLeast(1)
+    val tileSide = min(mediaWidth, mediaHeight).coerceAtLeast(1)
+    val x = mediaLeft + (mediaWidth - tileSide) / 2
+    val yStart = mediaTop
+    val yEnd = mediaBottom - tileSide
+    val offsets = intArrayOf(yStart, (yStart + yEnd) / 2, yEnd)
+    return TilePlan(
+      offsets.map { y -> Rect(x, y, x + tileSide, y + tileSide) },
+      TILE_NAMES.toList(),
+      false
+    )
+  }
+
+  private fun windowTileNames(count: Int): List<String> =
+    if (count <= 1) listOf("window") else List(count) { index -> "window ${index + 1}" }
 
   /** Outcome of the cascade for one frame, with the human-readable reason kept. */
   private data class Verdict(
@@ -1072,7 +1187,7 @@ object AiVisualScanner {
 
   // region block + helpers
 
-  private fun triggerBlock(pkg: String) {
+  private fun triggerBlock(pkg: String, multiWindow: Boolean = false) {
     val service = activeService ?: return
     val context = service.applicationContext
     val domain = activeDomain
@@ -1080,7 +1195,12 @@ object AiVisualScanner {
     val label = appLabel ?: domain?.uppercase() ?: appLabelFor(context, pkg)
     // Stop before the overlay exists so the covered screen is never classified again.
     stop()
-    HabitGuard.onAiMatch(context, "$pkg:ai-screenshot${domain?.let { ":$it" } ?: ""}", label)
+    HabitGuard.onAiMatch(
+      context,
+      "$pkg:ai-screenshot${domain?.let { ":$it" } ?: ""}",
+      label,
+      multiWindow
+    )
   }
 
   /**

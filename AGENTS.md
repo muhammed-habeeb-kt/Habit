@@ -138,16 +138,28 @@ Part 4 / 6:
 
 ## Clocks, reboots, alarms
 
-- Cooldown time is stored as a monotonic remaining value (`SystemClock.elapsedRealtime`), never
-  as a wall-clock deadline. Changing the phone clock cannot shorten it.
-- Every tick (1 s while the foreground service runs) persists the remaining value at most every
-  5 s. After a reboot the last persisted value is used, so a reboot cannot shorten a cooldown.
-- The 10-minute OFF window additionally respects a wall-clock deadline and always takes the
-  *shorter* of the two values, so rebooting (or a forward clock change) cannot lengthen it.
-- Alarms are `ELAPSED_REALTIME_WAKEUP` (immune to clock changes). They do not survive reboot,
-  so `BootReceiver` re-arms them from encrypted state.
+Habit keeps its own clock (Part 15). **No timer or counter reads the wall clock**, so changing
+Date, Time or Time Zone in Android Settings can neither shorten nor extend anything.
+
+- `UnlockWindow` stores `savedRemainingMs` + `savedAtElapsed` + `savedBootCount`
+  (`Settings.Global.BOOT_COUNT`). `HabitUnlock.remainingMs` subtracts only a monotonic
+  `SystemClock.elapsedRealtime()` delta; a different boot session (or an elapsed value that
+  went backwards) returns the persisted remaining value untouched, so a reboot can only pause
+  a timer, never skip part of it.
+- The same pair rules the auto-restart OFF window, the rate-limit pause (1 / 5 / 15 min) and
+  the 12 s tamper stand-down; there is no `endWall` / `lockedUntilWall` any more.
+- Daily counters use a persisted `DayClock` (`dayKey`, `anchorElapsedMs`, `anchorWallMs`,
+  `bootCount`). While the phone stays on, a day is 24 monotonic hours from the anchor, so a
+  date change cannot roll or wipe today's count. Across a reboot the wall date is trusted
+  only forwards, so setting the clock back cannot resurrect an old day.
+- Every tick persists the remaining value at most every 5 s (`PERSIST_INTERVAL_MS`).
+- Alarms are `ELAPSED_REALTIME_WAKEUP` (`SystemClock.elapsedRealtime() + remainingMs`), never
+  `RTC_WAKEUP`, so they are immune to clock changes. They do not survive reboot, so
+  `BootReceiver` re-arms them from encrypted state.
 - If the exact-alarm permission is unavailable, scheduling falls back to `setAndAllowWhileIdle`
   and the foreground-service ticker still applies the transition on time.
+- Habit registers no `ACTION_TIME_CHANGED` / `ACTION_TIMEZONE_CHANGED` receiver: nothing in
+  the app reacts to a clock change, because nothing in the app depends on one.
 
 ## Unlock methods
 
@@ -384,6 +396,32 @@ screenshot, no model, no stored page text.
    (incognito switch, watched-site count plus the amber “Add Site →” that opens
    `?tab=browser`, and Protected Browsers opening `/browsers`).
 
+### Split-screen & floating windows (Part 15)
+
+A watched app or site can be visible while another window owns the focus, so the router no
+longer trusts `rootInActiveWindow` alone.
+
+1. **Visibility** — `HabitAccessibilityService.watchedWindow(ai)` walks every visible
+   `service.windows` entry (skipping accessibility overlays, Habit itself and SystemUI). A
+   window is watched when its package is in `monitoredAppPackages` — or, for a browser, when
+   that window's own URL bar matches `monitoredDomains` via `browserHostFor` +
+   `AdultFilter.monitoredDomainFor`; an unreadable URL bar keeps an already-armed loop (fail
+   closed). The focused window wins, otherwise the largest watched one.
+2. **Bounds** — the window's `getBoundsInScreen` rectangle goes to
+   `AiVisualScanner.start(service, pkg, domain, bounds)` and is refreshed while the loop runs
+   (same package/domain = rect update only, so the frame history is kept).
+3. **Crop plan** — `AiVisualScanner.planTiles`: a window covering >= 80% of both axes is the
+   full-screen case (the classic three overlapping squares over the central media viewport).
+   Anything smaller is cropped to the window, its top 10% title bar dropped, and covered by
+   ONE square tile when `max/min <= 1.45`, otherwise two overlapping squares along the long
+   axis. Nothing outside the window is ever classified, so a floating window costs a third of
+   the full-screen inference work.
+4. **Block** — a hit from a partial window calls `HabitGuard.onAiMatch(..., multiWindow =
+   true)`, which fires BACK (closes the floating window / leaves the split) *and* HOME before
+   `BlockOverlay`, so both views are gone.
+5. **Limit** — a `FLAG_SECURE` window exposes no root, so a fully secure floating window can
+   be neither identified nor screenshotted. That is the honest ceiling of this feature.
+
 ## Rules to keep
 
 - On-device only. No screenshots, embeddings or classifications leave the phone.
@@ -428,6 +466,10 @@ screenshot, no model, no stored page text.
   boxes, domain add/quick-add/remove list, `monitoredDomains` in encrypted storage and the
   bridge, browser-URL arming of the screenshot scanner, and per-domain `• AI • DOMAIN`
   block badges.
+- [x] Part 15 — split-screen / floating-window monitoring with smart bounds cropping (every
+  visible window is inspected, the watched window's own rectangle is cropped and classified
+  with one or two tiles) and Habit's own monotonic clock: no wall-clock timer, no RTC alarm,
+  boot-session-aware remaining values and a monotonic 24-hour day counter.
 - [x] Part 14 — Incognito / private tab blocker: `incognitoBlockingEnabled` in encrypted
   storage with a native Strict/Aggressive lock on turning it off, click and window-text
   detection for Incognito / Private / Secret / InPrivate tabs in every watched browser
@@ -487,6 +529,10 @@ Part 14 adds the incognito-blocking bridge (`setIncognitoBlockingEnabled`) and t
 private-tab detection, so the development APK must be rebuilt. The manifest and the
 accessibility XML are unchanged since Part 12 (it already listens to `typeViewClicked`), so
 the service does not need to be toggled off and on.
+
+Part 15 changes Kotlin only (multi-window routing, the window-bounds crop plan and the
+monotonic clock), so the development APK must be rebuilt. The manifest and the accessibility
+XML are unchanged, so the service does not need to be toggled off and on.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,

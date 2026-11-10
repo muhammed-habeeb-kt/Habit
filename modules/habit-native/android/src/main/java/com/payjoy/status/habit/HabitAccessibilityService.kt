@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -13,6 +14,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 
 /**
  * Watches browser windows and blocks adult pages.
@@ -129,8 +131,9 @@ class HabitAccessibilityService : AccessibilityService() {
   override fun onInterrupt() = Unit
 
   /**
-   * Routes the foreground app: start the cascade for a selected app or for a watched
-   * website open in a browser, and stop it everywhere else.
+   * Routes the cascade: a selected app or watched website keeps the loop alive wherever it
+   * is on screen — full screen, split screen or a floating window — and everything else
+   * stops it.
    */
   private fun updateAiScanner(pkg: String) {
     try {
@@ -142,28 +145,33 @@ class HabitAccessibilityService : AccessibilityService() {
       if (pkg == SYSTEM_UI_PACKAGE) return
 
       val browser = pkg in BROWSER_PACKAGES
-      // An app loop depends only on its package, so one already running needs no work. A
-      // browser loop also depends on the URL, which can change without the package
-      // changing, so a browser's host is re-read on every routing pass.
-      if (!browser && AiVisualScanner.isRunningFor(pkg)) return
 
       // Every event comes through here, and TYPE_WINDOW_CONTENT_CHANGED can fire dozens of
-      // times a second. The store is only re-read when the package changes or the throttle
-      // has passed, so routing stays cheap without ever missing an app or site switch.
+      // times a second. Routing is only re-run when the package changes or the throttle has
+      // passed, so it stays cheap while still refreshing a moved floating window.
       val now = SystemClock.elapsedRealtime()
       val throttle = if (browser) BROWSER_ROUTE_INTERVAL_MS else ROUTE_INTERVAL_MS
       if (pkg == lastRoutedPackage && now - lastRoutedAt < throttle) return
       lastRoutedPackage = pkg
       lastRoutedAt = now
 
-      if (pkg == packageName || pkg == homePackage()) {
+      val state = HabitStore.state(this)
+      val ai = HabitStore.aiSettings(this)
+      if (!state.protectionEnabled || !ai.enabled) {
         AiVisualScanner.stop()
         return
       }
 
-      val state = HabitStore.state(this)
-      val ai = HabitStore.aiSettings(this)
-      if (!state.protectionEnabled || !ai.enabled) {
+      // Split-screen and floating windows first: the watched app or site can be visible
+      // while the launcher or another app owns the focus, and this window's rectangle is
+      // what the scanner crops to.
+      val watched = watchedWindow(ai)
+      if (watched != null) {
+        AiVisualScanner.start(this, watched.packageName, watched.domain, watched.bounds)
+        return
+      }
+
+      if (pkg == packageName || pkg == homePackage()) {
         AiVisualScanner.stop()
         return
       }
@@ -329,7 +337,13 @@ class HabitAccessibilityService : AccessibilityService() {
       rootInActiveWindow
     } catch (error: Throwable) {
       null
-    } ?: return null
+    }
+    return browserHostFor(root, pkg)
+  }
+
+  /** URL-bar host of one browser window root (the active one, or a split/floating one). */
+  private fun browserHostFor(root: AccessibilityNodeInfo?, pkg: String): String? {
+    if (root == null) return null
     if (root.packageName?.toString() != pkg) return null
 
     for (viewId in urlBarIds(pkg)) {
@@ -343,6 +357,97 @@ class HabitAccessibilityService : AccessibilityService() {
       if (host != null) return host
     }
     return null
+  }
+
+  /** A visible window the screenshot cascade should watch, with its screen rectangle. */
+  private data class WatchedWindow(
+    val packageName: String,
+    val domain: String?,
+    val bounds: Rect
+  )
+
+  /**
+   * The watched window on screen right now, or null when nothing watched is visible.
+   *
+   * On HyperOS (and stock Android) a monitored app or a watched site can sit in a freeform
+   * floating window or a split-screen half while another app, or the launcher, owns the
+   * focus. `rootInActiveWindow` then belongs to the *other* app, so every visible window in
+   * `service.windows` is inspected instead. The focused window wins; otherwise the largest
+   * watched window does. Its exact `getBoundsInScreen` rectangle travels to
+   * [AiVisualScanner], which crops to it so the rest of the display is never classified.
+   */
+  private fun watchedWindow(ai: AiSettings): WatchedWindow? {
+    val currentWindows = try {
+      windows
+    } catch (error: Throwable) {
+      Log.w(TAG, "Window list unavailable: ${error.message}")
+      null
+    } ?: return null
+
+    var largest: WatchedWindow? = null
+    var largestArea = 0L
+    for (window in currentWindows) {
+      if (!window.isVisible) continue
+      if (window.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue
+      val root = try {
+        window.root
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      val windowPackage = try {
+        root.packageName?.toString()
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      if (windowPackage == packageName || windowPackage == SYSTEM_UI_PACKAGE) continue
+
+      // A browser is guarded by its website, exactly like the foreground path: being in the
+      // app list as well must not turn a whole browser into a watched app.
+      val domain: String?
+      if (windowPackage in BROWSER_PACKAGES) {
+        val host = browserHostFor(root, windowPackage) ?: currentBrowserHost(windowPackage)
+        domain = if (host == null) {
+          // Private or still-loading page: keep a loop that already belongs to this browser
+          // (fail closed) instead of dropping protection.
+          if (AiVisualScanner.isRunningForPackage(windowPackage)) {
+            AiVisualScanner.runningDomain()
+          } else {
+            null
+          }
+        } else {
+          AdultFilter.monitoredDomainFor(host, ai.monitoredDomains)
+        }
+        if (domain == null) continue
+      } else if (windowPackage in ai.monitoredAppPackages) {
+        domain = null
+      } else {
+        continue
+      }
+
+      val bounds = Rect()
+      try {
+        window.getBoundsInScreen(bounds)
+      } catch (error: Throwable) {
+        continue
+      }
+      if (bounds.width() < MIN_WATCHED_WINDOW_PX || bounds.height() < MIN_WATCHED_WINDOW_PX) {
+        continue
+      }
+
+      val candidate = WatchedWindow(windowPackage, domain, bounds)
+      val focused = try {
+        window.isFocused
+      } catch (error: Throwable) {
+        false
+      }
+      if (focused) return candidate
+      val area = bounds.width().toLong() * bounds.height().toLong()
+      if (area > largestArea) {
+        largest = candidate
+        largestArea = area
+      }
+    }
+    return largest
   }
 
   /**
@@ -783,6 +888,8 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
     private const val SCAN_INTERVAL_MS = 180L
     private const val ROUTE_INTERVAL_MS = 1_000L
+    /** A watched window smaller than this is a thumbnail and is not routed to the scanner. */
+    private const val MIN_WATCHED_WINDOW_PX = 80
     /** Browsers re-read their URL bar on this cadence so a site change stops scanning fast. */
     private const val BROWSER_ROUTE_INTERVAL_MS = 500L
     /** Runaway guard for the private-tab node walk: a handful of screenfuls, < 50 ms. */

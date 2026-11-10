@@ -6,6 +6,8 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.PowerManager
+import android.os.SystemClock
+import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -24,13 +26,24 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-/** A timed unlock window (cooldown or auto re-enable window). */
+/**
+ * A timed unlock window (cooldown or auto re-enable window).
+ *
+ * Time is Habit's own and monotonic: [savedRemainingMs] is the time left at the monotonic
+ * instant [savedAtElapsed], and it is only ever decremented by `SystemClock` deltas. No
+ * wall-clock deadline is stored, so changing Date / Time / Time Zone in Android Settings
+ * can neither shorten nor extend a window.
+ *
+ * [savedBootCount] identifies the boot session the anchor belongs to, so a reboot is
+ * recognised even after the phone has been up longer than the old anchor (an elapsed value
+ * that happens to grow must never be subtracted across boots).
+ */
 data class UnlockWindow(
   val durationMs: Long,
   val savedRemainingMs: Long,
   val savedAtElapsed: Long,
-  /** Wall-clock deadline, only used to stop an OFF window from growing after a reboot. */
-  val endWall: Long = 0L
+  /** `Settings.Global.BOOT_COUNT` at save time, -1 when the device cannot report it. */
+  val savedBootCount: Int = -1
 )
 
 data class FailureState(
@@ -38,7 +51,10 @@ data class FailureState(
   val consecutive: Int = 0,
   val day: String = "",
   val dayCount: Int = 0,
-  val lockedUntilWall: Long = 0L
+  /** Rate-limit lock, stored the same monotonic way as [UnlockWindow]. */
+  val lockRemainingMs: Long = 0L,
+  val lockSavedAtElapsed: Long = 0L,
+  val lockSavedBootCount: Int = -1
 )
 
 data class UnlockState(
@@ -47,6 +63,21 @@ data class UnlockState(
   val restoreMode: String = ProtectionState.MODE_STRICT,
   val failures: FailureState = FailureState(),
   val fastCooldown: Boolean = false
+)
+
+/**
+ * Habit's own day counter anchor.
+ *
+ * The day key is derived from monotonic hours since the anchor while the phone stays on, so
+ * changing the phone's date can never roll the counter over early (or wipe today's blocked
+ * attempts). Across a reboot the wall date is only trusted forwards, so setting the clock
+ * back cannot resurrect an old day either.
+ */
+private data class DayClock(
+  val dayKey: String = "",
+  val anchorElapsedMs: Long = 0L,
+  val anchorWallMs: Long = 0L,
+  val bootCount: Int = -1
 )
 
 /**
@@ -158,6 +189,9 @@ object HabitStore {
   private const val KEY_AI = "ai"
   private const val KEY_RESTRICTED_SETTINGS = "restricted_settings"
   private const val KEY_TAMPER_GRACE = "tamper_grace"
+  /** Habit's own 24-hour day anchor for attempts / failure counters. */
+  private const val KEY_DAY_CLOCK = "day_clock"
+  private const val DAY_MS = 24L * 60L * 60L * 1000L
 
   /**
    * Plain-JSON mirror of the watched browser websites in `filesDir`. It is written on every
@@ -193,7 +227,30 @@ object HabitStore {
   @Volatile private var cachedKeywords: List<String>? = null
   @Volatile private var cachedAi: AiSettings? = null
   @Volatile private var cachedRestrictedVisited: Boolean? = null
-  @Volatile private var tamperGraceEndWall: Long? = null
+  @Volatile private var cachedDayClock: DayClock? = null
+  @Volatile private var cachedBootCount: Int? = null
+  /** Monotonic end of the tamper stand-down, with the boot session it belongs to. */
+  @Volatile private var tamperGraceUntilElapsed: Long? = null
+  @Volatile private var tamperGraceBootCount: Int? = null
+
+  /**
+   * `Settings.Global.BOOT_COUNT`: increments on every boot, so a new session is detected
+   * even when the new uptime is already larger than the old anchor. -1 when unreadable.
+   *
+   * Cached per process: the value cannot change without a reboot, and Habit's process never
+   * survives one. The 1 s ticker can call this for free instead of hitting a content
+   * provider every second.
+   */
+  fun bootCount(context: Context): Int {
+    cachedBootCount?.let { return it }
+    val value = try {
+      Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1)
+    } catch (error: Throwable) {
+      -1
+    }
+    cachedBootCount = value
+    return value
+  }
 
   /** Called on a background thread after an attempt is counted. */
   @Volatile var onAttemptsChanged: ((Int) -> Unit)? = null
@@ -665,7 +722,9 @@ object HabitStore {
         .put("consecutive", state.failures.consecutive)
         .put("day", state.failures.day)
         .put("dayCount", state.failures.dayCount)
-        .put("lockedUntilWall", state.failures.lockedUntilWall)
+        .put("lockRemainingMs", state.failures.lockRemainingMs)
+        .put("lockSavedAtElapsed", state.failures.lockSavedAtElapsed)
+        .put("lockSavedBootCount", state.failures.lockSavedBootCount)
     )
     return json.toString()
   }
@@ -675,7 +734,7 @@ object HabitStore {
       .put("durationMs", window.durationMs)
       .put("savedRemainingMs", window.savedRemainingMs)
       .put("savedAtElapsed", window.savedAtElapsed)
-      .put("endWall", window.endWall)
+      .put("savedBootCount", window.savedBootCount)
   }
 
   private fun parseUnlock(raw: String): UnlockState {
@@ -692,7 +751,9 @@ object HabitStore {
           consecutive = failures?.optInt("consecutive", 0) ?: 0,
           day = failures?.optString("day", "") ?: "",
           dayCount = failures?.optInt("dayCount", 0) ?: 0,
-          lockedUntilWall = failures?.optLong("lockedUntilWall", 0L) ?: 0L
+          lockRemainingMs = failures?.optLong("lockRemainingMs", 0L) ?: 0L,
+          lockSavedAtElapsed = failures?.optLong("lockSavedAtElapsed", 0L) ?: 0L,
+          lockSavedBootCount = failures?.optInt("lockSavedBootCount", -1) ?: -1
         )
       )
     } catch (error: Throwable) {
@@ -710,7 +771,7 @@ object HabitStore {
       durationMs = duration,
       savedRemainingMs = remaining,
       savedAtElapsed = json.optLong("savedAtElapsed", 0L),
-      endWall = json.optLong("endWall", 0L)
+      savedBootCount = json.optInt("savedBootCount", -1)
     )
   }
 
@@ -718,7 +779,86 @@ object HabitStore {
 
   // region attempts
 
-  fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+  private fun dayKeyFor(wallMs: Long): String =
+    SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(wallMs))
+
+  private fun dayClock(context: Context): DayClock {
+    cachedDayClock?.let { return it }
+    val raw = read(context, KEY_DAY_CLOCK)
+    val parsed = try {
+      if (raw.isNullOrBlank()) {
+        DayClock()
+      } else {
+        val json = JSONObject(raw)
+        DayClock(
+          dayKey = json.optString("dayKey", ""),
+          anchorElapsedMs = json.optLong("anchorElapsedMs", 0L),
+          anchorWallMs = json.optLong("anchorWallMs", 0L),
+          bootCount = json.optInt("bootCount", -1)
+        )
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "Day clock unreadable, starting a fresh day")
+      DayClock()
+    }
+    cachedDayClock = parsed
+    return parsed
+  }
+
+  private fun saveDayClock(context: Context, clock: DayClock) {
+    val json = JSONObject()
+      .put("dayKey", clock.dayKey)
+      .put("anchorElapsedMs", clock.anchorElapsedMs)
+      .put("anchorWallMs", clock.anchorWallMs)
+      .put("bootCount", clock.bootCount)
+    write(context, KEY_DAY_CLOCK, json.toString())
+    cachedDayClock = clock
+  }
+
+  /**
+   * The protection day, from Habit's own clock.
+   *
+   * While the phone stays on a day is 24 monotonic hours from the anchor, so changing the
+   * date in Settings can never roll the counter early or wipe today's blocked attempts.
+   * After a reboot the wall date is only trusted forwards (the key never moves backwards),
+   * so setting the clock back cannot resurrect an old day either.
+   */
+  fun today(context: Context): String {
+    synchronized(lock) {
+      val nowElapsed = SystemClock.elapsedRealtime()
+      val nowWall = System.currentTimeMillis()
+      val boot = bootCount(context)
+      val clock = dayClock(context)
+      val wallKey = dayKeyFor(nowWall)
+
+      if (clock.dayKey.isEmpty()) {
+        saveDayClock(context, DayClock(wallKey, nowElapsed, nowWall, boot))
+        return wallKey
+      }
+
+      val sameBoot = boot == -1 || clock.bootCount == -1 || boot == clock.bootCount
+      if (sameBoot && nowElapsed >= clock.anchorElapsedMs) {
+        val elapsed = nowElapsed - clock.anchorElapsedMs
+        if (elapsed < DAY_MS) return clock.dayKey
+        val days = elapsed / DAY_MS
+        // Projected from the anchor plus monotonic time, never from the current wall clock.
+        val projectedWall = clock.anchorWallMs + elapsed
+        val next = DayClock(
+          dayKey = dayKeyFor(projectedWall),
+          anchorElapsedMs = clock.anchorElapsedMs + days * DAY_MS,
+          anchorWallMs = projectedWall,
+          bootCount = boot
+        )
+        saveDayClock(context, next)
+        return next.dayKey
+      }
+
+      val nextKey = if (wallKey > clock.dayKey) wallKey else clock.dayKey
+      val nextAnchorWall = if (nowWall > clock.anchorWallMs) nowWall else clock.anchorWallMs
+      saveDayClock(context, DayClock(nextKey, nowElapsed, nextAnchorWall, boot))
+      return nextKey
+    }
+  }
 
   private fun attemptsJson(context: Context): JSONObject {
     val raw = read(context, KEY_ATTEMPTS) ?: return JSONObject()
@@ -729,7 +869,7 @@ object HabitStore {
     }
   }
 
-  fun attemptsToday(context: Context): Int = attemptsJson(context).optInt(today(), 0)
+  fun attemptsToday(context: Context): Int = attemptsJson(context).optInt(today(context), 0)
 
   /**
    * Counts one block event. Returns the new daily total, or null when the same
@@ -737,7 +877,7 @@ object HabitStore {
    */
   fun registerAttempt(context: Context, matchKey: String): Int? {
     synchronized(lock) {
-      val now = System.currentTimeMillis()
+      val now = SystemClock.elapsedRealtime()
       val last = dedupeAt[matchKey]
       if (last != null && now - last < DEDUPE_WINDOW_MS) return null
       dedupeAt[matchKey] = now
@@ -746,7 +886,7 @@ object HabitStore {
       }
 
       val json = attemptsJson(context)
-      val day = today()
+      val day = today(context)
       val count = json.optInt(day, 0) + 1
       json.put(day, count)
       trimAttempts(json)
@@ -932,24 +1072,43 @@ object HabitStore {
    * Habit itself opened. Written by the native bridge only, right before the intent.
    */
   fun markTamperGrace(context: Context, durationMs: Long = TAMPER_GRACE_MS) {
-    val endWall = System.currentTimeMillis() + durationMs
+    val until = SystemClock.elapsedRealtime() + durationMs
+    val boot = bootCount(context)
     synchronized(lock) {
-      write(context, KEY_TAMPER_GRACE, endWall.toString())
-      tamperGraceEndWall = endWall
+      write(context, KEY_TAMPER_GRACE, "$until|$boot")
+      tamperGraceUntilElapsed = until
+      tamperGraceBootCount = boot
     }
   }
 
-  /** Milliseconds left of the battery / autostart stand-down, 0 when none is running. */
+  /**
+   * Milliseconds left of the battery / autostart stand-down, 0 when none is running.
+   *
+   * Monotonic like every other Habit timer: moving the phone clock can neither extend nor
+   * revive the 12 s stand-down, and a different boot session expires it outright. A legacy
+   * wall-clock value written by an older build counts as expired, never as live grace.
+   */
   fun tamperGraceRemainingMs(context: Context): Long {
-    val endWall = tamperGraceEndWall ?: loadTamperGrace(context)
-    return (endWall - System.currentTimeMillis()).coerceAtLeast(0L)
+    loadTamperGrace(context)
+    val until = tamperGraceUntilElapsed ?: return 0L
+    val savedBoot = tamperGraceBootCount ?: -1
+    val boot = bootCount(context)
+    if (savedBoot != -1 && boot != -1 && savedBoot != boot) return 0L
+    return (until - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
   }
 
-  private fun loadTamperGrace(context: Context): Long = synchronized(lock) {
-    val stored = tamperGraceEndWall
-      ?: (read(context, KEY_TAMPER_GRACE)?.toLongOrNull() ?: 0L)
-    tamperGraceEndWall = stored
-    stored
+  private fun loadTamperGrace(context: Context) = synchronized(lock) {
+    if (tamperGraceUntilElapsed != null) return@synchronized
+    val raw = read(context, KEY_TAMPER_GRACE)
+    val parts = raw?.split('|').orEmpty()
+    if (parts.size < 2) {
+      // Missing, or a wall-clock value from an older build: never a live grace.
+      tamperGraceUntilElapsed = 0L
+      tamperGraceBootCount = -1
+      return@synchronized
+    }
+    tamperGraceUntilElapsed = parts[0].toLongOrNull() ?: 0L
+    tamperGraceBootCount = parts[1].toIntOrNull() ?: -1
   }
 
   // endregion

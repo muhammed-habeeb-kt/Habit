@@ -61,8 +61,16 @@ object HabitGuard {
    * AiVisualScanner calls this after the screenshot cascade confirms adult content in a
    * watched app. `matchKey` is stable per app + detected scene, so the 5-second dedupe
    * counts one attempt instead of one per analyzed frame.
+   *
+   * [multiWindow] is set when the hit came from a floating or split window: Back closes
+   * only that view and can leave the split behind, so Home is fired as well.
    */
-  fun onAiMatch(context: Context, matchKey: String, appLabel: String) {
+  fun onAiMatch(
+    context: Context,
+    matchKey: String,
+    appLabel: String,
+    multiWindow: Boolean = false
+  ) {
     if (!HabitStore.aiSettings(context).enabled) return
     if (!HabitStore.state(context).protectionEnabled) return
 
@@ -70,7 +78,7 @@ object HabitGuard {
     // `matchKey` is "<package>:ai-screenshot", so the package is recoverable for the
     // still-in-front check that decides whether Home is needed as well as Back.
     val packageHint = matchKey.substringBefore(':').takeIf { it.contains('.') }
-    showBlockScreen(matchKey, total, BlockSource.ai(appLabel), packageHint)
+    showBlockScreen(matchKey, total, BlockSource.ai(appLabel), packageHint, multiWindow)
   }
 
   /**
@@ -216,7 +224,8 @@ object HabitGuard {
     matchKey: String,
     attemptsToday: Int,
     source: BlockSource,
-    packageHint: String? = null
+    packageHint: String? = null,
+    multiWindow: Boolean = false
   ) {
     // A covered screen must never be classified again; stop before the overlay is added.
     AiVisualScanner.onOverlayShown()
@@ -231,6 +240,15 @@ object HabitGuard {
         currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
       } catch (error: Throwable) {
         Log.w(TAG, "Back action failed: ${error.message}")
+      }
+      // A floating window or a split half survives a single Back, so both views are closed
+      // before the block screen takes over the display.
+      if (multiWindow) {
+        try {
+          currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+        } catch (error: Throwable) {
+          Log.w(TAG, "Home action failed: ${error.message}")
+        }
       }
 
       val shown = try {

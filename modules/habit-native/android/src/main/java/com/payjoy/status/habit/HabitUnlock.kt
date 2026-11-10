@@ -11,10 +11,12 @@ import android.util.Log
  * Raising protection is instant. Lowering it in Strict/Aggressive requires an unlock:
  * either a typed character challenge (A) or a monotonic cooldown (B).
  *
- * Cooldowns never depend on the wall clock: remaining time comes from the persisted
- * monotonic snapshot and, after a reboot, from the last persisted remaining value.
- * That means changing the phone clock can't shorten a cooldown and rebooting can't
- * lengthen the OFF window.
+ * Habit keeps its own clock. Every timer is `savedRemainingMs` + `savedAtElapsed` and is
+ * only ever advanced by `SystemClock.elapsedRealtime()` deltas, with the boot session
+ * recorded beside the anchor. No wall-clock deadline exists anywhere, so changing Date,
+ * Time or Time Zone in Android Settings can neither shorten nor extend a cooldown or the
+ * auto-restart OFF window, and a reboot resumes from the last persisted remaining value
+ * (never from elapsed time that happened to grow past the old anchor).
  */
 object HabitUnlock {
   private const val TAG = "HabitUnlock"
@@ -33,9 +35,21 @@ object HabitUnlock {
 
   // region queries
 
-  fun remainingMs(window: UnlockWindow?, nowElapsed: Long = SystemClock.elapsedRealtime()): Long {
+  /**
+   * Time left in [window], strictly from monotonic time.
+   *
+   * A different boot session (or an elapsed value that went backwards) means the anchor is
+   * from before a reboot: the persisted remaining value is returned as it stands, so a
+   * reboot can only ever pause the timer, never skip part of it.
+   */
+  fun remainingMs(
+    window: UnlockWindow?,
+    nowElapsed: Long = SystemClock.elapsedRealtime(),
+    bootCount: Int = -1
+  ): Long {
     if (window == null) return 0L
-    val rebooted = nowElapsed < window.savedAtElapsed
+    val rebooted = (bootCount != -1 && window.savedBootCount != -1 &&
+      bootCount != window.savedBootCount) || nowElapsed < window.savedAtElapsed
     val remaining = if (rebooted) {
       window.savedRemainingMs
     } else {
@@ -44,26 +58,43 @@ object HabitUnlock {
     return remaining.coerceIn(0L, window.durationMs)
   }
 
-  /**
-   * The OFF window must never grow, so after a reboot it also respects the wall-clock
-   * deadline. Whichever is shorter wins — turning protection back on early is safe.
-   */
+  /** The OFF window runs on the same monotonic clock; no wall deadline exists any more. */
   fun remainingOffMs(
     window: UnlockWindow?,
     nowElapsed: Long = SystemClock.elapsedRealtime(),
-    nowWall: Long = System.currentTimeMillis()
+    bootCount: Int = -1
+  ): Long = remainingMs(window, nowElapsed, bootCount)
+
+  /**
+   * Rate-limit lock left, measured from the same monotonic anchor as the windows. Changing
+   * the phone clock can never clear a 1 / 5 / 15 minute pause; a reboot keeps the value.
+   */
+  fun lockRemainingMs(context: Context): Long = failureLockRemaining(
+    HabitStore.unlockState(context).failures,
+    SystemClock.elapsedRealtime(),
+    HabitStore.bootCount(context)
+  )
+
+  private fun failureLockRemaining(
+    failures: FailureState,
+    nowElapsed: Long,
+    bootCount: Int
   ): Long {
-    if (window == null) return 0L
-    val monotonic = remainingMs(window, nowElapsed)
-    if (window.endWall <= 0L) return monotonic
-    val wall = (window.endWall - nowWall).coerceAtLeast(0L)
-    return minOf(monotonic, wall)
+    if (failures.lockRemainingMs <= 0L) return 0L
+    val rebooted = bootCount != -1 && failures.lockSavedBootCount != -1 &&
+      bootCount != failures.lockSavedBootCount
+    if (rebooted || nowElapsed < failures.lockSavedAtElapsed) return failures.lockRemainingMs
+    return (failures.lockRemainingMs - (nowElapsed - failures.lockSavedAtElapsed))
+      .coerceAtLeast(0L)
   }
 
-  fun lockRemainingMs(context: Context): Long {
-    val lockedUntil = HabitStore.unlockState(context).failures.lockedUntilWall
-    return (lockedUntil - System.currentTimeMillis()).coerceAtLeast(0L)
-  }
+  /** Clears the rate-limit pause without touching today's failure count. */
+  private fun FailureState.withoutLock(): FailureState = copy(
+    consecutive = 0,
+    lockRemainingMs = 0L,
+    lockSavedAtElapsed = 0L,
+    lockSavedBootCount = -1
+  )
 
   fun cooldownDurationMs(context: Context): Long {
     val fast = HabitStore.unlockState(context).fastCooldown
@@ -127,14 +158,15 @@ object HabitUnlock {
 
   fun failuresToday(context: Context): Int {
     val failures = HabitStore.unlockState(context).failures
-    return if (failures.day == HabitStore.today()) failures.dayCount else 0
+    return if (failures.day == HabitStore.today(context)) failures.dayCount else 0
   }
 
   fun snapshotPart(context: Context): Map<String, Any?> {
     val unlock = HabitStore.unlockState(context)
     val now = SystemClock.elapsedRealtime()
-    val cooldownRemaining = remainingMs(unlock.cooldown, now)
-    val offRemaining = remainingOffMs(unlock.offWindow, now)
+    val boot = HabitStore.bootCount(context)
+    val cooldownRemaining = remainingMs(unlock.cooldown, now, boot)
+    val offRemaining = remainingOffMs(unlock.offWindow, now, boot)
     val configuredCooldownMs = ProtectionState.normalizeCooldownMinutes(
       HabitStore.state(context).configuredCooldownMinutes
     ) * 60_000L
@@ -272,8 +304,8 @@ object HabitUnlock {
     HabitStore.writeUnlockState(
       context,
       unlock.copy(
-        cooldown = UnlockWindow(duration, duration, now, System.currentTimeMillis() + duration),
-        failures = unlock.failures.copy(consecutive = 0, lockedUntilWall = 0L)
+        cooldown = UnlockWindow(duration, duration, now, HabitStore.bootCount(context)),
+        failures = unlock.failures.withoutLock()
       ),
       sync = true
     )
@@ -299,10 +331,11 @@ object HabitUnlock {
   fun tick(context: Context): ProtectionState {
     var unlock = HabitStore.unlockState(context)
     val now = SystemClock.elapsedRealtime()
+    val boot = HabitStore.bootCount(context)
     var changed = false
 
     val cooldown = unlock.cooldown
-    if (cooldown != null && remainingMs(cooldown, now) <= 0L) {
+    if (cooldown != null && remainingMs(cooldown, now, boot) <= 0L) {
       val previousMode = HabitStore.state(context).mode
       val restore = if (previousMode == ProtectionState.MODE_NORMAL) {
         ProtectionState.MODE_STRICT
@@ -313,12 +346,7 @@ object HabitUnlock {
       unlock = unlock.copy(
         cooldown = null,
         restoreMode = restore,
-        offWindow = UnlockWindow(
-          offMs,
-          offMs,
-          now,
-          System.currentTimeMillis() + offMs
-        )
+        offWindow = UnlockWindow(offMs, offMs, now, boot)
       )
       // Commit the exact OFF window before the mode flips, so a kill/reboot cannot revert
       // to an older or shorter window.
@@ -334,7 +362,7 @@ object HabitUnlock {
     }
 
     val offWindow = unlock.offWindow
-    if (offWindow != null && remainingOffMs(offWindow, now) <= 0L) {
+    if (offWindow != null && remainingOffMs(offWindow, now, boot) <= 0L) {
       // Never claim Aggressive when device admin is gone: fall back to Strict instead.
       val restoreMode = if (
         unlock.restoreMode == ProtectionState.MODE_AGGRESSIVE &&
@@ -366,7 +394,7 @@ object HabitUnlock {
         now < lastPersistElapsed ||
         now - lastPersistElapsed >= PERSIST_INTERVAL_MS
       if (shouldPersist) {
-        unlock = advanceWindows(unlock, now)
+        unlock = advanceWindows(unlock, now, boot)
         HabitStore.writeUnlockState(context, unlock)
         lastPersistElapsed = now
       }
@@ -378,10 +406,14 @@ object HabitUnlock {
     return HabitStore.state(context)
   }
 
-  private fun advanceWindows(unlock: UnlockState, now: Long): UnlockState {
+  private fun advanceWindows(unlock: UnlockState, now: Long, bootCount: Int): UnlockState {
     fun advance(window: UnlockWindow?): UnlockWindow? {
       if (window == null) return null
-      return window.copy(savedRemainingMs = remainingMs(window, now), savedAtElapsed = now)
+      return window.copy(
+        savedRemainingMs = remainingMs(window, now, bootCount),
+        savedAtElapsed = now,
+        savedBootCount = bootCount
+      )
     }
     return unlock.copy(cooldown = advance(unlock.cooldown), offWindow = advance(unlock.offWindow))
   }
@@ -389,8 +421,9 @@ object HabitUnlock {
   fun reschedule(context: Context) {
     val unlock = HabitStore.unlockState(context)
     val now = SystemClock.elapsedRealtime()
-    val cooldownRemaining = remainingMs(unlock.cooldown, now)
-    val offRemaining = remainingOffMs(unlock.offWindow, now)
+    val boot = HabitStore.bootCount(context)
+    val cooldownRemaining = remainingMs(unlock.cooldown, now, boot)
+    val offRemaining = remainingOffMs(unlock.offWindow, now, boot)
     val delay = when {
       unlock.cooldown != null && cooldownRemaining > 0L -> cooldownRemaining
       unlock.offWindow != null && offRemaining > 0L -> offRemaining
@@ -478,7 +511,7 @@ object HabitUnlock {
   fun recordFailure(context: Context) {
     var unlock = HabitStore.unlockState(context)
     val failures = unlock.failures
-    val today = HabitStore.today()
+    val today = HabitStore.today(context)
     val dayCount = if (failures.day == today) failures.dayCount + 1 else 1
     val consecutive = failures.consecutive + 1
     val lockMs = when {
@@ -487,14 +520,19 @@ object HabitUnlock {
       consecutive >= 3 -> 60L * 1000L
       else -> 0L
     }
-    val lockedUntil = if (lockMs > 0L) System.currentTimeMillis() + lockMs else failures.lockedUntilWall
+    val now = SystemClock.elapsedRealtime()
+    val boot = HabitStore.bootCount(context)
+    // A new pause replaces the old one; otherwise the running pause keeps its own anchor.
+    val lockRemaining = if (lockMs > 0L) lockMs else failureLockRemaining(failures, now, boot)
     unlock = unlock.copy(
       failures = FailureState(
         total = failures.total + 1,
         consecutive = consecutive,
         day = today,
         dayCount = dayCount,
-        lockedUntilWall = lockedUntil
+        lockRemainingMs = lockRemaining,
+        lockSavedAtElapsed = if (lockRemaining > 0L) now else 0L,
+        lockSavedBootCount = if (lockRemaining > 0L) boot else -1
       )
     )
     HabitStore.writeUnlockState(context, unlock)
@@ -505,7 +543,7 @@ object HabitUnlock {
     val unlock = HabitStore.unlockState(context)
     HabitStore.writeUnlockState(
       context,
-      unlock.copy(failures = unlock.failures.copy(consecutive = 0, lockedUntilWall = 0L))
+      unlock.copy(failures = unlock.failures.withoutLock())
     )
   }
 
@@ -522,7 +560,7 @@ object HabitUnlock {
       unlock.copy(
         cooldown = null,
         offWindow = null,
-        failures = unlock.failures.copy(consecutive = 0, lockedUntilWall = 0L)
+        failures = unlock.failures.withoutLock()
       )
     )
     val next = HabitStore.updateState(context) {
@@ -566,14 +604,9 @@ object HabitUnlock {
       context,
       unlock.copy(
         cooldown = null,
-        offWindow = UnlockWindow(
-          offMs,
-          offMs,
-          now,
-          System.currentTimeMillis() + offMs
-        ),
+        offWindow = UnlockWindow(offMs, offMs, now, HabitStore.bootCount(context)),
         restoreMode = target,
-        failures = unlock.failures.copy(consecutive = 0, lockedUntilWall = 0L)
+        failures = unlock.failures.withoutLock()
       ),
       // Committed before the mode flips to OFF, so a kill can never lose the window.
       sync = true

@@ -42,6 +42,16 @@ object AiCascadeConfig {
   /** "No separate rule": the combined score already folds `p_sexy` in. */
   val NEVER = Float.MAX_VALUE
 
+  /**
+   * Floating / split window crops. A window covering this share of both axes is treated as
+   * the normal full screen (three-tile media viewport); anything smaller is cropped to its
+   * own rectangle, its title bar dropped, and covered by one square tile when roughly
+   * square (two when it is taller or wider). Only that window is ever classified.
+   */
+  const val WINDOW_FULL_SCREEN_RATIO = 0.80f
+  const val WINDOW_TITLE_RATIO = 0.10f
+  const val WINDOW_SQUARE_RATIO = 1.45f
+
   /** Zero-power gate: 16x16 RGB grid, mean absolute difference out of 255. */
   const val STATIC_DIFF_GRID = 16
   const val STATIC_DIFF_THRESHOLD = 3.0f
