@@ -59,6 +59,29 @@ object AiCascadeConfig {
   const val STAGE1_INPUT_SIZE = 224
   const val STAGE2_INPUT_SIZE = 320
 
+  /**
+   * The media viewport inside the screenshot. Circular avatars live in the app header and
+   * the leftmost chat gutter, so those bands are never cropped or classified: only the
+   * central area where videos and photos actually play is sampled.
+   */
+  const val MEDIA_LEFT_RATIO = 0.18f
+  const val MEDIA_TOP_RATIO = 0.14f
+  const val MEDIA_RIGHT_RATIO = 0.96f
+  const val MEDIA_BOTTOM_RATIO = 0.88f
+
+  /**
+   * NudeNet box filter: a detection smaller than 18% of the crop side (58 px of 320) or
+   * covering less than 4% of its area is an avatar, icon or thumbnail, never media.
+   */
+  const val MIN_NUDE_BOX_RATIO = 0.18f
+  const val MIN_NUDE_BOX_AREA_RATIO = 0.04f
+
+  /**
+   * Production blocking needs the same verdict on two consecutive frames (~1..2 s), so a
+   * scroll that briefly shows a small preview can never close the app.
+   */
+  const val BLOCK_CONFIRM_FRAMES = 2
+
   /** Sensitivity-adjusted thresholds. `balanced` is the default aggressive preset. */
   data class Thresholds(
     /** Combined stage 1 score that blocks without NudeNet. */

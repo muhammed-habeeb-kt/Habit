@@ -112,6 +112,8 @@ object AiVisualScanner {
   /** One capture + inference in flight; a tick that arrives meanwhile is dropped. */
   private val isProcessing = AtomicBoolean(false)
   private val unsureStrikeCount = AtomicInteger(0)
+  /** Consecutive would-block frames; production needs two before the overlay appears. */
+  private val blockConfirmCount = AtomicInteger(0)
   /** Frames the static-screen gate skipped; diagnostics only, they cost no inference. */
   @Volatile private var skippedFrames = 0
 
@@ -202,6 +204,7 @@ object AiVisualScanner {
     frameCount = 0
     skippedFrames = 0
     unsureStrikeCount.set(0)
+    blockConfirmCount.set(0)
     safeStreak = 0
     captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
     hasSafeGrid = false
@@ -218,6 +221,7 @@ object AiVisualScanner {
     activePackage = null
     activeDomain = null
     unsureStrikeCount.set(0)
+    blockConfirmCount.set(0)
     safeStreak = 0
     captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
     // The next app starts on a new screen, so its first frame is always analyzed.
@@ -308,8 +312,8 @@ object AiVisualScanner {
   }
 
   /**
-   * One-line status for the persistent notification:
-   * `AI scanning Telegram • Frames: 12 • mob 0.14 • nude 0.02 (safe)` or the exact error.
+   * Clean status line for the persistent notification: the watched app or site, or the exact
+   * error. Production never shows per-frame model scores in the notification.
    */
   fun summary(): String? {
     val label = appLabel ?: activePackage ?: "app"
@@ -320,8 +324,7 @@ object AiVisualScanner {
     if (!running) {
       return error?.let { "AI idle — last error: $it" }
     }
-    val scores = "mob ${format(lastStage1Score)} • nude ${format(lastStage2Score)}"
-    return "AI scanning $label • Frames: $frameCount • $scores ($lastVerdict)"
+    return "AI scanning $label"
   }
 
   // endregion
@@ -540,6 +543,8 @@ object AiVisualScanner {
     val grid = sampleGrid(screen)
     val staticSkip = hasSafeGrid &&
       unsureStrikeCount.get() == 0 &&
+      // A frame waiting for its confirmation must be looked at again, never skipped.
+      blockConfirmCount.get() == 0 &&
       lastStage1Score < AiCascadeConfig.STATIC_SKIP_MAX_SCORE &&
       meanGridDiff(grid, lastSafeGrid) < AiCascadeConfig.STATIC_DIFF_THRESHOLD
     if (staticSkip) {
@@ -556,13 +561,22 @@ object AiVisualScanner {
       return
     }
 
-    // Three overlapping square tiles (top, centre, bottom) instead of one squashed tall
-    // frame. A full-screen photo or a media viewer fills the centre, while a chat column
-    // fills the middle band, so the centre tile is the one that actually catches content
-    // inside an app like Telegram.
-    val side = min(screen.width, screen.height / 2).coerceAtLeast(1)
-    val x = (screen.width - side) / 2
-    val offsets = intArrayOf(0, (screen.height - side) / 2, screen.height - side)
+    // Only the central media viewport is classified. The top band (status bar + app header
+    // with its circular profile avatar) and the left gutter (Telegram/Discord chat-list and
+    // message avatars) are deliberately excluded, so scrolling a chat list can never feed
+    // an avatar to a model. Inside that viewport three overlapping squares cover the top,
+    // middle and bottom of where a video or photo actually plays.
+    val mediaLeft = (screen.width * AiCascadeConfig.MEDIA_LEFT_RATIO).toInt()
+    val mediaTop = (screen.height * AiCascadeConfig.MEDIA_TOP_RATIO).toInt()
+    val mediaRight = (screen.width * AiCascadeConfig.MEDIA_RIGHT_RATIO).toInt()
+    val mediaBottom = (screen.height * AiCascadeConfig.MEDIA_BOTTOM_RATIO).toInt()
+    val mediaWidth = (mediaRight - mediaLeft).coerceAtLeast(1)
+    val mediaHeight = (mediaBottom - mediaTop).coerceAtLeast(1)
+    val side = min(mediaWidth, mediaHeight).coerceAtLeast(1)
+    val x = mediaLeft + (mediaWidth - side) / 2
+    val yStart = mediaTop
+    val yEnd = mediaBottom - side
+    val offsets = intArrayOf(yStart, (yStart + yEnd) / 2, yEnd)
     val tiles = ArrayList<Bitmap>(offsets.size)
 
     try {
@@ -634,8 +648,23 @@ object AiVisualScanner {
 
       lastVerdict = verdict.text
       if (verdict.wouldBlock) {
-        blockCount += 1
-        triggerBlock(pkg)
+        // Production blocking: the same verdict must survive two consecutive frames, so a
+        // brief scroll past a small preview never closes the app. A playing video or an
+        // opened media post keeps the hit on screen and blocks on the second frame.
+        val confirmations = blockConfirmCount.incrementAndGet()
+        if (confirmations >= AiCascadeConfig.BLOCK_CONFIRM_FRAMES) {
+          blockConfirmCount.set(0)
+          blockCount += 1
+          triggerBlock(pkg)
+        } else {
+          // Keep the next frame fast instead of relaxing into the 2.2 s movie interval.
+          captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
+          safeStreak = 0
+          lastVerdict = "confirming $confirmations/${AiCascadeConfig.BLOCK_CONFIRM_FRAMES} " +
+            "(${verdict.text})"
+        }
+      } else {
+        blockConfirmCount.set(0)
       }
     } finally {
       for (tile in tiles) recycle(tile)
@@ -1001,19 +1030,37 @@ object AiVisualScanner {
     if (!channelMajor && !anchorMajor) return NudeResult(0f, "none")
 
     val anchors = if (channelMajor) dim2 else dim1
+    fun valueAt(row: Int, anchor: Int): Float {
+      val index = if (channelMajor) row * anchors + anchor else anchor * YOLO_ROWS + row
+      return if (index in values.indices) values[index] else 0f
+    }
+
+    // Ignore tiny detections entirely: a circular avatar, a sticker, an emoji or a small
+    // thumbnail is never "substantial media". Boxes are in input pixels for the bundled
+    // export; a normalized export (all sides <= 1.5) is scaled up first.
+    val size = AiCascadeConfig.STAGE2_INPUT_SIZE.toFloat()
+    val minSide = size * AiCascadeConfig.MIN_NUDE_BOX_RATIO
+    val minArea = size * size * AiCascadeConfig.MIN_NUDE_BOX_AREA_RATIO
+    val bigEnough = BooleanArray(anchors) { anchor ->
+      val width = abs(valueAt(2, anchor))
+      val height = abs(valueAt(3, anchor))
+      val scale = if (width <= 1.5f && height <= 1.5f) size else 1f
+      val widthPx = width * scale
+      val heightPx = height * scale
+      widthPx >= minSide && heightPx >= minSide && widthPx * heightPx >= minArea
+    }
+
     var best = 0f
     var bestClass = -1
     for (classIndex in EXPOSED_CLASS_INDICES) {
       if (classIndex < 0 || classIndex >= YOLO_CLASS_COUNT) continue
       val classRow = YOLO_BOX_ROWS + classIndex
       for (anchor in 0 until anchors) {
-        val index = if (channelMajor) classRow * anchors + anchor else anchor * YOLO_ROWS + classRow
-        if (index in values.indices) {
-          val confidence = values[index]
-          if (confidence > best) {
-            best = confidence
-            bestClass = classIndex
-          }
+        if (!bigEnough[anchor]) continue
+        val confidence = valueAt(classRow, anchor)
+        if (confidence > best) {
+          best = confidence
+          bestClass = classIndex
         }
       }
     }

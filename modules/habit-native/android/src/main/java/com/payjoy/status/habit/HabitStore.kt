@@ -198,7 +198,17 @@ object HabitStore {
     if (prefs != null) return
     synchronized(lock) {
       if (prefs == null) {
-        prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val opened = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        // Production always blocks. Old calibration builds could leave a non-blocking switch
+        // behind, so those keys are wiped on every start and can never suppress a block.
+        opened.edit()
+          .remove("dry_run_mode")
+          .remove("dry_run")
+          .remove("debug_recording_enabled")
+          .remove("debugRecordingEnabled")
+          .remove("debugDryRun")
+          .apply()
+        prefs = opened
       }
     }
   }

@@ -1,20 +1,22 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
-import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { AppState, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
-import { AiScannerStatusCard } from '@/components/ai-scanner-status-card';
 import { AppTile, FrostedBanner, NeuCard, NeuSwitch, NeuWell } from '@/components/neumorphic';
 import { TabScreen } from '@/components/tab-screen';
 import { FontNames, Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
 import { useAiMonitoring } from '@/hooks/use-ai-monitoring';
 import { useProtection } from '@/hooks/use-protection';
 import {
+  canDrawOverlays,
   canListInstalledApps,
   canSetAiDomains,
   getInstalledApps,
   isMonitoringLocked,
+  isNativeAvailable,
   normalizeDomain,
+  openOverlaySettings,
   type InstalledApp,
 } from '@/native/habit';
 
@@ -41,6 +43,7 @@ export default function AppsScreen() {
   const [domainNote, setDomainNote] = useState<string | null>(null);
   const [apps, setApps] = useState<InstalledApp[]>([]);
   const [loading, setLoading] = useState(true);
+  const [overlayAllowed, setOverlayAllowed] = useState(true);
 
   useEffect(() => {
     let mounted = true;
@@ -53,6 +56,25 @@ export default function AppsScreen() {
       });
     return () => {
       mounted = false;
+    };
+  }, []);
+
+  // "Display over other apps" is the fallback path for the block screen on HyperOS. It is
+  // the only diagnostic left in production, shown as a compact fix banner like Home.
+  useEffect(() => {
+    let mounted = true;
+    const check = () => {
+      canDrawOverlays().then((allowed) => {
+        if (mounted) setOverlayAllowed(allowed);
+      });
+    };
+    check();
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') check();
+    });
+    return () => {
+      mounted = false;
+      subscription.remove();
     };
   }, []);
 
@@ -151,6 +173,18 @@ export default function AppsScreen() {
         <Text style={styles.subtitle}>Real-time on-device visual screen protection</Text>
       </View>
 
+      {isNativeAvailable && !overlayAllowed && (
+        <FrostedBanner
+          icon="shield-alert-outline"
+          title="Overlay permission is off"
+          body="Habit needs it to draw the block screen over apps."
+          actionLabel="Fix now"
+          onPress={() => {
+            void openOverlaySettings();
+          }}
+        />
+      )}
+
       <NeuCard style={styles.masterCard}>
         <View style={styles.iconWell}>
           <MaterialCommunityIcons name="star-four-points-outline" size={22} color={Palette.amber} />
@@ -195,8 +229,6 @@ export default function AppsScreen() {
             title="Habit scans these apps only while they are open."
             body="Nothing leaves your phone."
           />
-
-          <AiScannerStatusCard />
 
           <NeuWell padded={false} style={styles.search}>
             <MaterialCommunityIcons name="magnify" size={20} color={Palette.textMuted} />

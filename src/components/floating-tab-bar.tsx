@@ -61,7 +61,7 @@ export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarP
               <View style={[styles.pill, focused && styles.pillActive]}>
                 <MaterialCommunityIcons
                   name={focused ? visual.activeIcon : visual.icon}
-                  size={18}
+                  size={17}
                   color={focused ? Palette.amber : Palette.textSecondary}
                 />
                 <Text
@@ -83,9 +83,9 @@ export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarP
 const styles = StyleSheet.create({
   frame: {
     position: 'absolute',
-    // Slightly wider than the 14dp tile inset so the "Settings" label never clips.
-    left: Space.sm,
-    right: Space.sm,
+    // Wider than the old inset so each tab gets enough room for the full "Settings" label.
+    left: Space.xs,
+    right: Space.xs,
     borderRadius: 24,
     boxShadow: '0px 12px 32px rgba(0, 0, 0, 0.55)',
   },
@@ -122,16 +122,15 @@ const styles = StyleSheet.create({
     height: '100%',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 2,
   },
   pill: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 4,
+    gap: 3,
     maxWidth: '100%',
     height: 44,
-    paddingHorizontal: 8,
+    paddingHorizontal: 6,
     borderRadius: Radii.pill,
   },
   pillActive: {
@@ -142,9 +141,9 @@ const styles = StyleSheet.create({
   label: {
     flexShrink: 0,
     fontFamily: FontNames.interMedium,
-    fontSize: 11,
-    lineHeight: 15,
-    letterSpacing: 0,
+    fontSize: 10,
+    lineHeight: 14,
+    letterSpacing: -0.2,
     color: Palette.textSecondary,
   },
   labelActive: {
