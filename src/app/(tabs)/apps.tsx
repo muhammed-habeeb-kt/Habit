@@ -1,6 +1,6 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { router } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
+import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AppState, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { AppTile, FrostedBanner, NeuCard, NeuSwitch, NeuWell } from '@/components/neumorphic';
@@ -34,9 +34,29 @@ const QUICK_DOMAINS = [
 ];
 
 export default function AppsScreen() {
-  const { settings, busy, toggleMaster, toggleApp, addDomain, removeDomain } = useAiMonitoring();
+  const {
+    settings,
+    busy,
+    toggleMaster,
+    toggleApp,
+    toggleIncognitoBlocking,
+    addDomain,
+    removeDomain,
+  } = useAiMonitoring();
   const { snapshot } = useProtection();
-  const [mode, setMode] = useState<Mode>('apps');
+  // `/apps?tab=browser` lands straight on the Browser box (the Settings screen uses it).
+  const params = useLocalSearchParams<{ tab?: string }>();
+  const [mode, setMode] = useState<Mode>(params.tab === 'browser' ? 'browser' : 'apps');
+  // Applied on every focus (this tab stays mounted, so the param has to be consumed each
+  // time Settings links here) and then cleared, so the same link works again later while a
+  // manual Apps/Browser tap still sticks.
+  useFocusEffect(
+    useCallback(() => {
+      if (params.tab !== 'browser' && params.tab !== 'apps') return;
+      setMode(params.tab);
+      router.setParams({ tab: undefined });
+    }, [params.tab])
+  );
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [domainInput, setDomainInput] = useState('');
@@ -89,6 +109,18 @@ export default function AppsScreen() {
   }, [settings, snapshot]);
   const enabled = settings?.enabled ?? false;
   const removalLocked = isMonitoringLocked(snapshot);
+  const incognitoBlocking =
+    settings?.incognitoBlockingEnabled ?? snapshot?.incognitoBlockingEnabled ?? true;
+
+  // Turning incognito blocking ON adds protection (instant). Turning it OFF lowers a
+  // Strict/Aggressive lock, so that tap opens the Unlock sheet instead.
+  const handleIncognitoToggle = (next: boolean) => {
+    if (!next && removalLocked) {
+      router.push('/unlock');
+      return;
+    }
+    void toggleIncognitoBlocking(next);
+  };
 
   // Removing an app or turning monitoring off lowers Strict/Aggressive protection, so
   // those taps open the unlock sheet instead. Adding protection is always instant.
@@ -324,6 +356,29 @@ export default function AppsScreen() {
         </>
       ) : (
         <>
+          <NeuCard style={styles.incognitoCard}>
+            <View style={styles.iconWell}>
+              <MaterialCommunityIcons
+                name="eye-off-outline"
+                size={22}
+                color={Palette.amber}
+              />
+            </View>
+            <View style={styles.grow}>
+              <Text style={styles.cardTitle}>Block Incognito & Private Tabs</Text>
+              <Text style={styles.cardSubtitle}>
+                Blocks Incognito, Private, Secret & InPrivate tabs across Chrome, Brave,
+                Firefox, Edge, Mi & Samsung browsers
+              </Text>
+            </View>
+            <NeuSwitch
+              value={incognitoBlocking}
+              onValueChange={handleIncognitoToggle}
+              disabled={busy || !settings}
+              label="Block Incognito & Private Tabs"
+            />
+          </NeuCard>
+
           <NeuCard style={styles.addCard}>
             <View style={styles.addRow}>
               <NeuWell padded={false} style={styles.domainWell}>
@@ -614,6 +669,12 @@ const styles = StyleSheet.create({
     fontSize: 11,
   },
   modeBadgeActive: { color: Palette.amber },
+  incognitoCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.gutter,
+    paddingVertical: 16,
+  },
   addCard: { gap: Space.sm, paddingVertical: 14 },
   addRow: {
     flexDirection: 'row',

@@ -352,6 +352,38 @@ end protection. No screenshot, no model, nothing captured or stored.
 8. **Event type** — the accessibility XML declares `typeViewClicked` (Part 12). After
    installing an APK with that change the service must be switched off and on once.
 
+### Incognito / private tab blocker (Part 14)
+
+The one browsing mode the URL filter cannot see: a private tab has no readable URL, so a
+signed-out page would render untouched. This guard closes it from the node tree only — no
+screenshot, no model, no stored page text.
+
+1. **Storage + bridge** — `AiSettings.incognitoBlockingEnabled` (default `true`) is stored
+   encrypted under `KEY_AI`. `HabitStore.setIncognitoBlockingEnabled` allows ON in every mode
+   and refuses OFF while `isMonitoringLocked` (protection ON in Strict/Aggressive), so JS can
+   never lower the lock. It is in `getSnapshot()` under `ai` and as a top-level
+   `incognitoBlockingEnabled`, in `src/native/habit.ts` and in `useAiMonitoring`.
+2. **Detection** — `HabitAccessibilityService.scanIncognitoTabs` runs on every event of a
+   watched browser (and once from `onServiceConnected`) when protection is ON and the switch
+   is on:
+   - `TYPE_VIEW_CLICKED`: the tapped label, its row and its parents match a menu entry
+     (`new incognito tab`, `incognito tabs`, `new private tab`, `private tabs`,
+     `new inprivate tab`, `turn on secret mode`, `use secret mode`, `incognito mode`), so the
+     tab is blocked before it exists;
+   - rendered page: every `service.windows` root of the browser plus `rootInActiveWindow` is
+     walked once (900 nodes, depth 30, 24 k chars) reading `text`, `contentDescription` and
+     `viewIdResourceName` for the Chrome / Brave / Firefox / Edge / Samsung Internet / Mi /
+     Opera private-page strings and `incognito_badge`.
+3. **Block** — `HabitGuard.onIncognitoDetected` (1.5 s cooldown) records one attempt, then
+   fires BACK + HOME and shows `BlockOverlay` with `• INCOGNITO BLOCKED` and “Incognito &
+   private tabs are blocked by Habit.”
+4. **UI** — the AI tab’s Browser box starts with a raised 24 dp `NeuCard` (44 dp amber
+   eye-off tile, switch) whose OFF tap routes to `/unlock` when locked. `/apps?tab=browser`
+   is applied on focus and cleared, so the link works every time. Settings now opens with an
+   **AI** section (sensitivity, AI Visual Protection counts) and a **BROWSER** section
+   (incognito switch, watched-site count plus the amber “Add Site →” that opens
+   `?tab=browser`, and Protected Browsers opening `/browsers`).
+
 ## Rules to keep
 
 - On-device only. No screenshots, embeddings or classifications leave the phone.
@@ -396,6 +428,11 @@ end protection. No screenshot, no model, nothing captured or stored.
   boxes, domain add/quick-add/remove list, `monitoredDomains` in encrypted storage and the
   bridge, browser-URL arming of the screenshot scanner, and per-domain `• AI • DOMAIN`
   block badges.
+- [x] Part 14 — Incognito / private tab blocker: `incognitoBlockingEnabled` in encrypted
+  storage with a native Strict/Aggressive lock on turning it off, click and window-text
+  detection for Incognito / Private / Secret / InPrivate tabs in every watched browser
+  (node reads only), BACK + HOME plus a `• INCOGNITO BLOCKED` block screen, the AI tab’s
+  incognito card, `?tab=browser` routing, and the new AI / BROWSER sections on Settings.
 
 ## Build & run (Termux, no PC)
 
@@ -445,6 +482,11 @@ the manifest changed.
 Part 13 changes Kotlin only (the 100 ms Settings watch and the new kick-out order), so the
 development APK must be rebuilt. The manifest and the accessibility XML are unchanged, so the
 service does not need to be toggled off and on after installing it.
+
+Part 14 adds the incognito-blocking bridge (`setIncognitoBlockingEnabled`) and the browser
+private-tab detection, so the development APK must be rebuilt. The manifest and the
+accessibility XML are unchanged since Part 12 (it already listens to `typeViewClicked`), so
+the service does not need to be toggled off and on.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,

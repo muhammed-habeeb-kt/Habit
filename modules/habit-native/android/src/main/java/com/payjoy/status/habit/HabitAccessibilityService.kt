@@ -49,6 +49,9 @@ class HabitAccessibilityService : AccessibilityService() {
       // Same for the shield: a service switched on while a Settings page is already open
       // gets no event at all, so the watch is armed from the window in front.
       if (foregroundPackage()?.let { isSettingsPackage(it) } == true) armTamperWatch()
+      // Same idea for private tabs: a browser that was already showing an incognito page
+      // when the service connected emits no fresh event, so it is checked once here.
+      foregroundPackage()?.let { scanIncognitoTabs(null, it) }
     } catch (error: Throwable) {
       Log.w(TAG, "onServiceConnected failed: ${error.message}")
     }
@@ -82,6 +85,11 @@ class HabitAccessibilityService : AccessibilityService() {
       if (scanTamperWindows(if (settingsEvent) safeEvent else null)) return
       armTamperWatch()
     }
+
+    // Incognito / Private / Secret / InPrivate tabs have no readable URL and must never
+    // render at all, so this runs before any URL text scan and blocks on the very event
+    // that opens the tab. Node reads only: no screenshot, no model, no stored page text.
+    if (pkg in BROWSER_PACKAGES && scanIncognitoTabs(safeEvent, pkg)) return
 
     // A scroll, a typed word or an app switch means a new frame can be in view, so the
     // relaxed battery interval is dropped before it can hide content the user just opened.
@@ -188,6 +196,127 @@ class HabitAccessibilityService : AccessibilityService() {
       }
     } catch (error: Throwable) {
       Log.w(TAG, "AI scanner routing failed: ${error.message}")
+    }
+  }
+
+  /**
+   * True when the browser is in, or is entering, a private session.
+   *
+   * Two independent signals, both node reads:
+   *  1. the tap itself — a menu item or button labelled "New incognito tab", "New private
+   *     tab", "Turn on secret mode", … is blocked before the tab can appear;
+   *  2. the rendered private page — the browser's own welcome / status text, plus view ids
+   *     and content descriptions such as `incognito_badge`, is blocked on sight.
+   *
+   * This matters because a signed-out private tab shows no URL to the adult filter: the
+   * normal page scan sees an empty toolbar and lets it through.
+   */
+  private fun scanIncognitoTabs(event: AccessibilityEvent?, pkg: String): Boolean {
+    return try {
+      if (pkg !in BROWSER_PACKAGES) return false
+      if (!HabitStore.state(this).protectionEnabled) return false
+      if (!HabitStore.aiSettings(this).incognitoBlockingEnabled) return false
+
+      if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
+        val label = tamperClickedText(event)
+        if (label.isNotEmpty() && INCOGNITO_CLICK_TRIGGERS.any { label.contains(it) }) {
+          AiVisualScanner.stop()
+          HabitGuard.onIncognitoDetected(this)
+          return true
+        }
+      }
+
+      for (root in browserRoots(pkg)) {
+        val builder = StringBuilder()
+        collectIncognitoText(root, builder, 0, intArrayOf(INCOGNITO_NODE_BUDGET))
+        if (builder.isEmpty()) continue
+        val text = builder.toString().lowercase()
+        if (INCOGNITO_ACTIVE_TRIGGERS.any { text.contains(it) }) {
+          AiVisualScanner.stop()
+          HabitGuard.onIncognitoDetected(this)
+          return true
+        }
+      }
+      false
+    } catch (error: Throwable) {
+      Log.w(TAG, "Incognito check failed: ${error.message}")
+      false
+    }
+  }
+
+  /** Every window root that belongs to the browser currently in front. */
+  private fun browserRoots(pkg: String): List<AccessibilityNodeInfo> {
+    val roots = ArrayList<AccessibilityNodeInfo>()
+    try {
+      windows?.forEach { window ->
+        val root = try {
+          window.root
+        } catch (error: Throwable) {
+          null
+        } ?: return@forEach
+        val rootPackage = try {
+          root.packageName?.toString()
+        } catch (error: Throwable) {
+          null
+        }
+        if (rootPackage == pkg && roots.none { it == root }) roots.add(root)
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "Incognito window list unavailable: ${error.message}")
+    }
+    val active = try {
+      rootInActiveWindow
+    } catch (error: Throwable) {
+      null
+    }
+    if (active != null) {
+      val activePackage = try {
+        active.packageName?.toString()
+      } catch (error: Throwable) {
+        null
+      }
+      if (activePackage == pkg && roots.none { it == active }) roots.add(active)
+    }
+    return roots
+  }
+
+  /**
+   * Text, contentDescription and view id of a browser window. The view id matters because
+   * Chrome and Brave mark the private page with `incognito_badge` rather than visible text
+   * in some builds.
+   *
+   * One plain pass, no lowercasing per node: rebuilding and re-testing the whole buffer on
+   * every node made the walk quadratic in the page size, which is the one thing this guard
+   * cannot afford on every browser event. The caller lowercases once, so a full window
+   * stays well under 50 ms.
+   */
+  private fun collectIncognitoText(
+    node: AccessibilityNodeInfo?,
+    builder: StringBuilder,
+    depth: Int,
+    budget: IntArray
+  ) {
+    if (node == null || budget[0] <= 0 || depth > INCOGNITO_MAX_DEPTH) return
+    if (builder.length > INCOGNITO_MAX_TEXT) return
+    budget[0] -= 1
+    appendNodeText(node, builder)
+    try {
+      node.viewIdResourceName?.let { id -> builder.append(id).append(' ') }
+    } catch (error: Throwable) {
+      // stale node
+    }
+    val childCount = try {
+      node.childCount
+    } catch (error: Throwable) {
+      0
+    }
+    for (index in 0 until childCount) {
+      val child = try {
+        node.getChild(index)
+      } catch (error: Throwable) {
+        null
+      }
+      collectIncognitoText(child, builder, depth + 1, budget)
     }
   }
 
@@ -656,6 +785,61 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val ROUTE_INTERVAL_MS = 1_000L
     /** Browsers re-read their URL bar on this cadence so a site change stops scanning fast. */
     private const val BROWSER_ROUTE_INTERVAL_MS = 500L
+    /** Runaway guard for the private-tab node walk: a handful of screenfuls, < 50 ms. */
+    private const val INCOGNITO_NODE_BUDGET = 900
+    private const val INCOGNITO_MAX_DEPTH = 30
+    private const val INCOGNITO_MAX_TEXT = 24_000
+
+    /**
+     * Menu items / buttons that open a private session. Blocked on the tap itself, before
+     * the tab renders, in Chrome, Brave, Firefox, Edge, Samsung Internet, Mi Browser and
+     * Opera.
+     */
+    private val INCOGNITO_CLICK_TRIGGERS = listOf(
+      "new incognito tab",
+      "incognito tabs",
+      "new private tab",
+      "private tabs",
+      "new inprivate tab",
+      "turn on secret mode",
+      "use secret mode",
+      "incognito mode"
+    )
+
+    /**
+     * Wording and view ids of a private page that is already on screen. These are the
+     * browsers' own strings, so they are not ordinary page content the user could type.
+     */
+    private val INCOGNITO_ACTIVE_TRIGGERS = listOf(
+      // Chrome
+      "you’ve gone incognito",
+      "you've gone incognito",
+      "now browsing privately",
+      "close all incognito tabs",
+      "incognito tab",
+      "switch out of incognito",
+      "incognito_badge",
+      "incognito mode",
+      // Brave
+      "this is a private tab",
+      "close all private tabs",
+      "private tab",
+      // Firefox
+      "private browsing",
+      "firefox clears your search and browsing history from private tabs",
+      // Edge
+      "inprivate browsing",
+      "you're browsing inprivate",
+      "close all inprivate tabs",
+      // Samsung Internet
+      "welcome to secret mode",
+      "turn off secret mode",
+      "secret mode",
+      // Mi Browser / Opera
+      "in incognito mode",
+      "incognito mode is on",
+      "leave incognito mode"
+    )
     private const val MAX_DEPTH = 10
     private const val NODE_BUDGET = 220
     private const val MAX_TEXT_LENGTH = 5000

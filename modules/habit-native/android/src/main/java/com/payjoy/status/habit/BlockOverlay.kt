@@ -27,8 +27,9 @@ import android.widget.TextView
 
 /**
  * Where a block came from. Browser blocks come from the URL/text filter, AI blocks come
- * from the on-device screenshot cascade and carry the app name, and the tamper shield
- * blocks Android Settings while the protection lock is armed.
+ * from the on-device screenshot cascade and carry the app name, the tamper shield blocks
+ * Android Settings while the protection lock is armed, and an incognito block closes a
+ * private tab before any page can render.
  */
 data class BlockSource(
   val kind: String,
@@ -40,15 +41,22 @@ data class BlockSource(
   val isTamper: Boolean
     get() = kind == KIND_TAMPER
 
+  val isIncognito: Boolean
+    get() = kind == KIND_INCOGNITO
+
   companion object {
     const val KIND_BROWSER = "browser"
     const val KIND_AI = "ai"
     const val KIND_TAMPER = "tamper"
+    const val KIND_INCOGNITO = "incognito"
 
     val BROWSER = BlockSource(KIND_BROWSER)
 
     /** The Settings / security-centre shield, not a content verdict. */
     val TAMPER = BlockSource(KIND_TAMPER)
+
+    /** Incognito / Private / Secret / InPrivate tab blocking. */
+    val INCOGNITO = BlockSource(KIND_INCOGNITO)
 
     fun ai(appLabel: String): BlockSource = BlockSource(KIND_AI, appLabel)
   }
@@ -204,6 +212,7 @@ class BlockOverlay(private val service: HabitAccessibilityService) {
         when {
           source.isTamper ->
             "Habit is locked. Unlock inside the Habit app before changing system settings."
+          source.isIncognito -> "Incognito & private tabs are blocked by Habit."
           source.isAi -> "Habit closed this screen to protect you."
           else -> "Habit closed this page to protect you."
         },
@@ -259,6 +268,7 @@ class BlockOverlay(private val service: HabitAccessibilityService) {
   private fun sourceChip(source: BlockSource): View {
     val text = when {
       source.isTamper -> "• TAMPER SHIELD"
+      source.isIncognito -> "• INCOGNITO BLOCKED"
       source.isAi -> "• AI • ${source.appLabel?.uppercase() ?: "APP"}"
       else -> "• BROWSER"
     }
@@ -348,6 +358,7 @@ class BlockOverlay(private val service: HabitAccessibilityService) {
       label(
         when {
           source.isTamper -> "TAMPER SHIELD ACTIVE"
+          source.isIncognito -> "INCOGNITO BLOCKING ACTIVE"
           source.isAi -> "ON-DEVICE MODEL PROTECTION"
           else -> "REAL-TIME PROTECTION ACTIVE"
         },

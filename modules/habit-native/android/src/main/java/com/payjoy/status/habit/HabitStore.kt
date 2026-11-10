@@ -65,7 +65,13 @@ data class AiSettings(
    */
   val monitoredDomains: List<String> = emptyList(),
   val aiSensitivity: String = SENSITIVITY_BALANCED,
-  val blockAlertsEnabled: Boolean = true
+  val blockAlertsEnabled: Boolean = true,
+  /**
+   * Blocks Incognito / Private / Secret / InPrivate tabs in every watched browser.
+   * Defaults to on; turning it off lowers Strict/Aggressive protection and is refused
+   * while that lock is held (see [isMonitoringLocked]).
+   */
+  val incognitoBlockingEnabled: Boolean = true
 ) {
   companion object {
     const val SENSITIVITY_LOW = "low"
@@ -83,7 +89,8 @@ data class AiSettings(
     "monitoredAppPackages" to monitoredAppPackages,
     "monitoredDomains" to monitoredDomains,
     "aiSensitivity" to aiSensitivity,
-    "blockAlertsEnabled" to blockAlertsEnabled
+    "blockAlertsEnabled" to blockAlertsEnabled,
+    "incognitoBlockingEnabled" to incognitoBlockingEnabled
   )
 }
 
@@ -467,7 +474,8 @@ object HabitStore {
         ),
         monitoredAppPackages = watched,
         monitoredDomains = domains,
-        blockAlertsEnabled = json.optBoolean("blockAlertsEnabled", true)
+        blockAlertsEnabled = json.optBoolean("blockAlertsEnabled", true),
+        incognitoBlockingEnabled = json.optBoolean("incognitoBlockingEnabled", true)
       )
     } catch (error: Throwable) {
       Log.w(TAG, "AI settings unreadable, using the filesDir mirror")
@@ -482,6 +490,7 @@ object HabitStore {
       .put("monitoredDomains", JSONArray(settings.monitoredDomains))
       .put("aiSensitivity", settings.aiSensitivity)
       .put("blockAlertsEnabled", settings.blockAlertsEnabled)
+      .put("incognitoBlockingEnabled", settings.incognitoBlockingEnabled)
     write(context, KEY_AI, json.toString(), sync = true)
     writeDomainCache(context, settings.monitoredDomains)
     cachedAi = settings
@@ -596,6 +605,24 @@ object HabitStore {
   fun setAiBlockAlerts(context: Context, enabled: Boolean): AiSettings {
     synchronized(lock) {
       val next = aiSettings(context).copy(blockAlertsEnabled = enabled)
+      writeAiSettings(context, next)
+      return next
+    }
+  }
+
+  /**
+   * Turns Incognito / Private tab blocking on or off. Turning it ON only adds protection,
+   * so it is instant in every mode. Turning it OFF while Strict/Aggressive is protecting
+   * the phone is refused here, so no UI (or JS caller) can weaken the lock; the screen
+   * routes that tap to the Unlock sheet.
+   */
+  fun setIncognitoBlockingEnabled(context: Context, enabled: Boolean): AiSettings {
+    synchronized(lock) {
+      val current = aiSettings(context)
+      if (!enabled && current.incognitoBlockingEnabled && isMonitoringLocked(context)) {
+        return current
+      }
+      val next = current.copy(incognitoBlockingEnabled = enabled)
       writeAiSettings(context, next)
       return next
     }
@@ -817,6 +844,8 @@ object HabitStore {
       "deviceAdminActive" to HabitDeviceAdmin.isActive(context),
       "unlock" to HabitUnlock.snapshotPart(context),
       "ai" to aiSettings(context).toMap(),
+      // Top-level copy so the UI can gate the incognito switch without reading `ai`.
+      "incognitoBlockingEnabled" to aiSettings(context).incognitoBlockingEnabled,
       // The watched browser websites, so JS can always rebuild the Browser list from the
       // persisted store instead of trusting its own in-memory copy.
       "aiMonitoredDomains" to aiSettings(context).monitoredDomains

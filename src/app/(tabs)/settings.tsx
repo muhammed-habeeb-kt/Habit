@@ -21,7 +21,7 @@ import {
 } from '@/constants/theme';
 import { useAiMonitoring } from '@/hooks/use-ai-monitoring';
 import { useProtection } from '@/hooks/use-protection';
-import type { AiSensitivity } from '@/native/habit';
+import { isMonitoringLocked, type AiSensitivity } from '@/native/habit';
 
 const SENSITIVITY_OPTIONS: SegmentOption<AiSensitivity>[] = [
   { id: 'low', label: 'Low' },
@@ -45,7 +45,13 @@ const PERMISSION_COUNT = 5;
 
 export default function SettingsScreen() {
   const { snapshot } = useProtection();
-  const { settings, busy, changeSensitivity, toggleBlockAlerts } = useAiMonitoring();
+  const {
+    settings,
+    busy,
+    changeSensitivity,
+    toggleBlockAlerts,
+    toggleIncognitoBlocking,
+  } = useAiMonitoring();
 
   const mode = snapshot?.mode ?? 'normal';
   const pill = MODE_PILL[mode] ?? MODE_PILL.normal;
@@ -62,6 +68,24 @@ export default function SettingsScreen() {
   const version = Constants.expoConfig?.version ?? '1.0.0';
 
   const blockAlertsEnabled = settings?.blockAlertsEnabled ?? true;
+  const incognitoBlocking =
+    settings?.incognitoBlockingEnabled ?? snapshot?.incognitoBlockingEnabled ?? true;
+
+  const watchedAppsCount = settings?.monitoredAppPackages.length ?? 0;
+  const watchedDomainsCount =
+    settings?.monitoredDomains.length ?? snapshot?.aiMonitoredDomains?.length ?? 0;
+  // Turning it ON adds protection and is instant; turning it OFF lowers a
+  // Strict/Aggressive lock, so native refuses it and this opens Unlock instead.
+  const removalLocked = isMonitoringLocked(snapshot);
+  const handleIncognitoToggle = (next: boolean) => {
+    if (!next && removalLocked) {
+      router.push('/unlock');
+      return;
+    }
+    void toggleIncognitoBlocking(next);
+  };
+  const openBrowserSites = () =>
+    router.push({ pathname: '/(tabs)/apps', params: { tab: 'browser' } });
 
   return (
     <TabScreen>
@@ -69,20 +93,7 @@ export default function SettingsScreen() {
         <Text style={styles.title}>Settings</Text>
       </View>
 
-      <Text style={styles.sectionLabel}>PROTECTION</Text>
-
-      <Pressable
-        accessibilityRole="button"
-        onPress={() => router.navigate('/')}
-        style={({ pressed }) => [pressed && styles.pressed]}>
-        <NeuCard style={styles.rowCard}>
-          <Text style={styles.rowTitle}>Protection mode</Text>
-          <View style={styles.rowRight}>
-            <StatusPill label={pill.label} tone={pill.tone} />
-            <MaterialCommunityIcons name="chevron-right" size={20} color={Palette.textMuted} />
-          </View>
-        </NeuCard>
-      </Pressable>
+      <Text style={styles.sectionLabel}>AI</Text>
 
       <NeuCard style={styles.sensitivityCard}>
         <Text style={styles.cardTitle}>AI detection sensitivity</Text>
@@ -98,6 +109,92 @@ export default function SettingsScreen() {
         </View>
         <Text style={styles.note}>{SENSITIVITY_NOTES[sensitivity]}</Text>
       </NeuCard>
+
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="AI Visual Protection"
+        onPress={() => router.push('/apps')}
+        style={({ pressed }) => [pressed && styles.pressed]}>
+        <NeuCard style={styles.rowCard}>
+          <View style={styles.iconWell}>
+            <MaterialCommunityIcons
+              name="star-four-points-outline"
+              size={22}
+              color={Palette.amber}
+            />
+          </View>
+          <View style={styles.grow}>
+            <Text style={styles.cardTitle}>AI Visual Protection</Text>
+            <Text style={styles.cardSubtitle}>
+              {watchedAppsCount} apps • {watchedDomainsCount} sites watched
+            </Text>
+          </View>
+          <MaterialCommunityIcons name="chevron-right" size={20} color={Palette.textMuted} />
+        </NeuCard>
+      </Pressable>
+
+      <Text style={styles.sectionLabel}>BROWSER</Text>
+
+      <NeuCard style={styles.incognitoCard}>
+        <View style={styles.iconWell}>
+          <MaterialCommunityIcons name="eye-off-outline" size={22} color={Palette.amber} />
+        </View>
+        <View style={styles.grow}>
+          <Text style={styles.cardTitle}>Block Incognito & Private Tabs</Text>
+          <Text style={styles.cardSubtitle}>Prevent private browsing across all browsers</Text>
+        </View>
+        <NeuSwitch
+          label="Block Incognito & Private Tabs"
+          value={incognitoBlocking}
+          onValueChange={handleIncognitoToggle}
+          disabled={busy || !settings}
+        />
+      </NeuCard>
+
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Add or manage AI browser sites"
+        onPress={openBrowserSites}
+        style={({ pressed }) => [pressed && styles.pressed]}>
+        <NeuCard style={styles.rowCard}>
+          <View style={styles.grow}>
+            <Text style={styles.cardTitle}>Add / Manage AI Browser Sites</Text>
+            <Text style={styles.cardSubtitle}>
+              {watchedDomainsCount} websites watched by AI
+            </Text>
+          </View>
+          <View style={styles.addSiteButton}>
+            <Text style={styles.addSiteLabel}>Add Site</Text>
+            <MaterialCommunityIcons name="arrow-right" size={16} color={Palette.canvas} />
+          </View>
+        </NeuCard>
+      </Pressable>
+
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Protected browsers"
+        onPress={() => router.push('/browsers')}
+        style={({ pressed }) => [pressed && styles.pressed]}>
+        <NeuCard style={styles.rowCard}>
+          <Text style={styles.rowTitle}>Protected Browsers</Text>
+          <MaterialCommunityIcons name="chevron-right" size={20} color={Palette.textMuted} />
+        </NeuCard>
+      </Pressable>
+
+      <Text style={styles.sectionLabel}>PROTECTION</Text>
+
+      <Pressable
+        accessibilityRole="button"
+        onPress={() => router.navigate('/')}
+        style={({ pressed }) => [pressed && styles.pressed]}>
+        <NeuCard style={styles.rowCard}>
+          <Text style={styles.rowTitle}>Protection mode</Text>
+          <View style={styles.rowRight}>
+            <StatusPill label={pill.label} tone={pill.tone} />
+            <MaterialCommunityIcons name="chevron-right" size={20} color={Palette.textMuted} />
+          </View>
+        </NeuCard>
+      </Pressable>
 
       <Text style={styles.sectionLabel}>PERMISSIONS</Text>
       <NeuCard style={styles.permissionsCard}>
@@ -212,6 +309,27 @@ const styles = StyleSheet.create({
     alignSelf: 'stretch',
     gap: Space.xs,
     paddingVertical: 18,
+  },
+  incognitoCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.gutter,
+    paddingVertical: 16,
+  },
+  addSiteButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    height: 36,
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.amber,
+    paddingHorizontal: 14,
+    boxShadow: Shadows.amberGlow,
+  },
+  addSiteLabel: {
+    ...Typography.bodyMd,
+    fontFamily: FontNames.interBold,
+    color: Palette.canvas,
   },
   cardTitle: {
     ...Typography.headlineMd,

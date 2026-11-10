@@ -191,6 +191,12 @@ class HabitModule : Module() {
       HabitStore.setAiBlockAlerts(appCtx, enabled).toMap()
     }
 
+    // Incognito / Private tab blocking. Turning it on is instant; turning it off while
+    // Strict/Aggressive is locked is refused by HabitStore and the UI opens Unlock.
+    AsyncFunction("setIncognitoBlockingEnabled") { enabled: Boolean ->
+      HabitStore.setIncognitoBlockingEnabled(appCtx, enabled).toMap()
+    }
+
     // Live diagnostics for the Apps tab card: what the scanner is doing right now, which
     // models loaded, the last two scores and the exact last error.
     AsyncFunction("getAiScannerStatus") {

@@ -22,12 +22,16 @@ object HabitGuard {
   /** Short guard so the 100 ms poll cannot stack kick-outs, never a reason to miss one. */
   private const val TAMPER_KICK_COOLDOWN_MS = 400L
   private const val TAMPER_ATTEMPT_KEY = "tamper:shield"
+  /** One incognito kick-out per 1.5 s: the browser's own events repeat many times. */
+  private const val INCOGNITO_COOLDOWN_MS = 1_500L
+  private const val INCOGNITO_ATTEMPT_KEY = "incognito:tab"
 
   private val mainHandler = Handler(Looper.getMainLooper())
 
   @Volatile private var service: HabitAccessibilityService? = null
   @Volatile private var overlay: BlockOverlay? = null
   @Volatile private var lastTamperAt = 0L
+  @Volatile private var lastIncognitoAt = 0L
 
   fun attach(service: HabitAccessibilityService) {
     this.service = service
@@ -67,6 +71,53 @@ object HabitGuard {
     // still-in-front check that decides whether Home is needed as well as Back.
     val packageHint = matchKey.substringBefore(':').takeIf { it.contains('.') }
     showBlockScreen(matchKey, total, BlockSource.ai(appLabel), packageHint)
+  }
+
+  /**
+   * Entry point for the incognito / private tab guard.
+   *
+   * The browser is already in a private session (or the user just tapped "New incognito
+   * tab"), so this closes it with Back and Home before showing the block screen: no page
+   * is ever rendered inside a private tab. Signed-out private browsing leaves no URL for
+   * the normal filter to read, which is why this path exists at all.
+   */
+  fun onIncognitoDetected(context: Context) {
+    if (!HabitStore.state(context).protectionEnabled) return
+    if (!HabitStore.aiSettings(context).incognitoBlockingEnabled) return
+
+    val now = SystemClock.elapsedRealtime()
+    if (now - lastIncognitoAt < INCOGNITO_COOLDOWN_MS) return
+    lastIncognitoAt = now
+
+    val total = HabitStore.registerAttempt(context, INCOGNITO_ATTEMPT_KEY) ?: return
+    showIncognitoBlock(total)
+  }
+
+  /** Back + Home first, then the ``INCOGNITO BLOCKED`` screen over whatever is left. */
+  private fun showIncognitoBlock(attemptsToday: Int) {
+    AiVisualScanner.onOverlayShown()
+    val currentService = service ?: return
+    runOnMain {
+      try {
+        currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+        currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+      } catch (error: Throwable) {
+        Log.w(TAG, "Incognito escape action failed: ${error.message}")
+      }
+
+      val shown = try {
+        val screen = overlay ?: BlockOverlay(currentService).also { overlay = it }
+        screen.show(attemptsToday, BlockSource.INCOGNITO)
+      } catch (error: Throwable) {
+        AiVisualScanner.noteOverlayError("incognito overlay failed: ${error.message}")
+        false
+      }
+      if (!shown) {
+        AiVisualScanner.noteOverlayError(
+          "incognito overlay blocked by the launcher — allow \"display over other apps\" for Habit"
+        )
+      }
+    }
   }
 
   /**

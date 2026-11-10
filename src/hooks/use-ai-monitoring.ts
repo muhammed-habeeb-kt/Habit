@@ -10,6 +10,7 @@ import {
   setAiMonitoringEnabled,
   setAiSensitivity,
   setAiWatchedApps,
+  setIncognitoBlockingEnabled,
   type AiSensitivity,
   type AiSettings,
 } from '@/native/habit';
@@ -61,6 +62,17 @@ export function useAiMonitoring() {
     setSettings((prev) => (prev ? { ...prev, blockAlertsEnabled: enabled } : prev));
     try {
       setSettings(await setAiBlockAlerts(enabled));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  /** Turning it on is instant; turning it off lowers Strict/Aggressive, so native refuses. */
+  const toggleIncognitoBlocking = useCallback(async (enabled: boolean) => {
+    setBusy(true);
+    setSettings((prev) => (prev ? { ...prev, incognitoBlockingEnabled: enabled } : prev));
+    try {
+      setSettings(await setIncognitoBlockingEnabled(enabled));
     } finally {
       setBusy(false);
     }
@@ -134,6 +146,7 @@ export function useAiMonitoring() {
     busy,
     toggleMaster,
     toggleBlockAlerts,
+    toggleIncognitoBlocking,
     changeSensitivity,
     toggleApp,
     addDomain,

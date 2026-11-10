@@ -54,6 +54,8 @@ export type HabitSnapshot = {
    * be rebuilt from disk instead of from JS memory.
    */
   aiMonitoredDomains: string[];
+  /** Blocks Incognito / Private / Secret / InPrivate tabs in every browser. */
+  incognitoBlockingEnabled: boolean;
 };
 
 export type CharacterChallenge = {
@@ -110,6 +112,8 @@ export type AiSettings = {
   monitoredDomains: string[];
   aiSensitivity: AiSensitivity;
   blockAlertsEnabled: boolean;
+  /** Blocks Incognito / Private / Secret / InPrivate tabs across the watched browsers. */
+  incognitoBlockingEnabled: boolean;
 };
 
 /** An app actually installed on this phone, as reported by the native module. */
@@ -177,6 +181,7 @@ const DEFAULT_AI_SETTINGS: AiSettings = {
   monitoredDomains: [],
   aiSensitivity: 'balanced',
   blockAlertsEnabled: true,
+  incognitoBlockingEnabled: true,
 };
 
 // Session fallback for Expo Go / web, where the native store does not exist.
@@ -221,6 +226,7 @@ type HabitNativeModule = {
   setAiWatchedApps(packages: string[]): Promise<AiSettings>;
   setAiMonitoredDomains(domains: string[]): Promise<AiSettings>;
   setAiBlockAlerts(enabled: boolean): Promise<AiSettings>;
+  setIncognitoBlockingEnabled(enabled: boolean): Promise<AiSettings>;
   getAiScannerStatus(): Promise<AiScannerStatus>;
   testAiModels(): Promise<AiModelSelfTest>;
   canDrawOverlays(): Promise<boolean>;
@@ -311,6 +317,7 @@ const FALLBACK_SNAPSHOT: HabitSnapshot = {
   deviceAdminActive: false,
   unlock: FALLBACK_UNLOCK,
   aiMonitoredDomains: [],
+  incognitoBlockingEnabled: true,
 };
 
 /**
@@ -539,6 +546,10 @@ function normalizeAiSettings(value: AiSettings | null | undefined): AiSettings {
       : DEFAULT_AI_SETTINGS.monitoredDomains,
     aiSensitivity: sensitivity,
     blockAlertsEnabled: value.blockAlertsEnabled !== undefined ? value.blockAlertsEnabled : DEFAULT_AI_SETTINGS.blockAlertsEnabled,
+    incognitoBlockingEnabled:
+      value.incognitoBlockingEnabled !== undefined
+        ? value.incognitoBlockingEnabled === true
+        : DEFAULT_AI_SETTINGS.incognitoBlockingEnabled,
   };
 }
 
@@ -591,6 +602,25 @@ export async function setAiBlockAlerts(enabled: boolean): Promise<AiSettings> {
   }
   return fallbackAiSettings;
 }
+
+export async function setIncognitoBlockingEnabled(enabled: boolean): Promise<AiSettings> {
+  if (!native || typeof native.setIncognitoBlockingEnabled !== 'function') {
+    fallbackAiSettings = { ...fallbackAiSettings, incognitoBlockingEnabled: enabled };
+    return fallbackAiSettings;
+  }
+  try {
+    fallbackAiSettings = normalizeAiSettings(
+      await native.setIncognitoBlockingEnabled(enabled)
+    );
+  } catch {
+    fallbackAiSettings = { ...fallbackAiSettings, incognitoBlockingEnabled: enabled };
+  }
+  return fallbackAiSettings;
+}
+
+/** False on an APK whose native module predates the incognito-tab bridge. */
+export const canSetIncognitoBlocking =
+  native != null && typeof native.setIncognitoBlockingEnabled === 'function';
 
 export async function setAiWatchedApps(watchedApps: string[]): Promise<AiSettings> {
   if (!native) {
