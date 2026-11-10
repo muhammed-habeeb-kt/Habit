@@ -16,6 +16,7 @@ import {
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { formatLongMinutes } from '@/components/duration-wheels';
 import {
   NeuCard,
   NeuWell,
@@ -64,6 +65,8 @@ function tokenize(text: string): string[] {
 
 export default function UnlockCodeScreen() {
   const { snapshot } = useProtection();
+  // A code unlock now ends in the same timed OFF window as the other methods.
+  const offWindowText = formatLongMinutes(snapshot?.configuredOffWindowMinutes ?? 10);
   const insets = useSafeAreaInsets();
   const configuredLength = lockedLength(snapshot?.configuredChallengeLength);
   const [challenge, setChallenge] = useState<CharacterChallenge | null>(null);
@@ -171,9 +174,11 @@ export default function UnlockCodeScreen() {
           setTyped('');
           setFeedback(null);
           setMistake(null);
-          Alert.alert('Unlocked', 'Strict mode is off and protection is paused.', [
-            { text: 'OK', onPress: () => router.dismissTo('/') },
-          ]);
+          Alert.alert(
+            'Unlocked',
+            `Protection is off for ${offWindowText}, then turns back on by itself.`,
+            [{ text: 'OK', onPress: () => router.dismissTo('/') }]
+          );
           return;
         }
         setTyped('');
@@ -196,7 +201,7 @@ export default function UnlockCodeScreen() {
         submitting.current = false;
       }
     },
-    []
+    [offWindowText]
   );
 
   const handleChange = (value: string) => {

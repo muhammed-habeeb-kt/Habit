@@ -353,7 +353,9 @@ object HabitStore {
       .put("configuredChallengeLength", state.configuredChallengeLength)
       .put("configuredCooldownMinutes", state.configuredCooldownMinutes)
       .put("configuredOffWindowMinutes", state.configuredOffWindowMinutes)
-    write(context, KEY_STATE, json.toString())
+    // Committed synchronously: a mode change must never run on a stale configuration, and a
+    // process kill right after saving the auto-restart timer must keep the chosen minutes.
+    write(context, KEY_STATE, json.toString(), sync = true)
     cachedState = state
     onStateChanged?.invoke()
   }
@@ -397,6 +399,13 @@ object HabitStore {
       return next
     }
   }
+
+  /**
+   * The auto-restart OFF-window duration in minutes, 1..1439, straight from encrypted
+   * storage. Every OFF window in [HabitUnlock] is created from this value.
+   */
+  fun getOffWindowMinutes(context: Context): Int =
+    ProtectionState.normalizeOffWindowMinutes(state(context).configuredOffWindowMinutes)
 
   /** Saves only the auto-restart duration chosen from the Home OFF-window sheet. */
   fun setOffWindowMinutes(context: Context, offWindowMinutes: Int): ProtectionState {
@@ -604,9 +613,14 @@ object HabitStore {
     return parsed
   }
 
-  fun writeUnlockState(context: Context, state: UnlockState) {
+  /**
+   * Persists unlock state. [sync] is used whenever a window is created, so the exact
+   * configured duration is on disk before the mode changes; the 5 s progress ticker can
+   * keep the cheaper asynchronous write.
+   */
+  fun writeUnlockState(context: Context, state: UnlockState, sync: Boolean = false) {
     synchronized(lock) {
-      write(context, KEY_UNLOCK, serializeUnlock(state))
+      write(context, KEY_UNLOCK, serializeUnlock(state), sync = sync)
       cachedUnlock = state
     }
   }

@@ -76,9 +76,7 @@ object HabitUnlock {
 
   /** The user's auto-restart OFF-window duration, 1..1439 minutes (1m .. 23h 59m). */
   fun configuredOffWindowMinutes(context: Context): Int =
-    ProtectionState.normalizeOffWindowMinutes(
-      HabitStore.state(context).configuredOffWindowMinutes
-    )
+    HabitStore.getOffWindowMinutes(context)
 
   /** Every temporary OFF window (timer, face check, Normal-mode restart) uses this value. */
   fun offWindowDurationMs(context: Context): Long = configuredOffWindowMinutes(context) * 60_000L
@@ -108,20 +106,16 @@ object HabitUnlock {
     val locked = state.protectionEnabled && state.mode != ProtectionState.MODE_NORMAL
     val requestedLength = ProtectionState.normalizeChallengeLength(challengeLength)
     val requestedMinutes = ProtectionState.normalizeCooldownMinutes(cooldownMinutes)
+    // The auto-restart window is saved exactly as picked (1..1439). It is a duration the
+    // user chose, not a protection limit, so it can never be clamped to a built-in default.
     val requestedOffWindow = ProtectionState.normalizeOffWindowMinutes(offWindowMinutes)
     val effectiveLength = if (locked) maxOf(state.configuredChallengeLength, requestedLength) else requestedLength
     val effectiveMinutes = if (locked) maxOf(state.configuredCooldownMinutes, requestedMinutes) else requestedMinutes
-    // A shorter OFF window is stronger, so a locked setup may not be lengthened.
-    val effectiveOffWindow = if (locked) {
-      minOf(state.configuredOffWindowMinutes, requestedOffWindow)
-    } else {
-      requestedOffWindow
-    }
     val next = HabitStore.setProtectionConfig(
       context,
       effectiveLength,
       effectiveMinutes,
-      effectiveOffWindow
+      requestedOffWindow
     )
     // The real configured hours are used unless the debug switch is turned on again by hand.
     val unlock = HabitStore.unlockState(context)
@@ -154,6 +148,8 @@ object HabitUnlock {
       "configuredOffWindowMs" to configuredOffWindowMs,
       "offWindowActive" to (unlock.offWindow != null),
       "offWindowRemainingMs" to offRemaining,
+      // Monotonic deadline, so a caller never has to guess how much is left.
+      "offWindowDeadlineMs" to (if (unlock.offWindow != null) now + offRemaining else 0L),
       "offWindowTotalMs" to (unlock.offWindow?.durationMs ?: configuredOffWindowMs),
       "failuresToday" to failuresToday(context),
       "lockRemainingMs" to lockRemainingMs(context),
@@ -226,20 +222,9 @@ object HabitUnlock {
     val unlock = HabitStore.unlockState(context)
     if (unlock.cooldown != null || unlock.offWindow != null) return state
 
-    val saved = HabitStore.setOffWindowMinutes(context, minutes)
-    val duration = saved.configuredOffWindowMinutes * 60_000L
-    val now = SystemClock.elapsedRealtime()
-    HabitStore.writeUnlockState(
-      context,
-      unlock.copy(
-        offWindow = UnlockWindow(duration, duration, now, System.currentTimeMillis() + duration),
-        restoreMode = ProtectionState.MODE_NORMAL
-      )
-    )
-    val next = HabitStore.updateState(context) { it.copy(protectionEnabled = false) }
-    reschedule(context)
-    HabitForegroundService.start(context)
-    return next
+    // Exact minutes chosen by the user; persisted before the OFF window starts.
+    HabitStore.setOffWindowMinutes(context, minutes)
+    return beginOffWindow(context, ProtectionState.MODE_NORMAL)
   }
 
   fun setProtectionEnabled(context: Context, enabled: Boolean): ProtectionState {
@@ -289,7 +274,8 @@ object HabitUnlock {
       unlock.copy(
         cooldown = UnlockWindow(duration, duration, now, System.currentTimeMillis() + duration),
         failures = unlock.failures.copy(consecutive = 0, lockedUntilWall = 0L)
-      )
+      ),
+      sync = true
     )
     reschedule(context)
     return state
@@ -334,7 +320,9 @@ object HabitUnlock {
           System.currentTimeMillis() + offMs
         )
       )
-      HabitStore.writeUnlockState(context, unlock)
+      // Commit the exact OFF window before the mode flips, so a kill/reboot cannot revert
+      // to an older or shorter window.
+      HabitStore.writeUnlockState(context, unlock, sync = true)
       HabitStore.updateState(context) {
         it.copy(mode = ProtectionState.MODE_NORMAL, protectionEnabled = false)
       }
@@ -458,8 +446,9 @@ object HabitUnlock {
     }
 
     if (CharacterChallenge.submit(challengeId, typed)) {
-      recordSuccess(context)
-      exitStrict(context)
+      // A successful code unlock leaves protection OFF for the configured auto-restart
+      // window, then the Strict/Aggressive mode returns by itself.
+      completeUnlock(context)
       return mapOf(
         "success" to true,
         "challengeId" to "",
@@ -547,32 +536,26 @@ object HabitUnlock {
     return next
   }
 
-  /** Called by any successful unlock method (A, B or C). */
-  fun completeUnlock(context: Context): ProtectionState {
-    recordSuccess(context)
-    return exitStrict(context)
-  }
-
   /**
-   * Method C success: protection is off for the user's auto-restart window, then the
-   * previous mode returns automatically. "Turn on now" ends it early (setProtectionEnabled).
+   * Enters the temporary OFF window that auto-restarts into [restoreMode]. This is the one
+   * place every unlock path (code, face, Normal-mode turn-off) creates an OFF window, and
+   * it always uses the user's configured minutes — never a built-in 10 or 30 minute value.
    * The deadline is stored monotonic *and* as wall clock, so rebooting cannot extend it.
    */
-  fun completeFaceUnlock(context: Context): ProtectionState {
-    recordSuccess(context)
-    CharacterChallenge.clear()
-
-    val previous = HabitStore.state(context)
-    val restoreMode = if (previous.mode == ProtectionState.MODE_NORMAL) {
-      ProtectionState.MODE_STRICT
-    } else {
-      previous.mode
+  private fun beginOffWindow(context: Context, restoreMode: String): ProtectionState {
+    val target = when (restoreMode) {
+      ProtectionState.MODE_AGGRESSIVE -> ProtectionState.MODE_AGGRESSIVE
+      ProtectionState.MODE_STRICT -> ProtectionState.MODE_STRICT
+      // Normal-mode turn-off restores Normal, but a Strict/Aggressive unlock always
+      // restores a locked mode.
+      else -> ProtectionState.MODE_NORMAL
     }
 
-    // Strict can be restored without device admin, so drop it while protection is off.
-    // Aggressive must keep it: re-adding admin needs a user prompt, and without it the
-    // watchdog could not report a real Aggressive state after the window.
-    if (restoreMode != ProtectionState.MODE_AGGRESSIVE) {
+    // Strict can be restored without device admin, so drop an Aggressive admin when the
+    // lock is only Strict. Aggressive must keep it: re-adding admin needs a user prompt,
+    // and without it the watchdog could not report a real Aggressive state after the
+    // window. A Normal-mode turn-off leaves the admin state alone.
+    if (target == ProtectionState.MODE_STRICT) {
       HabitDeviceAdmin.remove(context)
     }
 
@@ -589,9 +572,11 @@ object HabitUnlock {
           now,
           System.currentTimeMillis() + offMs
         ),
-        restoreMode = restoreMode,
+        restoreMode = target,
         failures = unlock.failures.copy(consecutive = 0, lockedUntilWall = 0L)
-      )
+      ),
+      // Committed before the mode flips to OFF, so a kill can never lose the window.
+      sync = true
     )
 
     val next = HabitStore.updateState(context) {
@@ -604,6 +589,37 @@ object HabitUnlock {
     HabitWatchdog.schedule(context)
     HabitWatchdog.check(context, force = true)
     return next
+  }
+
+  /**
+   * Called by any successful unlock method (A, B or C). Method A (code) and C (two faces)
+   * stop protection only for the configured auto-restart window and then restore Strict or
+   * Aggressive automatically. Method B ends its cooldown in [tick] with the same rule.
+   */
+  fun completeUnlock(context: Context): ProtectionState {
+    recordSuccess(context)
+    CharacterChallenge.clear()
+    val current = HabitStore.state(context)
+    // A Normal-mode character check (only reachable outside a lock) ends protection for
+    // good; a Strict/Aggressive unlock always enters the timed OFF window.
+    if (current.mode == ProtectionState.MODE_NORMAL) return exitStrict(context)
+    return beginOffWindow(context, current.mode)
+  }
+
+  /**
+   * Method C success: protection is off for the user's auto-restart window, then the
+   * previous mode returns automatically. "Turn on now" ends it early (setProtectionEnabled).
+   */
+  fun completeFaceUnlock(context: Context): ProtectionState {
+    recordSuccess(context)
+    CharacterChallenge.clear()
+    val previous = HabitStore.state(context)
+    val restoreMode = if (previous.mode == ProtectionState.MODE_NORMAL) {
+      ProtectionState.MODE_STRICT
+    } else {
+      previous.mode
+    }
+    return beginOffWindow(context, restoreMode)
   }
 
   /** Debug builds only: lets the tester skip the cooldown and leave Strict instantly. */

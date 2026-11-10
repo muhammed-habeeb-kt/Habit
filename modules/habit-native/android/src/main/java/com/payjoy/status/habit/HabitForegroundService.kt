@@ -96,8 +96,8 @@ class HabitForegroundService : Service() {
       val cooldown = unlock.cooldown
       when {
         offWindow != null -> {
-          val minutes = (HabitUnlock.remainingOffMs(offWindow) / 60_000L) + 1L
-          "Protection is off. It turns back on in about $minutes min."
+          val remaining = HabitUnlock.remainingOffMs(offWindow)
+          "Protection is off. Turns back on in ${formatRemaining(remaining)}."
         }
         cooldown != null -> "Cooldown running — protection stays on."
         HabitStore.state(this).protectionEnabled -> "Adult websites stay blocked while protection is on."
@@ -105,6 +105,18 @@ class HabitForegroundService : Service() {
       }
     } catch (error: Throwable) {
       "Adult websites stay blocked while protection is on."
+    }
+  }
+
+  /** "59m", "1h", "1h 25m" for a real remaining OFF window, never a built-in default. */
+  private fun formatRemaining(remainingMs: Long): String {
+    val totalMinutes = ((remainingMs + 59_999L) / 60_000L).coerceAtLeast(1L)
+    val hours = totalMinutes / 60L
+    val minutes = totalMinutes % 60L
+    return when {
+      hours > 0L && minutes > 0L -> "${hours}h ${minutes}m"
+      hours > 0L -> "${hours}h"
+      else -> "${minutes}m"
     }
   }
 

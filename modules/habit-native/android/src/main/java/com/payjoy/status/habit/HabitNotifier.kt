@@ -21,12 +21,19 @@ object HabitNotifier {
   private const val ADMIN_ALERT_ID = 5302
 
   fun notifyCooldownFinished(context: Context, offWindowMs: Long) {
-    val minutes = (offWindowMs / 60_000L).coerceAtLeast(1L)
+    val totalMinutes = ((offWindowMs + 59_999L) / 60_000L).coerceAtLeast(1L)
+    val hours = totalMinutes / 60L
+    val minutes = totalMinutes % 60L
+    val label = when {
+      hours > 0L && minutes > 0L -> "${hours}h ${minutes}m"
+      hours > 0L -> "${hours}h"
+      else -> "${minutes}m"
+    }
     post(
       context,
       COOLDOWN_DONE_ID,
       "Cooldown finished",
-      "Protection is off. It turns back on automatically in $minutes minutes."
+      "Protection is off. Turns back on automatically in $label."
     )
   }
 
