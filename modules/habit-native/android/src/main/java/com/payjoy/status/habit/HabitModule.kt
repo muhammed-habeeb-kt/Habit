@@ -52,6 +52,9 @@ class HabitModule : Module() {
       try {
         HabitStore.init(ctx)
         HabitStore.ensureFilter(ctx)
+        // The calibration recorder is gone: wipe the frames and CSV an older debug build
+        // left on the phone instead of carrying them around.
+        HabitStore.clearAiDebugSessionDir(ctx)
         HabitUnlock.tick(ctx)
         HabitStore.onAttemptsChanged = { count ->
           sendEvent("onAttemptsChanged", mapOf("count" to count))
@@ -179,27 +182,6 @@ class HabitModule : Module() {
 
     AsyncFunction("setAiBlockAlerts") { enabled: Boolean ->
       HabitStore.setAiBlockAlerts(appCtx, enabled).toMap()
-    }
-
-    // Debug recording for threshold calibration: every scanned frame and both model scores
-    // land in filesDir/ai_debug_session. Dry-run logs "would block" without the overlay.
-    AsyncFunction("setAiDebugRecording") { enabled: Boolean ->
-      HabitStore.setAiDebugRecording(appCtx, enabled).toMap()
-    }
-
-    AsyncFunction("setAiDebugDryRun") { enabled: Boolean ->
-      HabitStore.setAiDebugDryRun(appCtx, enabled).toMap()
-    }
-
-    // Copies a standalone CSV and a ZIP (CSV + frames) into the public Download folder
-    // through MediaStore.Downloads and returns the exact paths, so the session can be
-    // pulled off the phone without a storage permission.
-    AsyncFunction("exportAiDebugSession") {
-      AiDebugSession.export(appCtx)
-    }
-
-    AsyncFunction("clearAiDebugSession") {
-      AiDebugSession.clear(appCtx)
     }
 
     // Live diagnostics for the Apps tab card: what the scanner is doing right now, which

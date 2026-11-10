@@ -57,7 +57,14 @@ export default function AppsScreen() {
   }, []);
 
   const watched = useMemo(() => settings?.monitoredAppPackages ?? [], [settings]);
-  const domains = useMemo(() => settings?.monitoredDomains ?? [], [settings]);
+  // Watch the persisted list: the native store is the source of truth, so the Browser box
+  // shows the saved websites even if the JS settings object arrives empty on a reload.
+  const domains = useMemo(() => {
+    const fromSettings = settings?.monitoredDomains ?? [];
+    return fromSettings.length > 0
+      ? fromSettings
+      : (snapshot?.aiMonitoredDomains ?? []);
+  }, [settings, snapshot]);
   const enabled = settings?.enabled ?? false;
   const removalLocked = isMonitoringLocked(snapshot);
 

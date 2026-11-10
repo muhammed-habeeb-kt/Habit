@@ -4,6 +4,7 @@ import {
   addStateListener,
   getAiSettings,
   normalizeDomain,
+  restoreMonitoredDomains,
   setAiBlockAlerts,
   setAiMonitoredDomains,
   setAiMonitoringEnabled,
@@ -28,7 +29,10 @@ export function useAiMonitoring() {
 
   useEffect(() => {
     let mounted = true;
-    getAiSettings().then((next) => {
+    // The Browser list is owned by the native store: re-read it (and repair an empty JS
+    // copy from `snapshot.aiMonitoredDomains`) every time the screen mounts, so a Metro
+    // restart or a full app reload can never make watched websites vanish.
+    restoreMonitoredDomains().then((next) => {
       if (mounted) setSettings(next);
     });
     const unsubscribe = addStateListener(() => {

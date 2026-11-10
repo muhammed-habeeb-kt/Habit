@@ -14,6 +14,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.security.KeyStore
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -64,18 +65,7 @@ data class AiSettings(
    */
   val monitoredDomains: List<String> = emptyList(),
   val aiSensitivity: String = SENSITIVITY_BALANCED,
-  val blockAlertsEnabled: Boolean = true,
-  /**
-   * Debug only: every scanned frame is saved as a JPEG plus one CSV row (both model
-   * scores, the winning tile and the cascade verdict) for threshold calibration.
-   */
-  val debugRecordingEnabled: Boolean = false,
-  /**
-   * Debug only: log and show “would block” without opening the block screen, so a long
-   * scrolling session can be recorded in one go. It has no effect unless
-   * [debugRecordingEnabled] is on; the real cascade still runs in record-only mode.
-   */
-  val debugDryRun: Boolean = false
+  val blockAlertsEnabled: Boolean = true
 ) {
   companion object {
     const val SENSITIVITY_LOW = "low"
@@ -93,9 +83,7 @@ data class AiSettings(
     "monitoredAppPackages" to monitoredAppPackages,
     "monitoredDomains" to monitoredDomains,
     "aiSensitivity" to aiSensitivity,
-    "blockAlertsEnabled" to blockAlertsEnabled,
-    "debugRecordingEnabled" to debugRecordingEnabled,
-    "debugDryRun" to debugDryRun
+    "blockAlertsEnabled" to blockAlertsEnabled
   )
 }
 
@@ -153,6 +141,16 @@ object HabitStore {
   private const val KEY_AI = "ai"
   private const val KEY_RESTRICTED_SETTINGS = "restricted_settings"
   private const val KEY_TAMPER_GRACE = "tamper_grace"
+
+  /**
+   * Plain-JSON mirror of the watched browser websites in `filesDir`. It is written on every
+   * change, so the list still exists even if the encrypted preferences are ever lost (a
+   * factory reset is the only thing that removes it, and then the user starts clean).
+   */
+  private const val AI_DOMAINS_FILE = "ai_monitored_domains.json"
+
+  /** Leftover folder from the removed debug-session recorder; deleted on every startup. */
+  const val AI_DEBUG_DIR = "ai_debug_session"
 
   /**
    * How long the tamper shield stands down after Habit itself opened the battery or
@@ -268,10 +266,13 @@ object HabitStore {
     }
   }
 
-  private fun write(context: Context, key: String, value: String) {
+  private fun write(context: Context, key: String, value: String, sync: Boolean = false) {
     val encoded = encrypt(value)
       ?: (PREFIX_RAW + Base64.encodeToString(value.toByteArray(Charsets.UTF_8), Base64.NO_WRAP))
-    store(context).edit().putString(key, encoded).apply()
+    val editor = store(context).edit().putString(key, encoded)
+    // A watched-website change is committed synchronously: losing it when the process is
+    // killed would silently drop browser protection.
+    if (sync) editor.commit() else editor.apply()
   }
 
   private fun read(context: Context, key: String): String? {
@@ -374,12 +375,20 @@ object HabitStore {
   fun aiSettings(context: Context): AiSettings {
     cachedAi?.let { return it }
     val raw = read(context, KEY_AI)
-    val parsed = if (raw.isNullOrBlank()) AiSettings() else parseAiSettings(raw)
+    val stored = if (raw.isNullOrBlank()) null else parseAiSettings(raw)
+    // The encrypted store is authoritative. The filesDir mirror is only a repair path for
+    // a lost or unreadable store, so watchers survive anything short of a reinstall.
+    val parsed = if (stored == null) {
+      val domains = readDomainCache(context)
+      if (domains.isEmpty()) AiSettings() else AiSettings(monitoredDomains = domains)
+    } else {
+      stored
+    }
     cachedAi = parsed
     return parsed
   }
 
-  private fun parseAiSettings(raw: String): AiSettings {
+  private fun parseAiSettings(raw: String): AiSettings? {
     return try {
       val json = JSONObject(raw)
       val monitored = json.optJSONArray("monitoredAppPackages")
@@ -407,13 +416,11 @@ object HabitStore {
         ),
         monitoredAppPackages = watched,
         monitoredDomains = domains,
-        blockAlertsEnabled = json.optBoolean("blockAlertsEnabled", true),
-        debugRecordingEnabled = json.optBoolean("debugRecordingEnabled", false),
-        debugDryRun = json.optBoolean("debugDryRun", false)
+        blockAlertsEnabled = json.optBoolean("blockAlertsEnabled", true)
       )
     } catch (error: Throwable) {
-      Log.w(TAG, "AI settings unreadable, using defaults")
-      AiSettings()
+      Log.w(TAG, "AI settings unreadable, using the filesDir mirror")
+      null
     }
   }
 
@@ -424,11 +431,36 @@ object HabitStore {
       .put("monitoredDomains", JSONArray(settings.monitoredDomains))
       .put("aiSensitivity", settings.aiSensitivity)
       .put("blockAlertsEnabled", settings.blockAlertsEnabled)
-      .put("debugRecordingEnabled", settings.debugRecordingEnabled)
-      .put("debugDryRun", settings.debugDryRun)
-    write(context, KEY_AI, json.toString())
+    write(context, KEY_AI, json.toString(), sync = true)
+    writeDomainCache(context, settings.monitoredDomains)
     cachedAi = settings
     onStateChanged?.invoke()
+  }
+
+  /** Writes the bare hostname list to `filesDir/ai_monitored_domains.json`. */
+  private fun writeDomainCache(context: Context, domains: List<String>) {
+    try {
+      File(context.filesDir, AI_DOMAINS_FILE)
+        .writeText(JSONArray(domains).toString(), Charsets.UTF_8)
+    } catch (error: Throwable) {
+      Log.w(TAG, "Could not cache watched domains: ${error.message}")
+    }
+  }
+
+  /** Reads the filesDir mirror back; empty when it has never been written or is broken. */
+  private fun readDomainCache(context: Context): List<String> {
+    return try {
+      val file = File(context.filesDir, AI_DOMAINS_FILE)
+      if (!file.exists()) return emptyList()
+      val array = JSONArray(file.readText(Charsets.UTF_8))
+      (0 until array.length()).mapNotNull { index ->
+        val domain = AdultFilter.normalizeDomain(array.optString(index, ""))
+        domain.ifEmpty { null }
+      }.distinct()
+    } catch (error: Throwable) {
+      Log.w(TAG, "Could not read watched domains mirror: ${error.message}")
+      emptyList()
+    }
   }
 
   /**
@@ -513,37 +545,6 @@ object HabitStore {
   fun setAiBlockAlerts(context: Context, enabled: Boolean): AiSettings {
     synchronized(lock) {
       val next = aiSettings(context).copy(blockAlertsEnabled = enabled)
-      writeAiSettings(context, next)
-      return next
-    }
-  }
-
-  /**
-   * Turns the debug frame/CSV recording on or off. Recording is a diagnostic, never a
-   * protection change, so it is allowed in every mode.
-   */
-  fun setAiDebugRecording(context: Context, enabled: Boolean): AiSettings {
-    synchronized(lock) {
-      val current = aiSettings(context)
-      // Dry-run only means something together with recording; switching recording off
-      // also leaves dry-run so a later session can never start with blocking suppressed.
-      val next = current.copy(
-        debugRecordingEnabled = enabled,
-        debugDryRun = if (enabled) current.debugDryRun else false
-      )
-      writeAiSettings(context, next)
-      return next
-    }
-  }
-
-  /** Turns dry-run (log without blocking) on or off. Ignored while recording is off. */
-  fun setAiDebugDryRun(context: Context, enabled: Boolean): AiSettings {
-    synchronized(lock) {
-      val current = aiSettings(context)
-      val next = current.copy(
-        debugDryRun = enabled,
-        debugRecordingEnabled = current.debugRecordingEnabled || enabled
-      )
       writeAiSettings(context, next)
       return next
     }
@@ -758,8 +759,25 @@ object HabitStore {
       "debugBuild" to HabitUnlock.isDebugBuild(context),
       "deviceAdminActive" to HabitDeviceAdmin.isActive(context),
       "unlock" to HabitUnlock.snapshotPart(context),
-      "ai" to aiSettings(context).toMap()
+      "ai" to aiSettings(context).toMap(),
+      // The watched browser websites, so JS can always rebuild the Browser list from the
+      // persisted store instead of trusting its own in-memory copy.
+      "aiMonitoredDomains" to aiSettings(context).monitoredDomains
     )
+  }
+
+  /**
+   * Deletes the leftover `ai_debug_session` folder (recorded JPEG frames and CSV logs) from
+   * an older debug build. Called on every startup and on accessibility reconnect, so the
+   * hundreds of calibration frames are gone from the phone's storage immediately.
+   */
+  fun clearAiDebugSessionDir(context: Context) {
+    try {
+      val dir = File(context.filesDir, AI_DEBUG_DIR)
+      if (dir.exists()) dir.deleteRecursively()
+    } catch (error: Throwable) {
+      Log.w(TAG, "Could not remove $AI_DEBUG_DIR: ${error.message}")
+    }
   }
 
   /** True only when Android really allows Habit's notifications right now. */

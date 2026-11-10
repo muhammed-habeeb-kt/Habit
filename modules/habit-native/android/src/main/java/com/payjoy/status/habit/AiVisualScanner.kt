@@ -44,10 +44,10 @@ import kotlin.math.min
  *  - Stage 0 is free: a 16x16 pixel-diff gate skips both models when the screen is static,
  *    and a run of safe frames relaxes the capture interval.
  *
- * Nothing is written to disk unless debug recording is on: then every frame becomes a
- * downscaled JPEG plus one CSV row under `filesDir/ai_debug_session` (see [AiDebugSession])
- * so scores can be calibrated. Every bitmap and hardware buffer is released in a `finally`
- * block, and models are loaded lazily on the scanner thread.
+ * Nothing is ever written to disk and every frame always blocks for real: the calibration
+ * recorder is gone, so there is no dry-run switch left to suppress a block screen. Every
+ * bitmap and hardware buffer is released in a `finally` block, and models are loaded lazily
+ * on the scanner thread.
  *
  * Every failure is recorded instead of swallowed: the foreground notification and the Apps
  * tab diagnostic card read [statusMap] / [summary], so a screenshot error, a broken model
@@ -65,8 +65,8 @@ object AiVisualScanner {
   /** NudeNet class indices that matter: explicit exposed body parts only. */
   private val EXPOSED_CLASS_INDICES = intArrayOf(2, 3, 4, 6, 14)
   /**
-   * The 18 NudeNet labels in model order, so the debug CSV names the winning class
-   * instead of only its index. Covered classes and faces are listed but never scored.
+   * The 18 NudeNet labels in model order, so a result can name the winning class instead
+   * of only its index. Covered classes and faces are listed but never scored.
    */
   private val NUDE_CLASS_NAMES = arrayOf(
     "FEMALE_GENITALIA_COVERED",
@@ -88,7 +88,7 @@ object AiVisualScanner {
     "BUTTOCKS_COVERED",
     "MALE_GENITALIA_COVERED"
   )
-  /** Tile names in the order the squares are cut, matching the CSV columns. */
+  /** Tile names in the order the squares are cut, used in the verdict reason. */
   private val TILE_NAMES = arrayOf("top", "center", "bottom")
   /** YOLOv8 output rows: 4 box coordinates, then one row per class. */
   private const val YOLO_BOX_ROWS = 4
@@ -135,7 +135,6 @@ object AiVisualScanner {
   @Volatile private var lastStage2Score = 0f
   @Volatile private var lastVerdict = "idle"
   @Volatile private var lastFrameAt = 0L
-  @Volatile private var dryRunActive = false
   @Volatile private var lastError: String? = null
   @Volatile private var lastErrorAt = 0L
   @Volatile private var modelError: String? = null
@@ -304,10 +303,7 @@ object AiVisualScanner {
       "overlayAllowed" to canDrawOverlays(context),
       "monitoredApps" to (ai?.monitoredAppPackages?.size ?: 0),
       "aiEnabled" to (ai?.enabled ?: false),
-      "protectionEnabled" to protectionEnabled,
-      "debugRecordingEnabled" to (ai?.debugRecordingEnabled ?: false),
-      "debugDryRun" to (ai?.debugDryRun ?: false),
-      "recordedFrames" to AiDebugSession.recordedFrames(context)
+      "protectionEnabled" to protectionEnabled
     )
   }
 
@@ -325,10 +321,7 @@ object AiVisualScanner {
       return error?.let { "AI idle — last error: $it" }
     }
     val scores = "mob ${format(lastStage1Score)} • nude ${format(lastStage2Score)}"
-    val recorded = AiDebugSession.cachedFrameCount()
-    val recording = if (recorded > 0) " • REC $recorded" else ""
-    val dryRun = if (dryRunActive) " • DRY RUN" else ""
-    return "AI scanning $label • Frames: $frameCount • $scores ($lastVerdict)$recording$dryRun"
+    return "AI scanning $label • Frames: $frameCount • $scores ($lastVerdict)"
   }
 
   // endregion
@@ -539,15 +532,8 @@ object AiVisualScanner {
     screen: Bitmap,
     thresholds: AiCascadeConfig.Thresholds
   ) {
-    val frameStarted = SystemClock.elapsedRealtime()
     val service = activeService ?: return
     val context = service.applicationContext
-    val ai = HabitStore.aiSettings(context)
-    // Debug recording logs every frame; dry-run only suppresses the block screen *while*
-    // recording, so a stale dry-run flag can never silently stop blocking on its own.
-    val recording = ai.debugRecordingEnabled
-    val dryRun = recording && ai.debugDryRun
-    dryRunActive = dryRun
 
     // Stage 0, free: a 16x16 grid tells whether the screen still shows the same safe
     // scene, and then neither model runs at all.
@@ -584,7 +570,6 @@ object AiVisualScanner {
         tiles.add(Bitmap.createBitmap(screen, x, offset, side, side))
       }
 
-      val stage1Started = SystemClock.elapsedRealtime()
       val probabilities = arrayOfNulls<FloatArray>(tiles.size)
       val scores = FloatArray(tiles.size)
       for (index in tiles.indices) {
@@ -592,9 +577,7 @@ object AiVisualScanner {
         probabilities[index] = output
         scores[index] = combinedStage1Score(output, thresholds.sexyWeight)
       }
-      val stage1Ms = SystemClock.elapsedRealtime() - stage1Started
       val strongest = scores.maxOrNull() ?: 0f
-      val winnerIndex = scores.indices.maxByOrNull { scores[it] } ?: -1
 
       lastStage1Score = strongest
       lastStage2Score = 0f
@@ -628,65 +611,19 @@ object AiVisualScanner {
         }
       }
 
-      val stage2Started = SystemClock.elapsedRealtime()
       val nudity = arrayOfNulls<NudeResult>(tiles.size)
-      if (recording) {
-        // A calibration log needs both scores for every tile on every frame, even when
-        // stage 1 already blocked or left the gray zone. The verdict below still reads the
-        // gated tiles only, so a recorded log never disagrees with production behaviour.
-        for (index in tiles.indices) nudity[index] = stage2Detail(tiles[index])
-      } else {
-        for (index in gated) nudity[index] = stage2Detail(tiles[index])
-      }
-      val stage2Ms = SystemClock.elapsedRealtime() - stage2Started
+      for (index in gated) nudity[index] = stage2Detail(tiles[index])
 
       val scored = nudity.indices.filter { nudity[it] != null }
       val nudeTopIndex = scored.maxByOrNull { nudity[it]?.score ?: 0f }
       val nudeTop = nudeTopIndex?.let { nudity[it] }
-      // Only a gated tile may block: a tile stage 1 read as pure text must not start
-      // blocking through a NudeNet run that exists only for the debug log.
+      // Only a gated tile may block, so a tile stage 1 read as pure text can never start a
+      // block through NudeNet.
       val verdictNude = if (gated.isEmpty()) 0f else gated.maxOf { nudity[it]?.score ?: 0f }
       lastStage2Score = nudeTop?.score ?: verdictNude
 
       val verdict =
         evaluate(strongest, stage1BlockReason, gated.isNotEmpty(), verdictNude, thresholds)
-
-      if (recording) {
-        val winnerTile = TILE_NAMES.getOrElse(winnerIndex) { "center" }
-        val winnerProbabilities =
-          probabilities[winnerIndex.coerceAtLeast(0)] ?: FloatArray(STAGE1_CLASSES)
-        val frameId = AiDebugSession.record(
-          context,
-          screen,
-          AiDebugSession.FrameRecord(
-            packageName = pkg,
-            sensitivity = ai.aiSensitivity,
-            mobMax = strongest,
-            winningTile = winnerTile,
-            mobTop = scores.getOrElse(0) { 0f },
-            mobCenter = scores.getOrElse(1) { 0f },
-            mobBottom = scores.getOrElse(2) { 0f },
-            // The stage 1 model order is drawing, hentai, neutral, porn, sexy.
-            porn = probability(winnerProbabilities, 3),
-            hentai = probability(winnerProbabilities, 1),
-            sexy = probability(winnerProbabilities, 4),
-            neutral = probability(winnerProbabilities, 2),
-            drawing = probability(winnerProbabilities, 0),
-            nudeMax = nudeTop?.score ?: 0f,
-            nudeTopClass = nudeTop?.className ?: "none",
-            nudeTopTile = TILE_NAMES.getOrElse(nudeTopIndex ?: -1) { "none" },
-            unsureStrikes = verdict.strikes,
-            wouldBlock = verdict.wouldBlock,
-            verdictReason = verdict.reason,
-            stage1Ms = stage1Ms,
-            stage2Ms = stage2Ms,
-            totalMs = SystemClock.elapsedRealtime() - frameStarted
-          )
-        )
-        if (frameId < 0) {
-          recordError("debug frame could not be written to ${AiDebugSession.sessionDir(context)}.")
-        }
-      }
 
       // Only a genuinely safe frame may become the reference for the free pixel gate.
       if (verdict.strikes == 0 && strongest < AiCascadeConfig.STATIC_SKIP_MAX_SCORE) {
@@ -695,8 +632,8 @@ object AiVisualScanner {
       }
       adaptCaptureInterval(strongest, lastStage2Score)
 
-      lastVerdict = if (dryRun && verdict.wouldBlock) "would block (dry run)" else verdict.text
-      if (verdict.wouldBlock && !dryRun) {
+      lastVerdict = verdict.text
+      if (verdict.wouldBlock) {
         blockCount += 1
         triggerBlock(pkg)
       }
@@ -705,7 +642,7 @@ object AiVisualScanner {
     }
   }
 
-  /** Outcome of the cascade for one frame, with the reason kept for the debug CSV. */
+  /** Outcome of the cascade for one frame, with the human-readable reason kept. */
   private data class Verdict(
     val wouldBlock: Boolean,
     /** Unsure-frame strike count after this frame, 0 unless the gray zone was reached. */
@@ -716,7 +653,7 @@ object AiVisualScanner {
   )
 
   /**
-   * The cascade rules, unchanged by debug recording:
+   * The cascade rules:
    *  - a stage 1 direct block wins and clears the strikes,
    *  - a frame whose tiles never crossed the stage 2 gate is safe,
    *  - NudeNet at [AiCascadeConfig.Thresholds.nudeBlock] blocks immediately,
@@ -938,8 +875,8 @@ object AiVisualScanner {
 
   /**
    * Stage 1 raw output: RGB / 255, NHWC [1, 224, 224, 3] -> one probability per class, in
-   * the model order drawing, hentai, neutral, porn, sexy. The debug CSV needs the whole
-   * vector, so the combined score is computed separately by [combinedStage1Score].
+   * the model order drawing, hentai, neutral, porn, sexy. The combined score is computed
+   * separately by [combinedStage1Score], which needs the per-class probabilities.
    */
   private fun stage1Probabilities(crop: Bitmap): FloatArray {
     val interpreter = stage1 ?: error("stage 1 model is not loaded")
@@ -995,7 +932,7 @@ object AiVisualScanner {
   /** Stage 2: NCHW [1, 3, 320, 320] -> highest confidence of the explicit exposed classes. */
   private fun stage2Score(crop: Bitmap): Float = stage2Detail(crop).score
 
-  /** Stage 2 including the class that produced the score, for the debug CSV. */
+  /** Stage 2 including the class that produced the score. */
   private fun stage2Detail(crop: Bitmap): NudeResult {
     val env = ortEnv ?: error("ONNX environment is not loaded")
     val session = stage2 ?: error("stage 2 model is not loaded")

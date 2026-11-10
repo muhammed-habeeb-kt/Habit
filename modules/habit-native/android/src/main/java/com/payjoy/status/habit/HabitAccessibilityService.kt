@@ -40,6 +40,9 @@ class HabitAccessibilityService : AccessibilityService() {
     try {
       HabitStore.init(this)
       HabitStore.ensureFilter(this)
+      // Delete any debug frames/CSV left by an older calibration build, even when the Habit
+      // UI is never opened.
+      HabitStore.clearAiDebugSessionDir(this)
       HabitGuard.attach(this)
       // Starts the keep-alive only when protection (or an unlock timer) needs it.
       HabitUnlock.resumeAfterBoot(this)
@@ -242,8 +245,6 @@ class HabitAccessibilityService : AccessibilityService() {
       if (!HabitStore.state(this).protectionEnabled) return
       val ai = HabitStore.aiSettings(this)
       if (!ai.enabled || pkg !in ai.monitoredAppPackages) return
-      // A calibration dry-run must not block, exactly like the screenshot cascade.
-      if (ai.debugRecordingEnabled && ai.debugDryRun) return
 
       val root = try {
         rootInActiveWindow
