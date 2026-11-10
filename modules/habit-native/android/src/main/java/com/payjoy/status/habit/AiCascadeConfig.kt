@@ -77,10 +77,12 @@ object AiCascadeConfig {
   const val MIN_NUDE_BOX_AREA_RATIO = 0.04f
 
   /**
-   * Production blocking needs the same verdict on two consecutive frames (~1..2 s), so a
-   * scroll that briefly shows a small preview can never close the app.
+   * Production blocking needs the same verdict on two consecutive frames, so a scroll that
+   * briefly shows a small preview can never close the app. The confirming frame is captured
+   * about [BLOCK_CONFIRM_INTERVAL_MS] later, i.e. ~1.5 s of media presence on screen.
    */
   const val BLOCK_CONFIRM_FRAMES = 2
+  const val BLOCK_CONFIRM_INTERVAL_MS = 1_500L
 
   /** Sensitivity-adjusted thresholds. `balanced` is the default aggressive preset. */
   data class Thresholds(

@@ -657,8 +657,9 @@ object AiVisualScanner {
           blockCount += 1
           triggerBlock(pkg)
         } else {
-          // Keep the next frame fast instead of relaxing into the 2.2 s movie interval.
-          captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
+          // Re-check after ~1.5 s instead of relaxing into the 2.2 s movie interval, so the
+          // confirmation really spans a moment of continuous media presence.
+          captureIntervalMs = AiCascadeConfig.BLOCK_CONFIRM_INTERVAL_MS
           safeStreak = 0
           lastVerdict = "confirming $confirmations/${AiCascadeConfig.BLOCK_CONFIRM_FRAMES} " +
             "(${verdict.text})"
