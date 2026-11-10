@@ -9,6 +9,8 @@ export type UnlockInfo = {
   cooldownTotalMs: number;
   /** Wait-it-out duration the user configured (180..1440 minutes), in ms. */
   configuredCooldownMs: number;
+  /** How long protection stays OFF before auto-restarting (1..1439 minutes), in ms. */
+  configuredOffWindowMs: number;
   /** Character challenge length locked in while Strict/Aggressive is on. */
   configuredChallengeLength: number;
   offWindowActive: boolean;
@@ -28,6 +30,8 @@ export type HabitSnapshot = {
   configuredChallengeLength: number;
   /** Wait-it-out timer in minutes, always 180..1440. */
   configuredCooldownMinutes: number;
+  /** Auto-restart OFF window in minutes, always 1..1439 (1m .. 23h 59m). */
+  configuredOffWindowMinutes: number;
   attemptsToday: number;
   /** Live Android check: the accessibility service is enabled right now. */
   accessibilityEnabled: boolean;
@@ -186,7 +190,12 @@ type HabitNativeModule = {
   getSnapshot(): Promise<HabitSnapshot>;
   setProtectionEnabled(enabled: boolean): Promise<HabitSnapshot>;
   setMode(mode: ProtectionMode): Promise<HabitSnapshot>;
-  configureProtection(challengeLength: number, cooldownMinutes: number): Promise<HabitSnapshot>;
+  configureProtection(
+    challengeLength: number,
+    cooldownMinutes: number,
+    offWindowMinutes: number
+  ): Promise<HabitSnapshot>;
+  startTimedOffWindow(minutes: number): Promise<HabitSnapshot>;
   requestUnlockTimer(): Promise<HabitSnapshot>;
   cancelUnlockTimer(): Promise<HabitSnapshot>;
   startCharacterChallenge(length: number): Promise<CharacterChallenge | null>;
@@ -274,6 +283,7 @@ const FALLBACK_UNLOCK: UnlockInfo = {
   cooldownRemainingMs: 0,
   cooldownTotalMs: 0,
   configuredCooldownMs: 3 * 60 * 60 * 1000,
+  configuredOffWindowMs: 10 * 60 * 1000,
   configuredChallengeLength: 200,
   offWindowActive: false,
   offWindowRemainingMs: 0,
@@ -290,6 +300,7 @@ const FALLBACK_SNAPSHOT: HabitSnapshot = {
   onboardingCompleted: false,
   configuredChallengeLength: 200,
   configuredCooldownMinutes: 180,
+  configuredOffWindowMinutes: 10,
   attemptsToday: 0,
   accessibilityEnabled: false,
   notificationsGranted: false,
@@ -307,18 +318,24 @@ const FALLBACK_SNAPSHOT: HabitSnapshot = {
  * (web, Expo Go, or a native module that predates `configureProtection`) so refreshing a
  * snapshot always reports the user's own 100/200/300 and 3h..24h, never 200 / 180.
  */
-let savedProtectionConfig: { challengeLength: number; cooldownMinutes: number } | null = null;
+let savedProtectionConfig: {
+  challengeLength: number;
+  cooldownMinutes: number;
+  offWindowMinutes: number;
+} | null = null;
 
 function fallbackSnapshot(): HabitSnapshot {
   if (!savedProtectionConfig) return FALLBACK_SNAPSHOT;
-  const { challengeLength, cooldownMinutes } = savedProtectionConfig;
+  const { challengeLength, cooldownMinutes, offWindowMinutes } = savedProtectionConfig;
   return {
     ...FALLBACK_SNAPSHOT,
     configuredChallengeLength: challengeLength,
     configuredCooldownMinutes: cooldownMinutes,
+    configuredOffWindowMinutes: offWindowMinutes,
     unlock: {
       ...FALLBACK_UNLOCK,
       configuredCooldownMs: cooldownMinutes * 60_000,
+      configuredOffWindowMs: offWindowMinutes * 60_000,
       configuredChallengeLength: challengeLength,
     },
   };
@@ -352,20 +369,42 @@ export function setMode(mode: ProtectionMode): Promise<HabitSnapshot> {
  * Persists the two limits chosen before Strict/Aggressive turns on and returns the fresh
  * snapshot, so the chosen challenge length and wait duration are visible immediately.
  *
- * While protection is OFF or Normal both values are taken exactly as picked (100, 200 or
- * 300 characters and 180..1440 minutes), even when that lowers an earlier setup. The
- * native state machine only refuses a lower while Strict/Aggressive is actually on.
+ * While protection is OFF or Normal all three values are taken exactly as picked (100, 200
+ * or 300 characters, 180..1440 minutes and a 1..1439 minute OFF window), even when that
+ * lowers an earlier setup. Native only refuses a weaker setup while Strict/Aggressive runs.
  */
 export async function configureProtection(
   challengeLength: number,
-  cooldownMinutes: number
+  cooldownMinutes: number,
+  offWindowMinutes: number
 ): Promise<HabitSnapshot> {
-  savedProtectionConfig = { challengeLength, cooldownMinutes };
-  return safeCall(() => native!.configureProtection(challengeLength, cooldownMinutes), {
+  savedProtectionConfig = { challengeLength, cooldownMinutes, offWindowMinutes };
+  return safeCall(
+    () => native!.configureProtection(challengeLength, cooldownMinutes, offWindowMinutes),
+    {
+      ...fallbackSnapshot(),
+      configuredChallengeLength: challengeLength,
+      configuredCooldownMinutes: cooldownMinutes,
+      configuredOffWindowMinutes: offWindowMinutes,
+    }
+  );
+}
+
+/**
+ * Normal-mode "turn off with auto-restart": protection stops now and comes back by itself
+ * after `minutes` (1..1439). Native refuses it outside Normal mode.
+ */
+export async function startTimedOffWindow(minutes: number): Promise<HabitSnapshot> {
+  const safe = Math.min(1439, Math.max(1, Math.round(minutes)));
+  const result = await safeCall(() => native!.startTimedOffWindow(safe), {
     ...fallbackSnapshot(),
-    configuredChallengeLength: challengeLength,
-    configuredCooldownMinutes: cooldownMinutes,
+    protectionEnabled: false,
+    configuredOffWindowMinutes: safe,
   });
+  savedProtectionConfig = savedProtectionConfig
+    ? { ...savedProtectionConfig, offWindowMinutes: result.configuredOffWindowMinutes ?? safe }
+    : { challengeLength: 200, cooldownMinutes: 180, offWindowMinutes: safe };
+  return result;
 }
 
 export function requestUnlockTimer(): Promise<HabitSnapshot> {
@@ -401,8 +440,8 @@ export function analyzeFaceFrame(imagePath: string): Promise<FaceFrameAnalysis |
 }
 
 /**
- * Ends a verified two-face check and starts the 30-minute OFF window. Refused natively
- * without an active check started by `startFaceUnlock`.
+ * Ends a verified two-face check and starts the configured auto-restart OFF window.
+ * Refused natively without an active check started by `startFaceUnlock`.
  */
 export function completeFaceUnlock(): Promise<boolean> {
   return safeCall(() => native!.completeFaceUnlock(), false);

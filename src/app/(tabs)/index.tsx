@@ -10,6 +10,8 @@ import {
 } from 'react-native';
 
 import { formatDuration, useCountdown } from '@/components/countdown';
+import { formatClockMinutes } from '@/components/duration-wheels';
+import { OffWindowSheet } from '@/components/off-window-sheet';
 import {
   AppTile,
   FrostedBanner,
@@ -33,7 +35,13 @@ import {
 } from '@/constants/theme';
 import { useAiMonitoring } from '@/hooks/use-ai-monitoring';
 import { useProtection } from '@/hooks/use-protection';
-import { activateDeviceAdmin, getInstalledApps, type ProtectionMode } from '@/native/habit';
+import {
+  activateDeviceAdmin,
+  getInstalledApps,
+  setProtectionEnabled,
+  startTimedOffWindow,
+  type ProtectionMode,
+} from '@/native/habit';
 
 const MODE_OPTIONS: SegmentOption<ProtectionMode>[] = [
   { id: 'normal', label: 'Normal' },
@@ -55,7 +63,7 @@ const BROWSERS = [
 ];
 
 export default function HomeScreen() {
-  const { snapshot, busy, toggle } = useProtection();
+  const { snapshot, busy, toggle, setSnapshot } = useProtection();
   // The AI summary mirrors the native settings, so the counts match the AI tab exactly.
   const {
     settings: aiSettings,
@@ -64,6 +72,8 @@ export default function HomeScreen() {
   } = useAiMonitoring();
   const askedForSetup = useRef(false);
   const [browserIcons, setBrowserIcons] = useState<Record<string, string>>({});
+  const [offSheetVisible, setOffSheetVisible] = useState(false);
+  const [offBusy, setOffBusy] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -109,7 +119,27 @@ export default function HomeScreen() {
       router.push('/unlock');
       return;
     }
+    // Turning Normal-mode protection off lets the user pick its auto-restart window first.
+    if (enabled) {
+      setOffSheetVisible(true);
+      return;
+    }
     toggle();
+  };
+
+  const applyOffWindow = async (minutes: number | null) => {
+    if (offBusy) return;
+    setOffBusy(true);
+    try {
+      const next =
+        minutes === null
+          ? await setProtectionEnabled(false)
+          : await startTimedOffWindow(minutes);
+      setSnapshot(next);
+      setOffSheetVisible(false);
+    } finally {
+      setOffBusy(false);
+    }
   };
 
   const aiOn = aiSettings?.enabled ?? false;
@@ -204,6 +234,12 @@ export default function HomeScreen() {
             <View style={styles.grow}>
               <Text style={styles.offLabel}>Back on in</Text>
               <Text style={styles.offCountdown}>{formatDuration(offWindowRemaining)}</Text>
+              <Text style={styles.offHint}>
+                {`Auto-restart timer · ${formatClockMinutes(
+                  Math.round(snapshot.unlock.offWindowTotalMs / 60_000) ||
+                    snapshot.configuredOffWindowMinutes
+                )}`}
+              </Text>
             </View>
             <PrimaryGlowButton
               label="Turn on now"
@@ -327,6 +363,14 @@ export default function HomeScreen() {
       <Text style={styles.footer}>
         Habit never stores the pages you visit — only a daily count stays on this phone.
       </Text>
+
+      <OffWindowSheet
+        visible={offSheetVisible}
+        initialMinutes={snapshot.configuredOffWindowMinutes}
+        busy={offBusy}
+        onClose={() => setOffSheetVisible(false)}
+        onConfirm={applyOffWindow}
+      />
     </TabScreen>
   );
 }
@@ -398,6 +442,12 @@ const styles = StyleSheet.create({
     fontSize: 24,
     lineHeight: 30,
     color: Palette.amber,
+  },
+  offHint: {
+    ...Typography.monoLabelSm,
+    fontSize: 9,
+    lineHeight: 12,
+    color: Palette.textMuted,
   },
   turnOnButton: {
     minHeight: 40,

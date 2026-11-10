@@ -94,7 +94,9 @@ data class ProtectionState(
   /** Character challenge length chosen before Strict/Aggressive was turned on. */
   val configuredChallengeLength: Int = DEFAULT_CHALLENGE_LENGTH,
   /** Wait-it-out duration in minutes, always between 180 and 1440. */
-  val configuredCooldownMinutes: Int = DEFAULT_COOLDOWN_MINUTES
+  val configuredCooldownMinutes: Int = DEFAULT_COOLDOWN_MINUTES,
+  /** How long protection stays OFF before it restarts itself, 1..1439 minutes. */
+  val configuredOffWindowMinutes: Int = DEFAULT_OFF_WINDOW_MINUTES
 ) {
   companion object {
     const val MODE_NORMAL = "normal"
@@ -105,6 +107,10 @@ data class ProtectionState(
     const val DEFAULT_COOLDOWN_MINUTES = 180
     const val MIN_COOLDOWN_MINUTES = 180
     const val MAX_COOLDOWN_MINUTES = 1440
+
+    const val DEFAULT_OFF_WINDOW_MINUTES = 10
+    const val MIN_OFF_WINDOW_MINUTES = 1
+    const val MAX_OFF_WINDOW_MINUTES = 1439
 
     val CHALLENGE_LENGTHS = intArrayOf(100, 200, 300)
 
@@ -120,6 +126,10 @@ data class ProtectionState(
     /** The timer can never be shorter than 3 hours or longer than 24 hours. */
     fun normalizeCooldownMinutes(value: Int): Int =
       value.coerceIn(MIN_COOLDOWN_MINUTES, MAX_COOLDOWN_MINUTES)
+
+    /** The auto-restart OFF window is 1 minute .. 23h 59m; 00:00 is never selectable. */
+    fun normalizeOffWindowMinutes(value: Int): Int =
+      value.coerceIn(MIN_OFF_WINDOW_MINUTES, MAX_OFF_WINDOW_MINUTES)
   }
 }
 
@@ -309,6 +319,12 @@ object HabitStore {
             "configuredCooldownMinutes",
             ProtectionState.DEFAULT_COOLDOWN_MINUTES
           )
+        ),
+        configuredOffWindowMinutes = ProtectionState.normalizeOffWindowMinutes(
+          json.optInt(
+            "configuredOffWindowMinutes",
+            ProtectionState.DEFAULT_OFF_WINDOW_MINUTES
+          )
         )
       )
     } catch (error: Throwable) {
@@ -326,6 +342,7 @@ object HabitStore {
       .put("onboardingCompleted", state.onboardingCompleted)
       .put("configuredChallengeLength", state.configuredChallengeLength)
       .put("configuredCooldownMinutes", state.configuredCooldownMinutes)
+      .put("configuredOffWindowMinutes", state.configuredOffWindowMinutes)
     write(context, KEY_STATE, json.toString())
     cachedState = state
     onStateChanged?.invoke()
@@ -356,12 +373,27 @@ object HabitStore {
   fun setProtectionConfig(
     context: Context,
     challengeLength: Int,
-    cooldownMinutes: Int
+    cooldownMinutes: Int,
+    offWindowMinutes: Int
   ): ProtectionState {
     synchronized(lock) {
       val next = state(context).copy(
         configuredChallengeLength = ProtectionState.normalizeChallengeLength(challengeLength),
-        configuredCooldownMinutes = ProtectionState.normalizeCooldownMinutes(cooldownMinutes)
+        configuredCooldownMinutes = ProtectionState.normalizeCooldownMinutes(cooldownMinutes),
+        configuredOffWindowMinutes =
+          ProtectionState.normalizeOffWindowMinutes(offWindowMinutes)
+      )
+      writeState(context, next)
+      return next
+    }
+  }
+
+  /** Saves only the auto-restart duration chosen from the Home OFF-window sheet. */
+  fun setOffWindowMinutes(context: Context, offWindowMinutes: Int): ProtectionState {
+    synchronized(lock) {
+      val next = state(context).copy(
+        configuredOffWindowMinutes =
+          ProtectionState.normalizeOffWindowMinutes(offWindowMinutes)
       )
       writeState(context, next)
       return next
@@ -750,6 +782,7 @@ object HabitStore {
       "onboardingCompleted" to state.onboardingCompleted,
       "configuredChallengeLength" to state.configuredChallengeLength,
       "configuredCooldownMinutes" to state.configuredCooldownMinutes,
+      "configuredOffWindowMinutes" to state.configuredOffWindowMinutes,
       "attemptsToday" to attemptsToday(context),
       "accessibilityEnabled" to accessibilityEnabled,
       "notificationsGranted" to notificationsGranted(context),

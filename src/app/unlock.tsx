@@ -4,6 +4,7 @@ import { useCallback } from 'react';
 import { Animated, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { formatLongMinutes } from '@/components/duration-wheels';
 import { NeuCard, SecondaryRaisedButton } from '@/components/neumorphic';
 import { FontNames, Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
 import { useProtection } from '@/hooks/use-protection';
@@ -34,8 +35,13 @@ function cooldownLabels(minutes: number): { tag: string; text: string } {
   return { tag: `${hours}H ${mins}M`, text: `${hours}h ${mins}m` };
 }
 
-function buildMethods(cooldownMinutes: number, challengeLength: number): UnlockMethod[] {
+function buildMethods(
+  cooldownMinutes: number,
+  challengeLength: number,
+  offWindowMinutes: number
+): UnlockMethod[] {
   const cooldown = cooldownLabels(cooldownMinutes);
+  const offText = formatLongMinutes(offWindowMinutes);
   return [
     {
       key: 'code',
@@ -51,7 +57,7 @@ function buildMethods(cooldownMinutes: number, challengeLength: number): UnlockM
       title: 'Wait it out',
       tag: cooldown.tag,
       tagTone: 'neutral',
-      subtitle: `Protection stays on for ${cooldown.text}, then switches off for 10 minutes.`,
+      subtitle: `Protection stays on for ${cooldown.text}, then switches off for ${offText}.`,
       icon: 'clock-outline',
       href: '/unlock-timer',
     },
@@ -60,7 +66,7 @@ function buildMethods(cooldownMinutes: number, challengeLength: number): UnlockM
       title: 'Two-person face check',
       tag: 'INSTANT',
       tagTone: 'success',
-      subtitle: 'Two different people verify their faces. Protection is off for 30 minutes.',
+      subtitle: `Two different people verify their faces. Protection is off for ${offText}.`,
       icon: 'account-multiple-outline',
       href: '/unlock-face',
     },
@@ -138,7 +144,8 @@ export default function UnlockScreen() {
 
   const methods = buildMethods(
     snapshot?.configuredCooldownMinutes ?? 180,
-    snapshot?.configuredChallengeLength ?? 200
+    snapshot?.configuredChallengeLength ?? 200,
+    snapshot?.configuredOffWindowMinutes ?? 10
   );
 
   return (

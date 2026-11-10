@@ -7,6 +7,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { Circle } from 'react-native-svg';
 
 import { formatDuration, useCountdown } from '@/components/countdown';
+import { formatLongMinutes } from '@/components/duration-wheels';
 import {
   NeuCard,
   NeuWell,
@@ -36,7 +37,7 @@ import {
  * Person 1 is averaged over 3 frontal open-eye frames. Person 2 must first pass 3
  * consecutive frontal open-eye frames with a different tracking id and signature; only
  * then is a blink accepted, and the post-blink frame is checked again. Success calls
- * `completeFaceUnlock()`, which starts the 30-minute OFF window.
+ * `completeFaceUnlock()`, which starts the configured auto-restart OFF window.
  *
  * 100% on-device: frames are downscaled, measured and deleted; nothing is saved or sent.
  */
@@ -45,7 +46,6 @@ type PersonState = 'VERIFYING' | 'VERIFIED' | 'WAITING';
 
 const FRAME_INTERVAL_MS = 450;
 const HANDOVER_MS = 2_000;
-const FACE_OFF_WINDOW_MS = 30 * 60 * 1000;
 /** Weighted mean absolute signature difference below this is treated as the same person. */
 const SAME_FACE_THRESHOLD = 0.05;
 /** The native signature starts with this many scale-free geometry ratios. */
@@ -197,7 +197,7 @@ export default function FaceUnlockScreen() {
 
   const offWindowMs = snapshot?.unlock.offWindowActive
     ? snapshot.unlock.offWindowRemainingMs
-    : FACE_OFF_WINDOW_MS;
+    : (snapshot?.configuredOffWindowMinutes ?? 10) * 60_000;
   const autoLock = useCountdown(stage === 'both_verified' ? offWindowMs : 0);
 
   const setPhase = useCallback((next: Stage) => {
@@ -471,7 +471,9 @@ export default function FaceUnlockScreen() {
             </View>
             <Text style={styles.successTitle}>Two faces verified</Text>
             <Text style={styles.successBody}>
-              Protection is OFF for 30 minutes, then turns back on by itself.
+              {`Protection is OFF for ${formatLongMinutes(
+                Math.max(1, Math.round(offWindowMs / 60_000))
+              )}, then turns back on by itself.`}
             </Text>
 
             <NeuWell style={styles.reactivation}>

@@ -9,8 +9,8 @@ import android.os.SystemClock
  * Detection runs live in `HabitModule.analyzeFaceFrame` (offline ML Kit): the screen
  * samples silent camera frames, verifies a blink from Person 1, a short hand-over, then a
  * different face plus a blink from Person 2, and only then calls [complete]. The native
- * side keeps the session so the 30-minute OFF window can never be started without a live
- * check — JS can request it, but not force it.
+ * side keeps the session so the auto-restart OFF window can never be started without a
+ * live check — JS can request it, but not force it.
  *
  * Nothing leaves the phone: each frame is downscaled, measured and recycled, then deleted.
  *
@@ -40,9 +40,9 @@ object FaceUnlock {
   }
 
   /**
-   * Ends a verified check: protection is off for the fixed 30-minute window and the
-   * previous mode returns by itself afterwards. Refused without an active, unexpired
-   * session, so a stale or repeated call cannot unlock anything.
+   * Ends a verified check: protection is off for the user's configured auto-restart window
+   * and the previous mode returns by itself afterwards. Refused without an active,
+   * unexpired session, so a stale or repeated call cannot unlock anything.
    */
   @Synchronized
   fun complete(context: Context): Boolean {

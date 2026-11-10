@@ -5,6 +5,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { Circle } from 'react-native-svg';
 
 import { useCountdown } from '@/components/countdown';
+import { formatLongMinutes, formatShortMinutes } from '@/components/duration-wheels';
 import {
   NeuCard,
   NeuSwitch,
@@ -27,7 +28,6 @@ const ARC_RADIUS = 103;
 const ARC_CIRCUMFERENCE = 2 * Math.PI * ARC_RADIUS;
 
 const FAST_COOLDOWN_MS = 60_000;
-const OFF_WINDOW_MS = 10 * 60 * 1000;
 
 /** "5 hours 30 min" for body copy. */
 function formatLongDuration(minutes: number): string {
@@ -95,6 +95,11 @@ export default function UnlockTimerScreen() {
   const configuredMinutes = snapshot.configuredCooldownMinutes ?? 180;
   const cooldownText = formatLongDuration(configuredMinutes);
   const cooldownShort = formatShortDuration(configuredMinutes);
+  // The OFF window is the user's own auto-restart timer (1m .. 23h 59m).
+  const offWindowMinutes = snapshot.configuredOffWindowMinutes ?? 10;
+  const offWindowText = formatLongMinutes(offWindowMinutes);
+  const offWindowShort = formatShortMinutes(offWindowMinutes);
+  const offWindowFallbackMs = offWindowMinutes * 60_000;
   // A running cooldown keeps its own duration; otherwise the dial starts at the configured
   // wait. The debug switch always wins so the dial matches its "1 minute" labels.
   const cooldownTotalMs = fastCooldown
@@ -115,7 +120,7 @@ export default function UnlockTimerScreen() {
   const totalMs = offWindow
     ? unlock.offWindowTotalMs > 0
       ? unlock.offWindowTotalMs
-      : OFF_WINDOW_MS
+      : offWindowFallbackMs
     : cooldownTotalMs;
   const fraction =
     totalMs > 0 ? Math.min(1, Math.max(0, displayRemaining / totalMs)) : 0;
@@ -131,19 +136,19 @@ export default function UnlockTimerScreen() {
   const steps: PipelineStep[] = offWindow
     ? [
         { index: 1, caption: `Waited ${cooldownShort}`, status: 'done' },
-        { index: 2, caption: 'Off 10m window', status: 'active' },
+        { index: 2, caption: `Off ${offWindowShort} window`, status: 'active' },
         { index: 3, caption: 'Back on', status: 'todo' },
       ]
     : [
         { index: 1, caption: `Wait ${cooldownShort}`, status: 'active' },
-        { index: 2, caption: 'Off 10m window', status: 'todo' },
+        { index: 2, caption: `Off ${offWindowShort} window`, status: 'todo' },
         { index: 3, caption: 'Back on', status: 'todo' },
       ];
 
   const startTimer = () => {
     Alert.alert(
       'Start the cooldown?',
-      `Protection stays fully on for ${cooldownLabel}. When it ends, protection turns off and turns back on by itself about 10 minutes later. You can cancel the cooldown at any time.`,
+      `Protection stays fully on for ${cooldownLabel}. When it ends, protection turns off and turns back on by itself after ${offWindowText}. You can cancel the cooldown at any time.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -297,7 +302,7 @@ export default function UnlockTimerScreen() {
               <Text style={styles.statusBody}>
                 {offWindow
                   ? 'It turns back on by itself when the timer ends.'
-                  : 'Protection stays fully on until the timer ends. Then it switches off for 10 minutes and turns back on by itself.'}
+                  : `Protection stays fully on until the timer ends. Then it switches off for ${offWindowText} and turns back on by itself.`}
               </Text>
             </View>
           </NeuCard>

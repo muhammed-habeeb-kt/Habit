@@ -121,7 +121,7 @@ class HabitModule : Module() {
       analyzeFaceFrame(imagePath)
     }
 
-    // Called once both people have blinked and differ; starts the 30-minute OFF window.
+    // Called once both people have blinked and differ; starts the configured OFF window.
     AsyncFunction("completeFaceUnlock") {
       FaceUnlock.complete(appCtx)
     }
@@ -149,11 +149,18 @@ class HabitModule : Module() {
       HabitStore.snapshot(appCtx)
     }
 
-    // Saves the challenge length and wait-it-out duration chosen before Strict or
-    // Aggressive is turned on. The state machine clamps them and only refuses a lower
-    // while protection is actually running.
-    AsyncFunction("configureProtection") { challengeLength: Int, cooldownMinutes: Int ->
-      HabitUnlock.configureProtection(appCtx, challengeLength, cooldownMinutes)
+    // Saves the challenge length, wait-it-out duration and auto-restart OFF window chosen
+    // before Strict or Aggressive is turned on. The state machine clamps them and only
+    // refuses a weaker setup while protection is actually running.
+    AsyncFunction("configureProtection") { challengeLength: Int, cooldownMinutes: Int, offWindowMinutes: Int ->
+      HabitUnlock.configureProtection(appCtx, challengeLength, cooldownMinutes, offWindowMinutes)
+      HabitStore.snapshot(appCtx)
+    }
+
+    // Normal-mode "turn off with auto-restart": protection stops now and comes back by
+    // itself after the chosen 1..1439 minutes.
+    AsyncFunction("startTimedOffWindow") { minutes: Int ->
+      HabitUnlock.startTimedOffWindow(appCtx, minutes)
       HabitStore.snapshot(appCtx)
     }
 

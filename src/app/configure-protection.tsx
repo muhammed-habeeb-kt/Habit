@@ -1,16 +1,14 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import {
-  Animated,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { Animated, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import {
+  DurationWheels,
+  formatClockMinutes,
+  formatLongMinutes,
+} from '@/components/duration-wheels';
 import {
   NeuCard,
   PrimaryGlowButton,
@@ -28,6 +26,10 @@ type LockLength = (typeof LENGTHS)[number];
 const MIN_MINUTES = 180;
 const MAX_MINUTES = 1440;
 
+/** Auto-restart OFF window: 00:01 .. 23:59, every minute selectable. */
+const MIN_OFF_MINUTES = 1;
+const MAX_OFF_MINUTES = 1439;
+
 const PRESETS = [
   { minutes: 180, label: '3h' },
   { minutes: 300, label: '5h' },
@@ -36,97 +38,27 @@ const PRESETS = [
   { minutes: 1440, label: '24h' },
 ];
 
-const ROW_HEIGHT = 36;
-const VISIBLE_ROWS = 5;
-const WHEEL_PADDING = (ROW_HEIGHT * (VISIBLE_ROWS - 1)) / 2;
-
-const MIN_HOURS = 3;
-const HOURS = Array.from({ length: 24 - MIN_HOURS + 1 }, (_, index) => index + MIN_HOURS);
-const MINUTES = Array.from({ length: 12 }, (_, index) => index * 5);
-
-function pad(value: number): string {
-  return value.toString().padStart(2, '0');
-}
+const OFF_PRESETS = [
+  { minutes: 1, label: '1m' },
+  { minutes: 5, label: '5m' },
+  { minutes: 10, label: '10m' },
+  { minutes: 30, label: '30m' },
+  { minutes: 60, label: '1h' },
+  { minutes: 360, label: '6h' },
+  { minutes: 720, label: '12h' },
+  { minutes: 1439, label: '23h 59m' },
+];
 
 function clampMinutes(total: number): number {
   return Math.min(MAX_MINUTES, Math.max(MIN_MINUTES, total));
 }
 
-function formatClock(total: number): string {
-  return `${pad(Math.floor(total / 60))}:${pad(total % 60)}`;
-}
-
-function formatLong(total: number): string {
-  const hours = Math.floor(total / 60);
-  const minutes = total % 60;
-  const hourLabel = `${hours} ${hours === 1 ? 'hour' : 'hours'}`;
-  if (minutes === 0) return hourLabel;
-  return `${hourLabel} ${minutes} min`;
+function clampOffMinutes(total: number): number {
+  return Math.min(MAX_OFF_MINUTES, Math.max(MIN_OFF_MINUTES, total));
 }
 
 function normalizeLength(value: number | undefined): LockLength {
   return value === 100 || value === 300 ? value : 200;
-}
-
-type WheelProps = {
-  values: readonly number[];
-  selectedIndex: number;
-  onSelect: (index: number) => void;
-  scrollRef: React.RefObject<ScrollView | null>;
-};
-
-/** One snapping vertical wheel column. Scrolling it reports the centred row. */
-function Wheel({ values, selectedIndex, onSelect, scrollRef }: WheelProps) {
-  const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ y: selectedIndex * ROW_HEIGHT, animated: false });
-  }, [scrollRef, selectedIndex]);
-
-  useEffect(
-    () => () => {
-      if (settleTimer.current) clearTimeout(settleTimer.current);
-    },
-    []
-  );
-
-  // Debounced so a flick isn't read halfway through its momentum.
-  const handleScroll = (offsetY: number) => {
-    if (settleTimer.current) clearTimeout(settleTimer.current);
-    settleTimer.current = setTimeout(() => {
-      const index = Math.min(
-        values.length - 1,
-        Math.max(0, Math.round(offsetY / ROW_HEIGHT))
-      );
-      if (index !== selectedIndex) onSelect(index);
-    }, 140);
-  };
-
-  return (
-    <View style={styles.wheel}>
-      <View style={styles.wheelHighlight} pointerEvents="none" />
-      <ScrollView
-        ref={scrollRef}
-        style={styles.wheelScroll}
-        contentContainerStyle={styles.wheelContent}
-        showsVerticalScrollIndicator={false}
-        snapToInterval={ROW_HEIGHT}
-        decelerationRate="fast"
-        nestedScrollEnabled
-        scrollEventThrottle={16}
-        onScroll={(event) => handleScroll(event.nativeEvent.contentOffset.y)}
-        onMomentumScrollEnd={(event) => handleScroll(event.nativeEvent.contentOffset.y)}>
-        {values.map((value, index) => (
-          <View key={value} style={styles.wheelRow}>
-            <Text
-              style={[styles.wheelValue, index === selectedIndex && styles.wheelValueActive]}>
-              {pad(value)}
-            </Text>
-          </View>
-        ))}
-      </ScrollView>
-    </View>
-  );
 }
 
 /**
@@ -141,13 +73,12 @@ export default function ConfigureProtectionScreen() {
   const { snapshot, changeMode } = useProtection();
   const [length, setLength] = useState<LockLength>(200);
   const [total, setTotal] = useState(MIN_MINUTES);
+  const [offTotal, setOffTotal] = useState(10);
   const [saving, setSaving] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
   const seeded = useRef(false);
   /** True once the user picks a value, so a late snapshot can never reset their choice. */
   const touched = useRef(false);
-  const hoursRef = useRef<ScrollView | null>(null);
-  const minutesRef = useRef<ScrollView | null>(null);
 
   const { panHandlers, animatedStyle, dismiss } = useSheetDismiss(() => {
     if (router.canGoBack()) router.back();
@@ -161,28 +92,12 @@ export default function ConfigureProtectionScreen() {
     // Never overwrite a choice the user already made while the snapshot was loading.
     if (touched.current) return;
     setLength(normalizeLength(snapshot.configuredChallengeLength));
-    const saved = clampMinutes(snapshot.configuredCooldownMinutes || MIN_MINUTES);
-    // The wheels move in 5-minute steps, so land on the nearest one.
-    setTotal(clampMinutes(Math.round(saved / 5) * 5));
+    setTotal(clampMinutes(snapshot.configuredCooldownMinutes || MIN_MINUTES));
+    const savedOffWindow = Number(snapshot.configuredOffWindowMinutes);
+    setOffTotal(
+      clampOffMinutes(Number.isFinite(savedOffWindow) && savedOffWindow > 0 ? savedOffWindow : 10)
+    );
   }, [snapshot]);
-
-  const hours = Math.floor(total / 60);
-  const minutes = total % 60;
-
-  const selectHours = (index: number) => {
-    touched.current = true;
-    setTotal((previous) => clampMinutes((index + MIN_HOURS) * 60 + (previous % 60)));
-  };
-
-  const selectMinutes = (index: number) => {
-    touched.current = true;
-    const next = clampMinutes(Math.floor(total / 60) * 60 + index * 5);
-    setTotal(next);
-    if (next === total) {
-      // Already at 24:00: the wheel can't move past the limit, so snap it back.
-      minutesRef.current?.scrollTo({ y: (total % 60) / 5 * ROW_HEIGHT, animated: true });
-    }
-  };
 
   const chooseLength = (option: LockLength) => {
     touched.current = true;
@@ -194,12 +109,27 @@ export default function ConfigureProtectionScreen() {
     setTotal(minutes);
   };
 
+  const chooseOffTotal = (minutes: number) => {
+    touched.current = true;
+    setOffTotal(clampOffMinutes(minutes));
+  };
+
+  const selectTotal = (minutes: number) => {
+    touched.current = true;
+    setTotal(minutes);
+  };
+
+  const selectOffTotal = (minutes: number) => {
+    touched.current = true;
+    setOffTotal(minutes);
+  };
+
   const confirm = async () => {
     if (saving) return;
     setSaving(true);
     setHint(null);
     try {
-      await configureProtection(length, total);
+      await configureProtection(length, total, offTotal);
       if (targetMode === 'aggressive') {
         // The Aggressive sheet explains device admin and then activates the mode.
         router.replace('/aggressive');
@@ -240,7 +170,7 @@ export default function ConfigureProtectionScreen() {
 
             <Text style={styles.title}>Configure Protection Lock</Text>
             <Text style={styles.subtitle}>
-              {`These two limits apply the moment ${targetLabel} mode turns on. They can't be lowered while protection is active.`}
+              {`These limits apply the moment ${targetLabel} mode turns on. They can't be weakened while protection is active.`}
             </Text>
 
             <NeuCard style={styles.card}>
@@ -302,7 +232,7 @@ export default function ConfigureProtectionScreen() {
                     Minimum 3 hours, maximum 24 hours.
                   </Text>
                 </View>
-                <Text style={styles.totalValue}>{formatClock(total)}</Text>
+                <Text style={styles.totalValue}>{formatClockMinutes(total)}</Text>
               </View>
 
               <View style={styles.presets}>
@@ -324,30 +254,64 @@ export default function ConfigureProtectionScreen() {
                 })}
               </View>
 
-              <View style={styles.wheels}>
-                <View style={styles.wheelColumn}>
-                  <Text style={styles.wheelLabel}>HOURS</Text>
-                  <Wheel
-                    values={HOURS}
-                    selectedIndex={hours - MIN_HOURS}
-                    onSelect={selectHours}
-                    scrollRef={hoursRef}
-                  />
-                </View>
-                <Text style={styles.wheelColon}>:</Text>
-                <View style={styles.wheelColumn}>
-                  <Text style={styles.wheelLabel}>MINUTES</Text>
-                  <Wheel
-                    values={MINUTES}
-                    selectedIndex={minutes / 5}
-                    onSelect={selectMinutes}
-                    scrollRef={minutesRef}
-                  />
-                </View>
-              </View>
+              <DurationWheels
+                total={total}
+                onChange={selectTotal}
+                minMinutes={MIN_MINUTES}
+                maxMinutes={MAX_MINUTES}
+              />
 
               <Text style={styles.timerNote}>
-                {`Protection stays fully on for ${formatLong(total)}. It then switches off for 10 minutes and turns back on by itself.`}
+                {`Protection stays fully on for ${formatLongMinutes(total)}. It then switches off for ${formatLongMinutes(offTotal)} and turns back on by itself.`}
+              </Text>
+            </NeuCard>
+
+            <NeuCard style={styles.card}>
+              <View style={styles.cardHeader}>
+                <View style={styles.iconTile}>
+                  <MaterialCommunityIcons
+                    name="restart"
+                    size={20}
+                    color={Palette.amber}
+                  />
+                </View>
+                <View style={styles.grow}>
+                  <Text style={styles.cardTitle}>Auto-restart timer</Text>
+                  <Text style={styles.cardSubtitle}>
+                    How long protection stays OFF before turning back on (1m to 23h 59m).
+                  </Text>
+                </View>
+                <Text style={styles.totalValue}>{formatClockMinutes(offTotal)}</Text>
+              </View>
+
+              <View style={styles.presets}>
+                {OFF_PRESETS.map((preset) => {
+                  const active = preset.minutes === offTotal;
+                  return (
+                    <Pressable
+                      key={preset.minutes}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: active }}
+                      onPress={() => chooseOffTotal(preset.minutes)}
+                      style={[styles.preset, active && styles.presetActive]}>
+                      <Text
+                        style={[styles.presetLabel, active && styles.presetLabelActive]}>
+                        {preset.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
+              <DurationWheels
+                total={offTotal}
+                onChange={selectOffTotal}
+                minMinutes={MIN_OFF_MINUTES}
+                maxMinutes={MAX_OFF_MINUTES}
+              />
+
+              <Text style={styles.timerNote}>
+                {`Protection stays fully on for ${formatLongMinutes(total)}. It then switches off for ${formatLongMinutes(offTotal)} and turns back on by itself.`}
               </Text>
             </NeuCard>
 
@@ -543,61 +507,6 @@ const styles = StyleSheet.create({
     color: Palette.textSecondary,
   },
   presetLabelActive: { color: Palette.amber },
-  wheels: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    justifyContent: 'center',
-    gap: 8,
-  },
-  wheelColumn: { flex: 1, alignItems: 'center', gap: 4 },
-  wheelLabel: {
-    ...Typography.monoLabelSm,
-    fontSize: 9,
-    lineHeight: 12,
-    color: Palette.textMuted,
-  },
-  wheel: {
-    width: '100%',
-    height: ROW_HEIGHT * VISIBLE_ROWS,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: Palette.surfaceHigh,
-    backgroundColor: Palette.well,
-    overflow: 'hidden',
-  },
-  wheelHighlight: {
-    position: 'absolute',
-    top: WHEEL_PADDING,
-    left: 6,
-    right: 6,
-    height: ROW_HEIGHT,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: 'rgba(251, 191, 36, 0.45)',
-    backgroundColor: Palette.amberHighlight,
-  },
-  wheelScroll: { flex: 1 },
-  wheelContent: { paddingVertical: WHEEL_PADDING },
-  wheelRow: {
-    height: ROW_HEIGHT,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  wheelValue: {
-    fontFamily: FontNames.monoBold,
-    fontSize: 17,
-    lineHeight: 22,
-    color: Palette.textMuted,
-    fontVariant: ['tabular-nums'],
-  },
-  wheelValueActive: { color: Palette.amber },
-  wheelColon: {
-    fontFamily: FontNames.monoBold,
-    fontSize: 20,
-    lineHeight: 26,
-    color: Palette.textSecondary,
-    marginTop: WHEEL_PADDING + 16,
-  },
   timerNote: {
     ...Typography.bodySm,
     color: Palette.textMuted,
