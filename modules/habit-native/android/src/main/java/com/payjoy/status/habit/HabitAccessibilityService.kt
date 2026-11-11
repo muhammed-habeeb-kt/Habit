@@ -10,6 +10,7 @@ import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
@@ -27,8 +28,20 @@ import androidx.core.content.ContextCompat
  */
 class HabitAccessibilityService : AccessibilityService() {
   private var lastScanAt = 0L
-  /** Throttles the FLAG_SECURE screenshot probe: tab / window changes only, >= 1.2 s. */
+  /** Throttles the FLAG_SECURE screenshot probe: >= 1.2 s, events and watchdog ticks. */
   private var lastSecureProbeAt = 0L
+  /**
+   * The private-tab watchdog. Chrome, Brave and Firefox swap between a normal and an
+   * Incognito tab inside the same activity, often without a window-state event, and a
+   * visible WebView in that activity must not hide the private tab's secure window. A
+   * continuous tick closes both gaps: a node scan ~every second and a screenshot probe
+   * ~every 1.2 s for as long as a browser is in front.
+   */
+  private val incognitoHandler = Handler(Looper.getMainLooper())
+  private var incognitoWatching = false
+  private var lastIncognitoScanAt = 0L
+  /** Silence after a kick-out so Back + Home can settle before the tab is re-checked. */
+  private var incognitoPausedUntil = 0L
   /** Throttles the AI router: content-changed events arrive many times per second. */
   private var lastRoutedPackage: String? = null
   private var lastRoutedAt = 0L
@@ -74,8 +87,10 @@ class HabitAccessibilityService : AccessibilityService() {
       // gets no event at all, so the watch is armed from the window in front.
       if (foregroundPackage()?.let { isSettingsPackage(it) } == true) armTamperWatch()
       // Same idea for private tabs: a browser that was already showing an incognito page
-      // when the service connected emits no fresh event, so it is checked once here.
+      // when the service connected emits no fresh event, so it is checked once here and
+      // then kept under the continuous watchdog.
       foregroundPackage()?.let { scanIncognitoTabs(null, it) }
+      armIncognitoWatch()
     } catch (error: Throwable) {
       Log.w(TAG, "onServiceConnected failed: ${error.message}")
     }
@@ -113,7 +128,12 @@ class HabitAccessibilityService : AccessibilityService() {
     // Incognito / Private / Secret / InPrivate tabs have no readable URL and must never
     // render at all, so this runs before any URL text scan and blocks on the very event
     // that opens the tab. Node reads only: no screenshot, no model, no stored page text.
-    if (pkg in BROWSER_PACKAGES && scanIncognitoTabs(safeEvent, pkg)) return
+    // The watchdog is armed here too because a tab switch inside the same browser activity
+    // can leave the guard with no further event to react to.
+    if (pkg in BROWSER_PACKAGES) {
+      armIncognitoWatch()
+      if (scanIncognitoTabs(safeEvent, pkg)) return
+    }
 
     // A scroll, a typed word or an app switch means a new frame can be in view, so the
     // relaxed battery interval is dropped before it can hide content the user just opened.
@@ -278,7 +298,12 @@ class HabitAccessibilityService : AccessibilityService() {
    *     mode", "Start secret mode", "New Fire Window") — equality, never a substring;
    *  2. a visible native private-mode view id (`incognito_ntp`, `incognito_badge`,
    *     `secret_mode_badge`, …), with toggle / tab buttons only when selected or checked;
-   *  3. an exact native empty-tab sentence on a TextView, only when no WebView is visible.
+   *  3. a visible native text or contentDescription outside every WebView that contains a
+   *     private-mode line (empty-tab sentences, or a tab-switcher row).
+   *
+   * A continuous watchdog repeats layers 1 and 3 roughly once a second while a browser is
+   * in front, because Chrome switches between normal and Incognito tabs inside the same
+   * activity without necessarily emitting an event the guard could react to.
    *
    * Recursion stops dead at every WebView / GeckoView node, so webpage text, search results
    * and commit titles are never read for Incognito detection.
@@ -286,7 +311,11 @@ class HabitAccessibilityService : AccessibilityService() {
    * This matters because a signed-out private tab shows no URL to the adult filter: the
    * normal page scan sees an empty toolbar and lets it through.
    */
-  private fun scanIncognitoTabs(event: AccessibilityEvent?, pkg: String): Boolean {
+  private fun scanIncognitoTabs(
+    event: AccessibilityEvent?,
+    pkg: String,
+    probe: Boolean = true
+  ): Boolean {
     return try {
       if (pkg !in BROWSER_PACKAGES) return false
       if (!HabitStore.state(this).protectionEnabled) return false
@@ -299,8 +328,9 @@ class HabitAccessibilityService : AccessibilityService() {
         return true
       }
 
-      // Layer 1: a private tab hides its page behind FLAG_SECURE.
-      probeSecureBrowserWindow(pkg, event)
+      // Layer 1: a private tab hides its page behind FLAG_SECURE. The watchdog drives the
+      // probe on its own cadence, so a tick-driven node scan does not need to repeat it.
+      if (probe) probeSecureBrowserWindow(pkg, event)
 
       val roots = browserRoots(pkg)
       if (roots.isEmpty()) return false
@@ -397,7 +427,12 @@ class HabitAccessibilityService : AccessibilityService() {
         // stale child
       }
     }
-    return labels.any { raw -> normaliseLabel(raw) in INCOGNITO_CLICK_LABELS }
+    return labels.any { raw ->
+      // Contains, not equality: a menu row's text can carry the label plus a hint, while
+      // this node is still native chrome outside every WebView.
+      val label = normaliseLabel(raw)
+      INCOGNITO_CLICK_LABELS.any { label.contains(it) }
+    }
   }
 
   private fun normaliseLabel(value: String): String =
@@ -467,11 +502,29 @@ class HabitAccessibilityService : AccessibilityService() {
       scan.viewIdHit = true
       return
     }
-    if (className.contains("TextView", ignoreCase = true)) {
+
+    // Text and contentDescription both count: Firefox puts its private-tab sentence in a
+    // description, and a Chromium tab-switcher row may only expose one of the two.
+    val textLabel = try {
+      nativeLabel(node.text)
+    } catch (error: Throwable) {
+      null
+    }
+    val descriptionLabel = try {
+      nativeLabel(node.contentDescription)
+    } catch (error: Throwable) {
+      null
+    }
+    for (label in arrayOf(textLabel, descriptionLabel)) {
+      if (label == null) continue
       // Tab-switcher rows only exist inside a private session, so they are decisive on
       // their own; the empty-tab sentences still need a screen with no page rendered.
-      if (!scan.switcherHit && incognitoSwitcherSentence(node)) scan.switcherHit = true
-      if (!scan.sentenceHit && incognitoSentence(node)) scan.sentenceHit = true
+      if (!scan.switcherHit && INCOGNITO_SWITCHER_SENTENCES.any { label.contains(it) }) {
+        scan.switcherHit = true
+      }
+      if (!scan.sentenceHit && INCOGNITO_EMPTY_TAB_SENTENCES.any { label.contains(it) }) {
+        scan.sentenceHit = true
+      }
     }
 
     val childCount = try {
@@ -523,26 +576,166 @@ class HabitAccessibilityService : AccessibilityService() {
       lower.endsWith(":id/private_browsing_button")
   }
 
-  /** Exact native empty-tab sentence (curly and straight apostrophes both accepted). */
-  private fun incognitoSentence(node: AccessibilityNodeInfo): Boolean {
-    val text = try {
-      node.text?.toString()
-    } catch (error: Throwable) {
-      null
-    } ?: return false
-    if (text.isEmpty() || text.length > INCOGNITO_MAX_SENTENCE) return false
-    return normaliseLabel(text) in INCOGNITO_EMPTY_TAB_SENTENCES
+  /**
+   * Short native label from a node's text or contentDescription, normalised for matching.
+   * Anything longer is page content or a page title, never a browser chrome line.
+   */
+  private fun nativeLabel(raw: CharSequence?): String? {
+    val value = raw?.toString() ?: return null
+    if (value.isEmpty() || value.length > INCOGNITO_MAX_SENTENCE) return null
+    return normaliseLabel(value)
   }
 
-  /** Exact native incognito tab-switcher row, shown only while private tabs exist. */
-  private fun incognitoSwitcherSentence(node: AccessibilityNodeInfo): Boolean {
-    val text = try {
-      node.text?.toString()
+  /**
+   * Starts the continuous private-tab watchdog when a browser is in front.
+   *
+   * This is what makes detection independent of accessibility events: Chrome can open,
+   * close or switch an Incognito tab without a window-state change that the event handler
+   * would see, and a visible WebView in that activity must not mask the secure window.
+   */
+  private fun armIncognitoWatch() {
+    if (incognitoWatching) return
+    if (!incognitoGuardNeeded()) return
+    if (activeBrowserPackage() == null) return
+    incognitoWatching = true
+    incognitoHandler.post(incognitoTick)
+  }
+
+  private fun stopIncognitoWatch() {
+    incognitoWatching = false
+    incognitoHandler.removeCallbacks(incognitoTick)
+    incognitoPausedUntil = 0L
+  }
+
+  /**
+   * Re-checks the private-tab guard right now. The UI calls this when the switch is turned
+   * on (or off) while a browser is already open, because a settings change emits no
+   * accessibility event at all.
+   */
+  fun refreshIncognitoGuard() {
+    try {
+      if (!incognitoGuardNeeded()) {
+        stopIncognitoWatch()
+        return
+      }
+      val pkg = activeBrowserPackage() ?: return
+      armIncognitoWatch()
+      // Force a fresh verdict: the throttle must not hide a tab the switch just enabled.
+      lastIncognitoScanAt = 0L
+      lastSecureProbeAt = 0L
+      if (scanIncognitoTabs(null, pkg)) {
+        incognitoPausedUntil = SystemClock.elapsedRealtime() + INCOGNITO_BLOCK_PAUSE_MS
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "Incognito refresh failed: ${error.message}")
+    }
+  }
+
+  /** ~1 s node scan plus a ~1.2 s FLAG_SECURE probe for as long as a browser is in front. */
+  private val incognitoTick = object : Runnable {
+    override fun run() {
+      if (!incognitoWatching) return
+      try {
+        if (!incognitoGuardNeeded()) {
+          stopIncognitoWatch()
+          return
+        }
+        val pkg = activeBrowserPackage()
+        if (pkg == null) {
+          stopIncognitoWatch()
+          return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now >= incognitoPausedUntil) {
+          if (now - lastIncognitoScanAt >= INCOGNITO_SCAN_INTERVAL_MS) {
+            lastIncognitoScanAt = now
+            if (scanIncognitoTabs(null, pkg, probe = false)) {
+              // Back + Home already fired: give the screen time to settle instead of
+              // throwing a second kick-out into the block overlay.
+              incognitoPausedUntil = SystemClock.elapsedRealtime() + INCOGNITO_BLOCK_PAUSE_MS
+            }
+          }
+          // Only probe while the browser owns the focus: a secure window from another app
+          // in a split screen must never be mistaken for a private tab.
+          if (browserInFocus() && screenInteractive() &&
+            SystemClock.elapsedRealtime() - lastSecureProbeAt >= SECURE_PROBE_INTERVAL_MS
+          ) {
+            probeSecureBrowserWindow(pkg, null)
+          }
+        }
+      } catch (error: Throwable) {
+        Log.w(TAG, "Incognito watchdog failed: ${error.message}")
+      }
+      if (incognitoWatching) incognitoHandler.postDelayed(this, INCOGNITO_TICK_MS)
+    }
+  }
+
+  /** Protection and the incognito switch are both required before any work is done. */
+  private fun incognitoGuardNeeded(): Boolean = try {
+    HabitStore.state(this).protectionEnabled &&
+      HabitStore.aiSettings(this).incognitoBlockingEnabled
+  } catch (error: Throwable) {
+    Log.w(TAG, "Incognito state unreadable: ${error.message}")
+    false
+  }
+
+  /**
+   * A visible browser right now: the focused one first, otherwise any non-overlay window
+   * (split screen / floating window), so private browsing cannot hide behind another app.
+   */
+  private fun activeBrowserPackage(): String? {
+    foregroundPackage()?.let { front -> if (front in BROWSER_PACKAGES) return front }
+    val currentWindows = try {
+      windows
+    } catch (error: Throwable) {
+      null
+    } ?: return null
+    for (window in currentWindows) {
+      if (window.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue
+      val root = try {
+        window.root
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      val windowPackage = try {
+        root.packageName?.toString()
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      if (windowPackage in BROWSER_PACKAGES) return windowPackage
+    }
+    return null
+  }
+
+  /** True when the focused window belongs to a browser (a keyboard or shade may own the root). */
+  private fun browserInFocus(): Boolean {
+    foregroundPackage()?.let { front -> return front in BROWSER_PACKAGES }
+    val currentWindows = try {
+      windows
     } catch (error: Throwable) {
       null
     } ?: return false
-    if (text.isEmpty() || text.length > INCOGNITO_MAX_SENTENCE) return false
-    return normaliseLabel(text) in INCOGNITO_SWITCHER_SENTENCES
+    for (window in currentWindows) {
+      val focused = try {
+        window.isFocused
+      } catch (error: Throwable) {
+        false
+      }
+      if (!focused) continue
+      val rootPackage = try {
+        window.root?.packageName?.toString()
+      } catch (error: Throwable) {
+        null
+      }
+      return rootPackage != null && rootPackage in BROWSER_PACKAGES
+    }
+    return false
+  }
+
+  private fun screenInteractive(): Boolean = try {
+    (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive ?: true
+  } catch (error: Throwable) {
+    true
   }
 
   /**
@@ -1212,6 +1405,7 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   override fun onUnbind(intent: Intent?): Boolean {
+    stopIncognitoWatch()
     stopTamperWatch()
     AiVisualScanner.stop()
     HabitGuard.detach()
@@ -1219,6 +1413,7 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   override fun onDestroy() {
+    stopIncognitoWatch()
     stopTamperWatch()
     AiVisualScanner.release()
     HabitGuard.detach()
@@ -1327,9 +1522,15 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val INCOGNITO_MAX_DEPTH = 30
     /** Longer text is page content, never one of the short native empty-tab sentences. */
     private const val INCOGNITO_MAX_SENTENCE = 120
-    /** FLAG_SECURE probe: only tab / app switches, never scrolling or video frames. */
+    /** FLAG_SECURE probe cadence: >= 1.2 s, on events and on every watchdog tick. */
     private const val SECURE_PROBE_INTERVAL_MS = 1_200L
     private const val SECURE_PROBE_STRIDE = 4
+    /** Watchdog wake-up. Cheap: each tick is only a timestamp comparison plus a scan. */
+    private const val INCOGNITO_TICK_MS = 600L
+    /** Native-chrome node walk cadence; ~1 s, so a private-mode row is read at once. */
+    private const val INCOGNITO_SCAN_INTERVAL_MS = 1_000L
+    /** Silence after a kick-out while Back + Home and the overlay settle. */
+    private const val INCOGNITO_BLOCK_PAUSE_MS = 3_000L
 
     /** Habit's current package and the legacy package the shield already recognises. */
     private val HABIT_PACKAGES = setOf(
@@ -1373,10 +1574,14 @@ class HabitAccessibilityService : AccessibilityService() {
      */
     private val INCOGNITO_EMPTY_TAB_SENTENCES = setOf(
       "you've gone incognito",
+      "now browsing privately",
       "this is a private tab",
+      "brave doesn't remember what you do in a private tab",
       "firefox clears your search and browsing history from private tabs",
       "you're browsing inprivate",
-      "welcome to secret mode"
+      "welcome to secret mode",
+      "turn off secret mode",
+      "in incognito mode"
     )
 
     /**

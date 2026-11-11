@@ -193,8 +193,14 @@ class HabitModule : Module() {
 
     // Incognito / Private tab blocking. Turning it on is instant; turning it off while
     // Strict/Aggressive is locked is refused by HabitStore and the UI opens Unlock.
+    //
+    // The write is committed synchronously, the running service re-checks the window in
+    // front straight away (a settings change fires no accessibility event), and the caller
+    // gets the updated snapshot so the switch can never keep a value that was not stored.
     AsyncFunction("setIncognitoBlockingEnabled") { enabled: Boolean ->
-      HabitStore.setIncognitoBlockingEnabled(appCtx, enabled).toMap()
+      HabitStore.setIncognitoBlockingEnabled(appCtx, enabled)
+      HabitGuard.refreshIncognitoGuard()
+      HabitStore.snapshot(appCtx)
     }
 
     // Live diagnostics for the Apps tab card: what the scanner is doing right now, which

@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-11 (Part 20: incognito detection only from native browser chrome, never WebView text)_
+_Last updated: 2026-11-11 (Part 22: continuous private-tab watchdog + switch sync)_
 
 ## Product
 
@@ -554,6 +554,13 @@ longer trusts `rootInActiveWindow` alone.
   `use-theme.ts`) and confirmed the single-Kotlin-package layout: `expo prebuild --clean`
   generates exactly one service / receiver entry per class, all under
   `com.payjoy.status.habit`, and never copies `design-screens/` or `scripts/` into the APK.
+- [x] Part 22 — Incognito blocking actually runs while the user browses: a continuous
+  browser watchdog (600 ms wake-up, node walk ~1 s, `FLAG_SECURE` probe ~1.2 s) keeps the
+  guard alive when Chrome swaps tabs inside the same activity without an event; every
+  visible native node's text **and** contentDescription outside any `WebView` is matched,
+  the extra private-mode lines (`now browsing privately`, `turn on/off secret mode`, …) are
+  included, and `setIncognitoBlockingEnabled` commits, re-checks the window in front at
+  once and returns the updated snapshot so the switch always shows the stored value.
 
 ## Build & run (Termux, no PC)
 
@@ -629,6 +636,11 @@ accessibility XML are unchanged, so the service does not need to be toggled off 
 Part 20 changes Kotlin only (strict native-chrome incognito detection), so the development
 APK must be rebuilt. The manifest and the accessibility XML are unchanged since Part 12, so
 the service does not need to be toggled off and on.
+
+Part 22 changes Kotlin and the JS bridge only (the continuous private-tab watchdog and the
+snapshot reply from `setIncognitoBlockingEnabled`), so the development APK must be rebuilt.
+The manifest and the accessibility XML are unchanged, so the service does not need to be
+toggled off and on.
 
 Part 19 changes Kotlin only (AI thresholds, crops, foreground latch and the live
 notification line) and hardens the CI model check, so the development APK must be rebuilt.

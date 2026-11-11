@@ -101,6 +101,16 @@ object HabitGuard {
     showIncognitoBlock(total)
   }
 
+  /**
+   * Re-checks the private-tab guard in the running service. Called when the Incognito
+   * switch changes, because a browser may already be open in a private tab and no
+   * accessibility event will arrive for a settings change.
+   */
+  fun refreshIncognitoGuard() {
+    val currentService = service ?: return
+    runOnMain { currentService.refreshIncognitoGuard() }
+  }
+
   /** Back + Home first, then the ``INCOGNITO BLOCKED`` screen over whatever is left. */
   private fun showIncognitoBlock(attemptsToday: Int) {
     AiVisualScanner.onOverlayShown()

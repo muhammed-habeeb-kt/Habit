@@ -57,6 +57,11 @@ export type HabitSnapshot = {
   deviceAdminActive: boolean;
   unlock: UnlockInfo;
   /**
+   * The AI settings map from the same snapshot. Every native snapshot carries it, and the
+   * incognito switch uses it to read back the value that was just committed.
+   */
+  ai?: AiSettings;
+  /**
    * Watched browser websites straight from the native store, so the Browser list can always
    * be rebuilt from disk instead of from JS memory.
    */
@@ -233,7 +238,7 @@ type HabitNativeModule = {
   setAiWatchedApps(packages: string[]): Promise<AiSettings>;
   setAiMonitoredDomains(domains: string[]): Promise<AiSettings>;
   setAiBlockAlerts(enabled: boolean): Promise<AiSettings>;
-  setIncognitoBlockingEnabled(enabled: boolean): Promise<AiSettings>;
+  setIncognitoBlockingEnabled(enabled: boolean): Promise<HabitSnapshot | AiSettings>;
   getAiScannerStatus(): Promise<AiScannerStatus>;
   testAiModels(): Promise<AiModelSelfTest>;
   canDrawOverlays(): Promise<boolean>;
@@ -541,6 +546,15 @@ export function publishLists(domains: string[], keywords: string[]): Promise<boo
   );
 }
 
+/** True for the plain settings map an older APK returns from the incognito switch. */
+function isAiSettings(value: unknown): value is AiSettings {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as AiSettings).aiSensitivity === 'string'
+  );
+}
+
 function normalizeAiSettings(value: AiSettings | null | undefined): AiSettings {
   if (!value) return DEFAULT_AI_SETTINGS;
   const sensitivity: AiSensitivity =
@@ -618,9 +632,13 @@ export async function setIncognitoBlockingEnabled(enabled: boolean): Promise<AiS
     return fallbackAiSettings;
   }
   try {
-    fallbackAiSettings = normalizeAiSettings(
-      await native.setIncognitoBlockingEnabled(enabled)
-    );
+    const result = await native.setIncognitoBlockingEnabled(enabled);
+    // Current APKs answer with the updated snapshot (`ai` holds the value that was just
+    // committed); older ones answer with the settings map. Both keep the switch honest.
+    let settings: AiSettings = fallbackAiSettings;
+    if ('ai' in result && result.ai) settings = result.ai;
+    else if (isAiSettings(result)) settings = result;
+    fallbackAiSettings = normalizeAiSettings(settings);
   } catch {
     fallbackAiSettings = { ...fallbackAiSettings, incognitoBlockingEnabled: enabled };
   }
