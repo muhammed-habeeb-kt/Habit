@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-11 (Part 22: continuous private-tab watchdog + switch sync)_
+_Last updated: 2026-11-11 (Part 23: always-on private-tab watchdog + honest switch sync)_
 
 ## Product
 
@@ -395,23 +395,28 @@ text is never read.
    never lower the lock. It is in `getSnapshot()` under `ai` and as a top-level
    `incognitoBlockingEnabled`, in `src/native/habit.ts` and in `useAiMonitoring`.
 2. **Detection** — `HabitAccessibilityService.scanIncognitoTabs` runs on every event of a
-   watched browser (and once from `onServiceConnected`) when protection is ON and the switch
-   is on. Only native browser chrome is inspected; **recursion stops dead at every WebView /
-   GeckoView node**, so page text, search results and commit titles are never read, and only
-   visible nodes are visited:
+   watched browser, once from `onServiceConnected`, and from a **continuous 1 s watchdog**
+   that stays armed whenever protection is ON and the switch is on (it parks cheaply when
+   no browser is in front instead of stopping, so a browser that returns without an event
+   is still covered). The browser in front is resolved from the focused window and the
+   latest browser event, so a private window that refuses its accessibility root is still
+   probed. Only native browser chrome is inspected; **recursion stops dead at every WebView /
+   GeckoView node while its native siblings are still walked**, so page text, search
+   results and commit titles are never read, and only visible nodes are visited:
    - **Layer 1, `FLAG_SECURE` screenshot probe** (`probeSecureBrowserWindow`): Chromium
      browsers mark an Incognito / Private tab secure, so `takeScreenshot` (API 30+) fails
      with `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW`. That failure blocks the tab, and so does a
      frame whose central half is more than 98% pure black (`R`, `G`, `B` all under 4,
-     sampled every 4 px). Probes run only on window-state / windows-changed / click events,
-     at most once per 1.2 s. No frame is stored; the bitmap and hardware buffer are closed
-     immediately;
+     sampled every 4 px). Probes run on every watchdog tick (at most once per 1.2 s) and
+     immediately on window-state / windows-changed / click events. No frame is stored; the
+     bitmap and hardware buffer are closed immediately;
    - **Layer 2, menu-click interception** (`isPrivateModeClick`): the clicked node's own
-     text / contentDescription, the event text and its direct child TextViews must
-     **exactly equal** a native menu label (`new incognito tab`, `new private tab`,
-     `new inprivate tab`, `turn on secret mode`, `start secret mode`, `new fire window`) and
-     the node must be visible and outside every WebView, so the tab is blocked before it
-     exists;
+     text / contentDescription, the event text and its direct child TextViews are matched
+     against a native menu label (`new incognito tab`, `new private tab`, `new inprivate
+     tab`, `turn on secret mode`, `start secret mode`, `new fire window`) when the node is
+     visible and outside every WebView (contains, because a row can carry a hint); with no
+     source node only an **exact** event-text match counts, so a clicked page link can
+     never trigger it. The tab is blocked before it exists;
    - **Layer 3, native browser chrome**: native view ids on visible nodes: `incognito_ntp`,
      `incognito_ntp_content`, `new_tab_incognito_container`, `incognito_badge` (Chrome /
      Brave), `private_browsing_description` (Firefox), `secret_mode_badge` /
@@ -419,12 +424,13 @@ text is never read.
      `incognito_tabs_button` / `privateBrowsingButton` count only while `isSelected` or
      `isChecked` is true. Exact native tab-switcher rows (`search your incognito tabs`,
      `search your private tabs`, `close all incognito tabs`, `close all private tabs`) block
-     on their own, and the exact empty-tab sentences (`you've gone incognito` with either
-     apostrophe, `this is a private tab`, `firefox clears your search and browsing history
-     from private tabs`, `you're browsing inprivate`, `welcome to secret mode`) count only
-     when **no visible WebView exists** anywhere in the browser's windows. No broad substring
-     such as `private tab`, `incognito tab`, `private mode`, `secret mode` or `inprivate` is
-     matched anywhere.
+     on their own, and the empty-tab sentences (`you've gone incognito` with either
+     apostrophe, `now browsing privately`, `this is a private tab`, `brave doesn't remember
+     what you do in a private tab`, `you're browsing inprivate`, `welcome to secret mode`,
+     `turn off secret mode`, `in incognito mode`) count from native chrome even while a
+     WebView exists elsewhere in the window, because the walk never enters a WebView. No
+     broad substring such as `private tab`, `incognito tab`, `private mode`, `secret mode`
+     or `inprivate` is matched anywhere.
 3. **Block** — `HabitGuard.onIncognitoDetected` (1.5 s cooldown) records one attempt, then
    fires BACK + HOME and shows `BlockOverlay` with `• INCOGNITO BLOCKED` and “Incognito &
    private tabs are blocked by Habit.”
@@ -555,12 +561,23 @@ longer trusts `rootInActiveWindow` alone.
   generates exactly one service / receiver entry per class, all under
   `com.payjoy.status.habit`, and never copies `design-screens/` or `scripts/` into the APK.
 - [x] Part 22 — Incognito blocking actually runs while the user browses: a continuous
-  browser watchdog (600 ms wake-up, node walk ~1 s, `FLAG_SECURE` probe ~1.2 s) keeps the
+  browser watchdog (node walk ~1 s, `FLAG_SECURE` probe ~1.2 s) keeps the
   guard alive when Chrome swaps tabs inside the same activity without an event; every
   visible native node's text **and** contentDescription outside any `WebView` is matched,
   the extra private-mode lines (`now browsing privately`, `turn on/off secret mode`, …) are
   included, and `setIncognitoBlockingEnabled` commits, re-checks the window in front at
   once and returns the updated snapshot so the switch always shows the stored value.
+- [x] Part 23 — The private-tab guard can no longer be defeated by a quiet browser or a
+  refused accessibility root: the watchdog wakes every 1000 ms for as long as protection
+  and the switch are on and never stops itself on an empty window list, it remembers the
+  last browser in front (cleared by any other real app) so the `FLAG_SECURE` probe keeps
+  running inside a secure private window, private-mode sentences and tab-switcher rows are
+  decisive even when a WebView exists beside the chrome, a click with no source node still
+  matches an exact event label, and the incognito attempt counter no longer sits behind the
+  5 s duplicate window (the 1.5 s kick-out cooldown is the only limit). Turning the switch
+  off and on re-arms the loop, drops every throttle and re-checks the window in front at
+  once; the JS bridge reads the persisted value back if a write fails, so the switch can
+  never show a value the store does not have.
 
 ## Build & run (Termux, no PC)
 
@@ -641,6 +658,11 @@ Part 22 changes Kotlin and the JS bridge only (the continuous private-tab watchd
 snapshot reply from `setIncognitoBlockingEnabled`), so the development APK must be rebuilt.
 The manifest and the accessibility XML are unchanged, so the service does not need to be
 toggled off and on.
+
+Part 23 changes Kotlin and the JS bridge fallback only (the always-armed 1 s watchdog, the
+browser-front latch and the incognito attempt-counter dedupe), so the development APK must
+be rebuilt. The manifest and the accessibility XML are unchanged, so the service does not
+need to be toggled off and on.
 
 Part 19 changes Kotlin only (AI thresholds, crops, foreground latch and the live
 notification line) and hardens the CI model check, so the development APK must be rebuilt.

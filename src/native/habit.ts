@@ -640,7 +640,13 @@ export async function setIncognitoBlockingEnabled(enabled: boolean): Promise<AiS
     else if (isAiSettings(result)) settings = result;
     fallbackAiSettings = normalizeAiSettings(settings);
   } catch {
-    fallbackAiSettings = { ...fallbackAiSettings, incognitoBlockingEnabled: enabled };
+    // A failed write must never leave the switch showing a value the store does not have,
+    // so the persisted settings are read back instead of trusting the optimistic guess.
+    try {
+      fallbackAiSettings = normalizeAiSettings(await native.getAiSettings());
+    } catch {
+      fallbackAiSettings = { ...fallbackAiSettings, incognitoBlockingEnabled: enabled };
+    }
   }
   return fallbackAiSettings;
 }

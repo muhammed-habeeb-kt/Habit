@@ -898,13 +898,19 @@ object HabitStore {
 
   /**
    * Counts one block event. Returns the new daily total, or null when the same
-   * domain/keyword was already counted within the last 5 seconds.
+   * domain/keyword was already counted within the last 5 seconds. `dedupeWindowMs = 0`
+   * turns that window off for a caller that already has a cooldown of its own (the
+   * incognito guard), so reopening a private tab is never swallowed as a duplicate.
    */
-  fun registerAttempt(context: Context, matchKey: String): Int? {
+  fun registerAttempt(
+    context: Context,
+    matchKey: String,
+    dedupeWindowMs: Long = DEDUPE_WINDOW_MS
+  ): Int? {
     synchronized(lock) {
       val now = SystemClock.elapsedRealtime()
       val last = dedupeAt[matchKey]
-      if (last != null && now - last < DEDUPE_WINDOW_MS) return null
+      if (last != null && dedupeWindowMs > 0L && now - last < dedupeWindowMs) return null
       dedupeAt[matchKey] = now
       if (dedupeAt.size > 64) {
         dedupeAt.entries.removeAll { now - it.value > DEDUPE_WINDOW_MS * 4 }

@@ -97,7 +97,10 @@ object HabitGuard {
     if (now - lastIncognitoAt < INCOGNITO_COOLDOWN_MS) return
     lastIncognitoAt = now
 
-    val total = HabitStore.registerAttempt(context, INCOGNITO_ATTEMPT_KEY) ?: return
+    // The 1.5 s kick-out cooldown above is the only rate limit here: the normal 5 s attempt
+    // dedupe would silently swallow a private tab reopened a few seconds later.
+    val total = HabitStore.registerAttempt(context, INCOGNITO_ATTEMPT_KEY, dedupeWindowMs = 0L)
+      ?: return
     showIncognitoBlock(total)
   }
 
