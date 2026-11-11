@@ -323,7 +323,7 @@ export default function HomeScreen() {
           </View>
           <View style={styles.grow}>
             <View style={styles.streakTitleRow}>
-              <Text style={styles.cardTitle}>Clean streak</Text>
+              <Text style={[styles.cardTitle, styles.streakTitle]}>Clean streak</Text>
               <View style={styles.streakMilestone}>
                 <Text style={styles.streakMilestoneText}>
                   {streakMilestone(currentStreakMs, enabled)}
@@ -564,6 +564,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
     flexWrap: 'wrap',
+  },
+  streakTitle: {
+    fontFamily: FontNames.interBold,
   },
   streakMilestone: {
     borderRadius: Radii.pill,
