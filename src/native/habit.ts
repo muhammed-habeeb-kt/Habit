@@ -33,6 +33,13 @@ export type HabitSnapshot = {
   /** Auto-restart OFF window in minutes, always 1..1439 (1m .. 23h 59m). */
   configuredOffWindowMinutes: number;
   attemptsToday: number;
+  /**
+   * Clean streak: monotonic time with protection actively ON. Counted natively, never from
+   * the phone's wall clock, and reset by any block or by protection turning OFF.
+   */
+  currentStreakMs: number;
+  /** All-time highest `currentStreakMs`, kept across resets and reboots. */
+  bestStreakMs: number;
   /** Live Android check: the accessibility service is enabled right now. */
   accessibilityEnabled: boolean;
   /** Live Android check: notifications are allowed, including POST_NOTIFICATIONS. */
@@ -308,6 +315,8 @@ const FALLBACK_SNAPSHOT: HabitSnapshot = {
   configuredCooldownMinutes: 180,
   configuredOffWindowMinutes: 10,
   attemptsToday: 0,
+  currentStreakMs: 0,
+  bestStreakMs: 0,
   accessibilityEnabled: false,
   notificationsGranted: false,
   batteryOptimizationIgnored: false,

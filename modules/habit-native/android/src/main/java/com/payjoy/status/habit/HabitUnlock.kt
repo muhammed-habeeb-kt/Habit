@@ -216,6 +216,8 @@ object HabitUnlock {
       HabitForegroundService.start(context)
       HabitWatchdog.schedule(context)
       HabitWatchdog.check(context, force = true)
+      // Protection is ON from this instant: start the clean-streak clock here.
+      HabitStore.pauseStreak(context)
       return next
     }
 
@@ -235,6 +237,7 @@ object HabitUnlock {
       HabitAlarms.cancel(context)
       HabitForegroundService.start(context)
       HabitWatchdog.schedule(context)
+      HabitStore.pauseStreak(context)
       return next
     }
 
@@ -264,6 +267,8 @@ object HabitUnlock {
     if (!enabled) {
       if (state.mode != ProtectionState.MODE_NORMAL) return state
       val next = HabitStore.updateState(context) { it.copy(protectionEnabled = false) }
+      // Protection is OFF: the streak ends here (the best record is kept).
+      HabitStore.resetStreak(context)
       HabitForegroundService.stop(context)
       return next
     }
@@ -284,6 +289,8 @@ object HabitUnlock {
       HabitStore.writeUnlockState(context, HabitStore.unlockState(context).copy(offWindow = null))
       HabitAlarms.cancel(context)
     }
+    // The streak clock restarts now, never from an anchor left over from before the window.
+    HabitStore.pauseStreak(context)
     HabitForegroundService.start(context)
     HabitWatchdog.schedule(context)
     return next
@@ -354,6 +361,8 @@ object HabitUnlock {
       HabitStore.updateState(context) {
         it.copy(mode = ProtectionState.MODE_NORMAL, protectionEnabled = false)
       }
+      // The cooldown finished into an OFF window: that is a broken streak.
+      HabitStore.resetStreak(context)
       // Aggressive is temporarily normal now, so stop its warnings and backstop alarm.
       HabitWatchdog.schedule(context)
       HabitWatchdog.check(context, force = true)
@@ -380,6 +389,8 @@ object HabitUnlock {
           mode = if (it.mode == ProtectionState.MODE_NORMAL) restoreMode else it.mode
         )
       }
+      // A fresh streak starts with the restored protection, not with the OFF window.
+      HabitStore.pauseStreak(context)
       HabitNotifier.notifyProtectionRestored(context)
       HabitForegroundService.start(context)
       HabitStore.ensureFilter(context)
@@ -403,7 +414,17 @@ object HabitUnlock {
       lastPersistElapsed = 0L
       if (changed) HabitAlarms.cancel(context)
     }
-    return HabitStore.state(context)
+
+    // Clean streak: only monotonic time with protection actually ON counts. The anchor is
+    // moved on every ON/OFF transition, so an OFF window or a reboot can never be credited
+    // later, and changing the phone clock changes nothing here at all.
+    val live = HabitStore.state(context)
+    if (live.protectionEnabled && unlock.offWindow == null) {
+      HabitStore.accrueStreak(context)
+    } else {
+      HabitStore.pauseStreak(context)
+    }
+    return live
   }
 
   private fun advanceWindows(unlock: UnlockState, now: Long, bootCount: Int): UnlockState {
@@ -566,6 +587,7 @@ object HabitUnlock {
     val next = HabitStore.updateState(context) {
       it.copy(mode = ProtectionState.MODE_NORMAL, protectionEnabled = false)
     }
+    HabitStore.resetStreak(context)
     HabitAlarms.cancel(context)
     HabitAlarms.cancelWatchdog(context)
     HabitNotifier.clearProtectionWarnings(context)
@@ -615,6 +637,8 @@ object HabitUnlock {
     val next = HabitStore.updateState(context) {
       it.copy(mode = ProtectionState.MODE_NORMAL, protectionEnabled = false)
     }
+    // Any unlock that opens an OFF window breaks the streak; the best record survives.
+    HabitStore.resetStreak(context)
     HabitAlarms.cancel(context)
     reschedule(context)
     // The service keeps the OFF window ticking even if the app is swiped away.

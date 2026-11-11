@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-08 (Part 13: 100 ms Settings tamper shield in every protected mode)_
+_Last updated: 2026-11-11 (Part 16: monotonic Clean streak counter on Home)_
 
 ## Product
 
@@ -475,6 +475,11 @@ longer trusts `rootInActiveWindow` alone.
   detection for Incognito / Private / Secret / InPrivate tabs in every watched browser
   (node reads only), BACK + HOME plus a `• INCOGNITO BLOCKED` block screen, the AI tab’s
   incognito card, `?tab=browser` routing, and the new AI / BROWSER sections on Settings.
+- [x] Part 16 — Clean streak counter: `StreakState` in encrypted storage (`currentMs`,
+  `bestMs`, monotonic anchor + boot session), accrued by `HabitUnlock.tick` only while
+  protection is ON with no OFF window, reset by every counted block and by protection
+  turning OFF, exposed as `currentStreakMs` / `bestStreakMs` in `getSnapshot()`, and shown
+  as the amber “Clean streak” Home card with milestone pill and best record.
 
 ## Build & run (Termux, no PC)
 
@@ -533,6 +538,10 @@ the service does not need to be toggled off and on.
 Part 15 changes Kotlin only (multi-window routing, the window-bounds crop plan and the
 monotonic clock), so the development APK must be rebuilt. The manifest and the accessibility
 XML are unchanged, so the service does not need to be toggled off and on.
+
+Part 16 adds the native streak engine and its two snapshot fields, so the development APK
+must be rebuilt before Home can show a real streak (an older APK reports 0). The manifest and
+the accessibility XML are unchanged, so the service does not need to be toggled off and on.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,

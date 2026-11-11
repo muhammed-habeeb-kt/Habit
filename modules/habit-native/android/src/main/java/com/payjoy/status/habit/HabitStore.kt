@@ -66,6 +66,25 @@ data class UnlockState(
 )
 
 /**
+ * The clean streak, measured on Habit's own monotonic clock.
+ *
+ * [anchorElapsedMs] is the `SystemClock.elapsedRealtime()` instant the running total was
+ * last brought up to date, so the 1 s ticker only ever adds a small delta. No wall-clock
+ * value is stored anywhere: changing Date / Time / Time Zone in Android Settings can
+ * neither inflate nor reset a streak, and a different boot session re-anchors instead of
+ * crediting time the phone was off.
+ */
+data class StreakState(
+  /** Clean time accumulated while protection was actually ON. */
+  val currentMs: Long = 0L,
+  /** All-time highest [currentMs] the user ever reached. */
+  val bestMs: Long = 0L,
+  val anchorElapsedMs: Long = 0L,
+  /** `Settings.Global.BOOT_COUNT` for [anchorElapsedMs]; -1 when unreadable. */
+  val anchorBootCount: Int = -1
+)
+
+/**
  * Habit's own day counter anchor.
  *
  * The day key is derived from monotonic hours since the anchor while the phone stays on, so
@@ -191,7 +210,10 @@ object HabitStore {
   private const val KEY_TAMPER_GRACE = "tamper_grace"
   /** Habit's own 24-hour day anchor for attempts / failure counters. */
   private const val KEY_DAY_CLOCK = "day_clock"
+  private const val KEY_STREAK = "streak"
   private const val DAY_MS = 24L * 60L * 60L * 1000L
+  /** The streak is committed at this cadence; the running total stays in memory between. */
+  private const val STREAK_PERSIST_INTERVAL_MS = 5_000L
 
   /**
    * Plain-JSON mirror of the watched browser websites in `filesDir`. It is written on every
@@ -228,7 +250,10 @@ object HabitStore {
   @Volatile private var cachedAi: AiSettings? = null
   @Volatile private var cachedRestrictedVisited: Boolean? = null
   @Volatile private var cachedDayClock: DayClock? = null
+  @Volatile private var cachedStreak: StreakState? = null
   @Volatile private var cachedBootCount: Int? = null
+  /** Last monotonic instant the streak was written to encrypted storage. */
+  @Volatile private var lastStreakPersistElapsed = 0L
   /** Monotonic end of the tamper stand-down, with the boot session it belongs to. */
   @Volatile private var tamperGraceUntilElapsed: Long? = null
   @Volatile private var tamperGraceBootCount: Int? = null
@@ -891,6 +916,8 @@ object HabitStore {
       json.put(day, count)
       trimAttempts(json)
       write(context, KEY_ATTEMPTS, json.toString())
+      // Strict accountability: any block ends the clean streak, even a tamper-shield one.
+      resetStreak(context)
       onAttemptsChanged?.invoke(count)
       return count
     }
@@ -900,6 +927,125 @@ object HabitStore {
     val days = json.keys().asSequence().toList().sorted()
     if (days.size <= MAX_DAYS) return
     days.dropLast(MAX_DAYS).forEach { json.remove(it) }
+  }
+
+  // endregion
+
+  // region clean streak
+
+  fun streak(context: Context): StreakState {
+    cachedStreak?.let { return it }
+    val raw = read(context, KEY_STREAK)
+    val parsed = try {
+      if (raw.isNullOrBlank()) {
+        StreakState()
+      } else {
+        val json = JSONObject(raw)
+        StreakState(
+          currentMs = json.optLong("currentMs", 0L).coerceAtLeast(0L),
+          bestMs = json.optLong("bestMs", 0L).coerceAtLeast(0L),
+          anchorElapsedMs = json.optLong("anchorElapsedMs", 0L).coerceAtLeast(0L),
+          anchorBootCount = json.optInt("anchorBootCount", -1)
+        )
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "Streak unreadable, starting clean")
+      StreakState()
+    }
+    cachedStreak = parsed
+    return parsed
+  }
+
+  private fun saveStreak(context: Context, streak: StreakState, sync: Boolean) {
+    val json = JSONObject()
+      .put("currentMs", streak.currentMs)
+      .put("bestMs", streak.bestMs)
+      .put("anchorElapsedMs", streak.anchorElapsedMs)
+      .put("anchorBootCount", streak.anchorBootCount)
+    write(context, KEY_STREAK, json.toString(), sync = sync)
+    cachedStreak = streak
+    lastStreakPersistElapsed = streak.anchorElapsedMs
+  }
+
+  /**
+   * The monotonic delay since the last anchor, or 0 when it cannot be trusted: no anchor
+   * yet, a different boot session, or an elapsed value that went backwards. Time that
+   * happened across a reboot is never credited to a streak.
+   */
+  private fun creditedDelta(streak: StreakState, nowElapsed: Long, boot: Int): Long {
+    if (streak.anchorElapsedMs <= 0L || nowElapsed < streak.anchorElapsedMs) return 0L
+    val sameBoot = boot == -1 || streak.anchorBootCount == -1 || boot == streak.anchorBootCount
+    if (!sameBoot) return 0L
+    return nowElapsed - streak.anchorElapsedMs
+  }
+
+  /**
+   * Adds the monotonic delta since the last tick to the running streak while protection is
+   * ON. Called once a second by `HabitUnlock.tick`; the total is kept in memory and only
+   * committed every [STREAK_PERSIST_INTERVAL_MS], so the encrypted store is never hammered.
+   */
+  fun accrueStreak(context: Context): StreakState {
+    synchronized(lock) {
+      val now = SystemClock.elapsedRealtime()
+      val boot = bootCount(context)
+      val previous = streak(context)
+      val credited = creditedDelta(previous, now, boot)
+      val current = previous.currentMs + credited
+      val next = StreakState(
+        currentMs = current,
+        bestMs = maxOf(previous.bestMs, current),
+        anchorElapsedMs = now,
+        anchorBootCount = boot
+      )
+      cachedStreak = next
+      val due = lastStreakPersistElapsed == 0L || now < lastStreakPersistElapsed ||
+        now - lastStreakPersistElapsed >= STREAK_PERSIST_INTERVAL_MS
+      if (due) saveStreak(context, next, sync = false)
+      return next
+    }
+  }
+
+  /**
+   * Ends the running streak (a block event, or protection turning OFF) and keeps the best
+   * record. Committed synchronously, so a kill straight after a block cannot resurrect a
+   * streak that has already been broken.
+   */
+  fun resetStreak(context: Context): StreakState {
+    synchronized(lock) {
+      val previous = streak(context)
+      val now = SystemClock.elapsedRealtime()
+      val boot = bootCount(context)
+      if (previous.currentMs == 0L) {
+        // Nothing to lose: just move the anchor so no OFF time is credited later.
+        val idle = previous.copy(anchorElapsedMs = now, anchorBootCount = boot)
+        cachedStreak = idle
+        return idle
+      }
+      val next = StreakState(0L, previous.bestMs, now, boot)
+      saveStreak(context, next, sync = true)
+      return next
+    }
+  }
+
+  /**
+   * Stops the streak clock without resetting it: protection is OFF or inside an OFF
+   * window. The anchor moves to now, so that time can never be credited to a later ON
+   * period, and the running total stays where it is (a reset already happened on the way
+   * out of protection).
+   */
+  fun pauseStreak(context: Context): StreakState {
+    synchronized(lock) {
+      val previous = streak(context)
+      val now = SystemClock.elapsedRealtime()
+      val next = previous.copy(anchorElapsedMs = now, anchorBootCount = bootCount(context))
+      cachedStreak = next
+      if (previous.currentMs > 0L) {
+        val due = lastStreakPersistElapsed == 0L || now < lastStreakPersistElapsed ||
+          now - lastStreakPersistElapsed >= STREAK_PERSIST_INTERVAL_MS
+        if (due) saveStreak(context, next, sync = false)
+      }
+      return next
+    }
   }
 
   // endregion
@@ -966,6 +1112,7 @@ object HabitStore {
    */
   fun snapshot(context: Context): Map<String, Any?> {
     val state = state(context)
+    val streakState = streak(context)
     val accessibilityEnabled = HabitAccessibilityService.isEnabled(context)
     return mapOf(
       "protectionEnabled" to state.protectionEnabled,
@@ -975,6 +1122,9 @@ object HabitStore {
       "configuredCooldownMinutes" to state.configuredCooldownMinutes,
       "configuredOffWindowMinutes" to state.configuredOffWindowMinutes,
       "attemptsToday" to attemptsToday(context),
+      // Clean streak, straight from the monotonic engine; never derived by JS.
+      "currentStreakMs" to streakState.currentMs,
+      "bestStreakMs" to streakState.bestMs,
       "accessibilityEnabled" to accessibilityEnabled,
       "notificationsGranted" to notificationsGranted(context),
       "batteryOptimizationIgnored" to batteryOptimizationIgnored(context),

@@ -55,6 +55,35 @@ const MODE_DESCRIPTIONS: Record<ProtectionMode, string> = {
   aggressive: 'Aggressive adds device-admin uninstall protection.',
 };
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** How often Home re-reads the native snapshot so the live streak keeps counting. */
+const STREAK_REFRESH_MS = 5_000;
+
+/**
+ * Streak display: `12d 06h`, `04h 18m`, or `42m` under an hour. The value is always whole
+ * minutes, so the card never shows a jumpy seconds counter.
+ */
+function formatStreak(ms: number): string {
+  const totalMinutes = Math.max(0, Math.floor(ms / 60_000));
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  const pad = (value: number) => String(value).padStart(2, '0');
+  if (days >= 1) return `${days}d ${pad(hours)}h`;
+  if (hours >= 1) return `${pad(hours)}h ${pad(minutes)}m`;
+  return `${minutes}m`;
+}
+
+/** `• PAUSED` while protection is off, then the highest milestone reached. */
+function streakMilestone(ms: number, protectionOn: boolean): string {
+  if (!protectionOn) return '• PAUSED';
+  if (ms >= 30 * DAY_MS) return '• 30 DAYS';
+  if (ms >= 7 * DAY_MS) return '• 1 WEEK';
+  if (ms >= 3 * DAY_MS) return '• 3 DAY STREAK';
+  if (ms >= DAY_MS) return '• 1+ DAY';
+  return '• ACTIVE';
+}
+
 const BROWSERS = [
   { name: 'Chrome', packages: ['com.android.chrome'] },
   { name: 'Firefox', packages: ['org.mozilla.firefox'] },
@@ -63,7 +92,7 @@ const BROWSERS = [
 ];
 
 export default function HomeScreen() {
-  const { snapshot, busy, toggle, setSnapshot } = useProtection();
+  const { snapshot, busy, toggle, setSnapshot, refresh } = useProtection();
   // The AI summary mirrors the native settings, so the counts match the AI tab exactly.
   const {
     settings: aiSettings,
@@ -93,6 +122,18 @@ export default function HomeScreen() {
   const cooldownRemaining = useCountdown(snapshot?.unlock.cooldownRemainingMs ?? 0);
   const offWindowRemaining = useCountdown(snapshot?.unlock.offWindowRemainingMs ?? 0);
 
+  // Native counts the streak every second while protection runs; this keeps the card in
+  // step without a per-second bridge call. An OFF window pauses it, so no polling then.
+  const streakRunning =
+    snapshot?.protectionEnabled === true && snapshot.unlock.offWindowActive === false;
+  useEffect(() => {
+    if (!streakRunning) return;
+    const interval = setInterval(() => {
+      void refresh();
+    }, STREAK_REFRESH_MS);
+    return () => clearInterval(interval);
+  }, [streakRunning, refresh]);
+
   useEffect(() => {
     if (!snapshot || askedForSetup.current) return;
     if (!snapshot.onboardingCompleted) {
@@ -110,6 +151,9 @@ export default function HomeScreen() {
   }
 
   const enabled = snapshot.protectionEnabled;
+  // `?? 0` keeps an older development APK (no streak in its native snapshot) harmless.
+  const currentStreakMs = Math.max(0, snapshot.currentStreakMs ?? 0);
+  const bestStreakMs = Math.max(0, snapshot.bestStreakMs ?? 0);
   const locked = snapshot.mode !== 'normal' && enabled;
   const offWindowActive = snapshot.unlock.offWindowActive && !enabled;
   const cooldownActive = snapshot.unlock.cooldownActive;
@@ -270,6 +314,28 @@ export default function HomeScreen() {
       <NeuCard style={styles.modeCard}>
         <NeuSegmented options={MODE_OPTIONS} value={snapshot.mode} onChange={handleMode} />
         <Text style={styles.modeHint}>{MODE_DESCRIPTIONS[snapshot.mode]}</Text>
+      </NeuCard>
+
+      <NeuCard style={styles.streakCard}>
+        <View style={styles.streakRow}>
+          <View style={styles.streakIconTile}>
+            <MaterialCommunityIcons name="fire" size={22} color={Palette.amber} />
+          </View>
+          <View style={styles.grow}>
+            <View style={styles.streakTitleRow}>
+              <Text style={styles.cardTitle}>Clean streak</Text>
+              <View style={styles.streakMilestone}>
+                <Text style={styles.streakMilestoneText}>
+                  {streakMilestone(currentStreakMs, enabled)}
+                </Text>
+              </View>
+            </View>
+            <Text style={styles.cardSubtitle}>
+              {`Best record: ${formatStreak(bestStreakMs)} • Resets on block or unlock`}
+            </Text>
+          </View>
+          <Text style={styles.streakValue}>{formatStreak(currentStreakMs)}</Text>
+        </View>
       </NeuCard>
 
       <NeuCard style={styles.metricCard}>
@@ -474,6 +540,48 @@ const styles = StyleSheet.create({
   modeHint: {
     ...Typography.bodyMd,
     color: Palette.textSecondary,
+  },
+  streakCard: {
+    paddingVertical: 18,
+  },
+  streakRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.gutter,
+  },
+  /** Raised amber tile with the flame; the halo is what makes it glow. */
+  streakIconTile: {
+    width: Radii.tileSize,
+    height: Radii.tileSize,
+    borderRadius: Radii.tile,
+    backgroundColor: Palette.amberHighlight,
+    boxShadow: `${Shadows.raisedSmall}, ${Shadows.amberHalo}`,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  streakTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flexWrap: 'wrap',
+  },
+  streakMilestone: {
+    borderRadius: Radii.pill,
+    backgroundColor: Palette.amberHighlight,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  streakMilestoneText: {
+    ...Typography.monoLabelSm,
+    color: Palette.amber,
+  },
+  streakValue: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 26,
+    lineHeight: 32,
+    letterSpacing: -0.5,
+    color: Palette.amber,
+    flexShrink: 0,
   },
   metricCard: {
     flexDirection: 'row',
