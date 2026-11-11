@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
@@ -12,9 +13,11 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import androidx.core.content.ContextCompat
 
 /**
  * Watches browser windows and blocks adult pages.
@@ -24,6 +27,8 @@ import android.view.accessibility.AccessibilityWindowInfo
  */
 class HabitAccessibilityService : AccessibilityService() {
   private var lastScanAt = 0L
+  /** Throttles the FLAG_SECURE screenshot probe: tab / window changes only, >= 1.2 s. */
+  private var lastSecureProbeAt = 0L
   /** Throttles the AI router: content-changed events arrive many times per second. */
   private var lastRoutedPackage: String? = null
   private var lastRoutedAt = 0L
@@ -294,6 +299,9 @@ class HabitAccessibilityService : AccessibilityService() {
         return true
       }
 
+      // Layer 1: a private tab hides its page behind FLAG_SECURE.
+      probeSecureBrowserWindow(pkg, event)
+
       val roots = browserRoots(pkg)
       if (roots.isEmpty()) return false
 
@@ -303,7 +311,9 @@ class HabitAccessibilityService : AccessibilityService() {
       }
       // A private view id is decisive on its own. The empty-tab sentences are only
       // trustworthy when the browser is not rendering a page at all.
-      if (scan.viewIdHit || (!scan.hasVisibleWebView && scan.sentenceHit)) {
+      if (scan.viewIdHit || scan.switcherHit ||
+        (!scan.hasVisibleWebView && scan.sentenceHit)
+      ) {
         blockPrivateTab()
         return true
       }
@@ -323,6 +333,7 @@ class HabitAccessibilityService : AccessibilityService() {
   private class PrivateTabScan {
     var hasVisibleWebView = false
     var viewIdHit = false
+    var switcherHit = false
     var sentenceHit = false
   }
 
@@ -345,7 +356,7 @@ class HabitAccessibilityService : AccessibilityService() {
     if (!visible) return false
     if (insideWebView(node)) return false
 
-    val labels = ArrayList<String>(3)
+    val labels = ArrayList<String>(6)
     try {
       node.text?.toString()?.let { labels.add(it) }
     } catch (error: Throwable) {
@@ -360,6 +371,31 @@ class HabitAccessibilityService : AccessibilityService() {
       event.text?.forEach { value -> if (!value.isNullOrEmpty()) labels.add(value.toString()) }
     } catch (error: Throwable) {
       // stale event
+    }
+    // A menu row is often a clickable container whose own text is empty while a child
+    // TextView carries the visible label, so the direct children are read too. They are
+    // native chrome rows (this node is outside every WebView) and still need an exact match.
+    val childCount = try {
+      node.childCount
+    } catch (error: Throwable) {
+      0
+    }
+    for (index in 0 until childCount) {
+      val child = try {
+        node.getChild(index)
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      try {
+        child.text?.toString()?.let { labels.add(it) }
+      } catch (error: Throwable) {
+        // stale child
+      }
+      try {
+        child.contentDescription?.toString()?.let { labels.add(it) }
+      } catch (error: Throwable) {
+        // stale child
+      }
     }
     return labels.any { raw -> normaliseLabel(raw) in INCOGNITO_CLICK_LABELS }
   }
@@ -431,10 +467,11 @@ class HabitAccessibilityService : AccessibilityService() {
       scan.viewIdHit = true
       return
     }
-    if (!scan.sentenceHit && className.contains("TextView", ignoreCase = true) &&
-      incognitoSentence(node)
-    ) {
-      scan.sentenceHit = true
+    if (className.contains("TextView", ignoreCase = true)) {
+      // Tab-switcher rows only exist inside a private session, so they are decisive on
+      // their own; the empty-tab sentences still need a screen with no page rendered.
+      if (!scan.switcherHit && incognitoSwitcherSentence(node)) scan.switcherHit = true
+      if (!scan.sentenceHit && incognitoSentence(node)) scan.sentenceHit = true
     }
 
     val childCount = try {
@@ -495,6 +532,109 @@ class HabitAccessibilityService : AccessibilityService() {
     } ?: return false
     if (text.isEmpty() || text.length > INCOGNITO_MAX_SENTENCE) return false
     return normaliseLabel(text) in INCOGNITO_EMPTY_TAB_SENTENCES
+  }
+
+  /** Exact native incognito tab-switcher row, shown only while private tabs exist. */
+  private fun incognitoSwitcherSentence(node: AccessibilityNodeInfo): Boolean {
+    val text = try {
+      node.text?.toString()
+    } catch (error: Throwable) {
+      null
+    } ?: return false
+    if (text.isEmpty() || text.length > INCOGNITO_MAX_SENTENCE) return false
+    return normaliseLabel(text) in INCOGNITO_SWITCHER_SENTENCES
+  }
+
+  /**
+   * Layer 1 of the private-tab guard: a FLAG_SECURE window cannot be screenshotted.
+   *
+   * Chrome, Brave and the other Chromium browsers mark an Incognito / Private tab secure, so
+   * `takeScreenshot` fails with `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW` instead of returning a
+   * frame. A browser whose central viewport is almost entirely pure black (a secure window
+   * that was blanked to black rather than refused) is treated the same way. Only tab and
+   * window changes trigger the probe, at most once every 1.2 s, so normal scrolling costs
+   * nothing.
+   */
+  private fun probeSecureBrowserWindow(pkg: String, event: AccessibilityEvent?) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+    if (pkg !in BROWSER_PACKAGES) return
+    val type = event?.eventType
+    if (type != null && type !in SECURE_PROBE_EVENTS) return
+    val now = SystemClock.elapsedRealtime()
+    if (now - lastSecureProbeAt < SECURE_PROBE_INTERVAL_MS) return
+    lastSecureProbeAt = now
+
+    try {
+      takeScreenshot(
+        Display.DEFAULT_DISPLAY,
+        ContextCompat.getMainExecutor(this),
+        object : TakeScreenshotCallback {
+          override fun onSuccess(screenshot: ScreenshotResult) {
+            var bitmap: Bitmap? = null
+            try {
+              bitmap = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
+                ?.copy(Bitmap.Config.ARGB_8888, false)
+              val black = bitmap?.let { centralViewportIsBlack(it) } == true
+              if (black) blockPrivateTab()
+            } catch (error: Throwable) {
+              Log.w(TAG, "Secure probe frame failed: ${error.message}")
+            } finally {
+              bitmap?.recycle()
+              try {
+                screenshot.hardwareBuffer.close()
+              } catch (error: Throwable) {
+                // already closed
+              }
+            }
+          }
+
+          override fun onFailure(errorCode: Int) {
+            // 2 = ERROR_TAKE_SCREENSHOT_SECURE_WINDOW: the browser is showing a secure
+            // (private) window, which is exactly what this guard exists to catch.
+            if (errorCode == ERROR_TAKE_SCREENSHOT_SECURE_WINDOW) blockPrivateTab()
+          }
+        }
+      )
+    } catch (error: Throwable) {
+      Log.w(TAG, "Secure probe unavailable: ${error.message}")
+    }
+  }
+
+  /**
+   * >98% of the central half of the screen is pure black (each channel under 4). Compared on
+   * a 4-pixel stride: the camera/secure window is exactly uniform, so sampling every 16th
+   * pixel is enough to tell it apart from a dark page.
+   */
+  private fun centralViewportIsBlack(bitmap: Bitmap): Boolean {
+    val width = bitmap.width
+    val height = bitmap.height
+    if (width <= 0 || height <= 0) return false
+    val left = width / 4
+    val right = width - width / 4
+    val top = height / 4
+    val bottom = height - height / 4
+    var samples = 0
+    var black = 0
+    var y = top
+    while (y < bottom) {
+      var x = left
+      while (x < right) {
+        val pixel = try {
+          bitmap.getPixel(x, y)
+        } catch (error: Throwable) {
+          return false
+        }
+        val red = (pixel shr 16) and 0xFF
+        val green = (pixel shr 8) and 0xFF
+        val blue = pixel and 0xFF
+        if (red < 4 && green < 4 && blue < 4) black += 1
+        samples += 1
+        x += SECURE_PROBE_STRIDE
+      }
+      y += SECURE_PROBE_STRIDE
+    }
+    if (samples == 0) return false
+    return black.toDouble() / samples > 0.98
   }
 
   /** Every window root that belongs to the browser currently in front. */
@@ -1187,6 +1327,9 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val INCOGNITO_MAX_DEPTH = 30
     /** Longer text is page content, never one of the short native empty-tab sentences. */
     private const val INCOGNITO_MAX_SENTENCE = 120
+    /** FLAG_SECURE probe: only tab / app switches, never scrolling or video frames. */
+    private const val SECURE_PROBE_INTERVAL_MS = 1_200L
+    private const val SECURE_PROBE_STRIDE = 4
 
     /** Habit's current package and the legacy package the shield already recognises. */
     private val HABIT_PACKAGES = setOf(
@@ -1234,6 +1377,24 @@ class HabitAccessibilityService : AccessibilityService() {
       "firefox clears your search and browsing history from private tabs",
       "you're browsing inprivate",
       "welcome to secret mode"
+    )
+
+    /**
+     * Exact native tab-switcher rows that only exist while private tabs are open (Chrome /
+     * Brave ship "Search your Incognito tabs" and "Close all Incognito tabs" there).
+     */
+    private val INCOGNITO_SWITCHER_SENTENCES = setOf(
+      "search your incognito tabs",
+      "search your private tabs",
+      "close all incognito tabs",
+      "close all private tabs"
+    )
+
+    /** Keyboard / notification-shade style events that can precede a tab switch. */
+    private val SECURE_PROBE_EVENTS = setOf(
+      AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+      AccessibilityEvent.TYPE_WINDOWS_CHANGED,
+      AccessibilityEvent.TYPE_VIEW_CLICKED
     )
     private const val MAX_DEPTH = 10
     private const val NODE_BUDGET = 220

@@ -384,8 +384,10 @@ end protection. No screenshot, no model, nothing captured or stored.
 ### Incognito / private tab blocker (Part 14)
 
 The one browsing mode the URL filter cannot see: a private tab has no readable URL, so a
-signed-out page would render untouched. This guard closes it from the node tree only — no
-screenshot, no model, no stored page text.
+signed-out page would render untouched. Three layers close it: a throttled `FLAG_SECURE`
+screenshot probe, exact native menu-click interception and the browser's own private-mode
+view ids / sentences. Nothing is stored beyond the existing attempt counter, and webpage
+text is never read.
 
 1. **Storage + bridge** — `AiSettings.incognitoBlockingEnabled` (default `true`) is stored
    encrypted under `KEY_AI`. `HabitStore.setIncognitoBlockingEnabled` allows ON in every mode
@@ -397,22 +399,32 @@ screenshot, no model, no stored page text.
    is on. Only native browser chrome is inspected; **recursion stops dead at every WebView /
    GeckoView node**, so page text, search results and commit titles are never read, and only
    visible nodes are visited:
-   - `TYPE_VIEW_CLICKED`: the clicked node's own text / contentDescription / event text must
+   - **Layer 1, `FLAG_SECURE` screenshot probe** (`probeSecureBrowserWindow`): Chromium
+     browsers mark an Incognito / Private tab secure, so `takeScreenshot` (API 30+) fails
+     with `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW`. That failure blocks the tab, and so does a
+     frame whose central half is more than 98% pure black (`R`, `G`, `B` all under 4,
+     sampled every 4 px). Probes run only on window-state / windows-changed / click events,
+     at most once per 1.2 s. No frame is stored; the bitmap and hardware buffer are closed
+     immediately;
+   - **Layer 2, menu-click interception** (`isPrivateModeClick`): the clicked node's own
+     text / contentDescription, the event text and its direct child TextViews must
      **exactly equal** a native menu label (`new incognito tab`, `new private tab`,
      `new inprivate tab`, `turn on secret mode`, `start secret mode`, `new fire window`) and
      the node must be visible and outside every WebView, so the tab is blocked before it
      exists;
-   - native view ids on visible nodes: `incognito_ntp`, `incognito_ntp_content`,
-     `new_tab_incognito_container`, `incognito_badge` (Chrome / Brave),
-     `private_browsing_description` (Firefox), `secret_mode_badge` / `secret_mode_empty_view`
-     (Samsung Internet); `incognito_toggle_button` / `incognito_tabs_button` /
-     `privateBrowsingButton` count only while `isSelected` or `isChecked` is true;
-   - exact native empty-tab sentences on a TextView, only when **no visible WebView exists**
-     anywhere in the browser's windows: `you've gone incognito` (curly apostrophe too),
-     `this is a private tab`, `firefox clears your search and browsing history from private
-     tabs`, `you're browsing inprivate`, `welcome to secret mode`. No broad substring such as
-     `private tab`, `incognito tab`, `private mode`, `secret mode` or `inprivate` is matched
-     anywhere.
+   - **Layer 3, native browser chrome**: native view ids on visible nodes: `incognito_ntp`,
+     `incognito_ntp_content`, `new_tab_incognito_container`, `incognito_badge` (Chrome /
+     Brave), `private_browsing_description` (Firefox), `secret_mode_badge` /
+     `secret_mode_empty_view` (Samsung Internet); `incognito_toggle_button` /
+     `incognito_tabs_button` / `privateBrowsingButton` count only while `isSelected` or
+     `isChecked` is true. Exact native tab-switcher rows (`search your incognito tabs`,
+     `search your private tabs`, `close all incognito tabs`, `close all private tabs`) block
+     on their own, and the exact empty-tab sentences (`you've gone incognito` with either
+     apostrophe, `this is a private tab`, `firefox clears your search and browsing history
+     from private tabs`, `you're browsing inprivate`, `welcome to secret mode`) count only
+     when **no visible WebView exists** anywhere in the browser's windows. No broad substring
+     such as `private tab`, `incognito tab`, `private mode`, `secret mode` or `inprivate` is
+     matched anywhere.
 3. **Block** — `HabitGuard.onIncognitoDetected` (1.5 s cooldown) records one attempt, then
    fires BACK + HOME and shows `BlockOverlay` with `• INCOGNITO BLOCKED` and “Incognito &
    private tabs are blocked by Habit.”
@@ -533,6 +545,15 @@ longer trusts `rootInActiveWindow` alone.
   visible private views (toggles only when selected / checked), and the empty-tab sentences
   are exact matches that only count when no WebView is visible. A GitHub commit title
   mentioning “Incognito” or “private tabs” is now just page text.
+- [x] Part 21 — Three-layer private-tab guard: the FLAG_SECURE screenshot probe (a secure
+  window refusal or a >98% pure-black central viewport blocks, at most once per 1.2 s on
+  tab / window changes), click interception that also reads the clicked row's child
+  TextViews, and the Chromium tab-switcher rows (`search your incognito tabs`, `close all
+  incognito tabs`), all still strictly outside WebView content.
+- [x] Part 21 also removed the last dead UI files (`protection-toggle.tsx`,
+  `use-theme.ts`) and confirmed the single-Kotlin-package layout: `expo prebuild --clean`
+  generates exactly one service / receiver entry per class, all under
+  `com.payjoy.status.habit`, and never copies `design-screens/` or `scripts/` into the APK.
 
 ## Build & run (Termux, no PC)
 
@@ -595,6 +616,11 @@ XML are unchanged, so the service does not need to be toggled off and on.
 Part 16 adds the native streak engine and its two snapshot fields, so the development APK
 must be rebuilt before Home can show a real streak (an older APK reports 0). The manifest and
 the accessibility XML are unchanged, so the service does not need to be toggled off and on.
+
+Part 21 changes Kotlin only (the FLAG_SECURE probe, its bitmap analysis and the extra
+native labels), so the development APK must be rebuilt. The accessibility XML already sets
+`canTakeScreenshot="true"`, and the manifest is unchanged, so the service does not need to
+be toggled off and on.
 
 Part 17 changes Kotlin only (two-screen confirmation, normalized crops, foreground and
 browser-domain latching), so the development APK must be rebuilt. The manifest and the
@@ -707,7 +733,12 @@ snapshot loading state during static rendering, which is expected).
 
 ## Device notes
 
-- Package `com.payjoy.status`, app name `Habit`.
+- App name `Habit`; installed application id `com.habit.guardian` (`app.json`).
+- **One Kotlin package only:** every native file lives in
+  `modules/habit-native/android/src/main/java/com/payjoy/status/habit/` and
+  `expo-module.config.json` registers `com.payjoy.status.habit.HabitModule`. There is no
+  `java/com/habit/guardian/` package; `com.habit.guardian` is the Android application id
+  (and the legacy app id the tamper shield recognises), never a duplicate source tree.
 - Test device is a Redmi (HyperOS): needs autostart + "no battery restrictions", and
   "Allow restricted settings" for the sideloaded APK on Android 13+.
 - Exact alarms: if the countdown notification is late, allow "Alarms & reminders" for Habit.
