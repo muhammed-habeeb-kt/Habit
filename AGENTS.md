@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-11 (Part 19: restored AI sensitivity, instant block, app-switch-only latch, model gate)_
+_Last updated: 2026-11-11 (Part 20: incognito detection only from native browser chrome, never WebView text)_
 
 ## Product
 
@@ -394,15 +394,25 @@ screenshot, no model, no stored page text.
    `incognitoBlockingEnabled`, in `src/native/habit.ts` and in `useAiMonitoring`.
 2. **Detection** — `HabitAccessibilityService.scanIncognitoTabs` runs on every event of a
    watched browser (and once from `onServiceConnected`) when protection is ON and the switch
-   is on:
-   - `TYPE_VIEW_CLICKED`: the tapped label, its row and its parents match a menu entry
-     (`new incognito tab`, `incognito tabs`, `new private tab`, `private tabs`,
-     `new inprivate tab`, `turn on secret mode`, `use secret mode`, `incognito mode`), so the
-     tab is blocked before it exists;
-   - rendered page: every `service.windows` root of the browser plus `rootInActiveWindow` is
-     walked once (900 nodes, depth 30, 24 k chars) reading `text`, `contentDescription` and
-     `viewIdResourceName` for the Chrome / Brave / Firefox / Edge / Samsung Internet / Mi /
-     Opera private-page strings and `incognito_badge`.
+   is on. Only native browser chrome is inspected; **recursion stops dead at every WebView /
+   GeckoView node**, so page text, search results and commit titles are never read, and only
+   visible nodes are visited:
+   - `TYPE_VIEW_CLICKED`: the clicked node's own text / contentDescription / event text must
+     **exactly equal** a native menu label (`new incognito tab`, `new private tab`,
+     `new inprivate tab`, `turn on secret mode`, `start secret mode`, `new fire window`) and
+     the node must be visible and outside every WebView, so the tab is blocked before it
+     exists;
+   - native view ids on visible nodes: `incognito_ntp`, `incognito_ntp_content`,
+     `new_tab_incognito_container`, `incognito_badge` (Chrome / Brave),
+     `private_browsing_description` (Firefox), `secret_mode_badge` / `secret_mode_empty_view`
+     (Samsung Internet); `incognito_toggle_button` / `incognito_tabs_button` /
+     `privateBrowsingButton` count only while `isSelected` or `isChecked` is true;
+   - exact native empty-tab sentences on a TextView, only when **no visible WebView exists**
+     anywhere in the browser's windows: `you've gone incognito` (curly apostrophe too),
+     `this is a private tab`, `firefox clears your search and browsing history from private
+     tabs`, `you're browsing inprivate`, `welcome to secret mode`. No broad substring such as
+     `private tab`, `incognito tab`, `private mode`, `secret mode` or `inprivate` is matched
+     anywhere.
 3. **Block** — `HabitGuard.onIncognitoDetected` (1.5 s cooldown) records one attempt, then
    fires BACK + HOME and shows `BlockOverlay` with `• INCOGNITO BLOCKED` and “Incognito &
    private tabs are blocked by Habit.”
@@ -517,6 +527,12 @@ longer trusts `rootInActiveWindow` alone.
   video no longer kills the scanner). The notification shows
   `Watching <app> • Frame #N • mob: … • nude: …` or `AI Model Error: …`, and CI fails the
   build unless both model files exist at their real sizes before Gradle runs.
+- [x] Part 20 — Incognito detection can no longer false-trigger on a normal tab: the walk
+  stops at every WebView / GeckoView node and skips invisible nodes, clicks must exactly
+  match a native private-mode menu label outside a WebView, view-id hits are limited to
+  visible private views (toggles only when selected / checked), and the empty-tab sentences
+  are exact matches that only count when no WebView is visible. A GitHub commit title
+  mentioning “Incognito” or “private tabs” is now just page text.
 
 ## Build & run (Termux, no PC)
 
@@ -583,6 +599,10 @@ the accessibility XML are unchanged, so the service does not need to be toggled 
 Part 17 changes Kotlin only (two-screen confirmation, normalized crops, foreground and
 browser-domain latching), so the development APK must be rebuilt. The manifest and the
 accessibility XML are unchanged, so the service does not need to be toggled off and on.
+
+Part 20 changes Kotlin only (strict native-chrome incognito detection), so the development
+APK must be rebuilt. The manifest and the accessibility XML are unchanged since Part 12, so
+the service does not need to be toggled off and on.
 
 Part 19 changes Kotlin only (AI thresholds, crops, foreground latch and the live
 notification line) and hardens the CI model check, so the development APK must be rebuilt.

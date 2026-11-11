@@ -265,11 +265,18 @@ class HabitAccessibilityService : AccessibilityService() {
   /**
    * True when the browser is in, or is entering, a private session.
    *
-   * Two independent signals, both node reads:
-   *  1. the tap itself — a menu item or button labelled "New incognito tab", "New private
-   *     tab", "Turn on secret mode", … is blocked before the tab can appear;
-   *  2. the rendered private page — the browser's own welcome / status text, plus view ids
-   *     and content descriptions such as `incognito_badge`, is blocked on sight.
+   * Only the browser's own native chrome is inspected, because a normal tab can display any
+   * words at all (a GitHub commit title saying "Block Incognito and private tabs" must never
+   * close the browser). Three strict signals:
+   *  1. an exact native menu label on a `TYPE_VIEW_CLICKED` node outside every WebView
+   *     ("New incognito tab", "New private tab", "New InPrivate tab", "Turn on secret
+   *     mode", "Start secret mode", "New Fire Window") — equality, never a substring;
+   *  2. a visible native private-mode view id (`incognito_ntp`, `incognito_badge`,
+   *     `secret_mode_badge`, …), with toggle / tab buttons only when selected or checked;
+   *  3. an exact native empty-tab sentence on a TextView, only when no WebView is visible.
+   *
+   * Recursion stops dead at every WebView / GeckoView node, so webpage text, search results
+   * and commit titles are never read for Incognito detection.
    *
    * This matters because a signed-out private tab shows no URL to the adult filter: the
    * normal page scan sees an empty toolbar and lets it through.
@@ -280,31 +287,214 @@ class HabitAccessibilityService : AccessibilityService() {
       if (!HabitStore.state(this).protectionEnabled) return false
       if (!HabitStore.aiSettings(this).incognitoBlockingEnabled) return false
 
-      if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
-        val label = tamperClickedText(event)
-        if (label.isNotEmpty() && INCOGNITO_CLICK_TRIGGERS.any { label.contains(it) }) {
-          AiVisualScanner.stop()
-          HabitGuard.onIncognitoDetected(this)
-          return true
-        }
+      if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED &&
+        isPrivateModeClick(event)
+      ) {
+        blockPrivateTab()
+        return true
       }
 
-      for (root in browserRoots(pkg)) {
-        val builder = StringBuilder()
-        collectIncognitoText(root, builder, 0, intArrayOf(INCOGNITO_NODE_BUDGET))
-        if (builder.isEmpty()) continue
-        val text = builder.toString().lowercase()
-        if (INCOGNITO_ACTIVE_TRIGGERS.any { text.contains(it) }) {
-          AiVisualScanner.stop()
-          HabitGuard.onIncognitoDetected(this)
-          return true
-        }
+      val roots = browserRoots(pkg)
+      if (roots.isEmpty()) return false
+
+      val scan = PrivateTabScan()
+      for (root in roots) {
+        collectPrivateTabSignals(root, scan, 0, intArrayOf(INCOGNITO_NODE_BUDGET))
+      }
+      // A private view id is decisive on its own. The empty-tab sentences are only
+      // trustworthy when the browser is not rendering a page at all.
+      if (scan.viewIdHit || (!scan.hasVisibleWebView && scan.sentenceHit)) {
+        blockPrivateTab()
+        return true
       }
       false
     } catch (error: Throwable) {
       Log.w(TAG, "Incognito check failed: ${error.message}")
       false
     }
+  }
+
+  private fun blockPrivateTab() {
+    AiVisualScanner.stop()
+    HabitGuard.onIncognitoDetected(this)
+  }
+
+  /** What one walk of a browser window found outside every WebView. */
+  private class PrivateTabScan {
+    var hasVisibleWebView = false
+    var viewIdHit = false
+    var sentenceHit = false
+  }
+
+  /**
+   * Exact menu label of the clicked node, but only when that node is real, visible and not
+   * part of a webpage. Without a source node the click cannot be verified as native chrome,
+   * so it is ignored (fail open) rather than guessed from the event text.
+   */
+  private fun isPrivateModeClick(event: AccessibilityEvent): Boolean {
+    val node = try {
+      event.source
+    } catch (error: Throwable) {
+      null
+    } ?: return false
+    val visible = try {
+      node.isVisibleToUser
+    } catch (error: Throwable) {
+      false
+    }
+    if (!visible) return false
+    if (insideWebView(node)) return false
+
+    val labels = ArrayList<String>(3)
+    try {
+      node.text?.toString()?.let { labels.add(it) }
+    } catch (error: Throwable) {
+      // stale node
+    }
+    try {
+      node.contentDescription?.toString()?.let { labels.add(it) }
+    } catch (error: Throwable) {
+      // stale node
+    }
+    try {
+      event.text?.forEach { value -> if (!value.isNullOrEmpty()) labels.add(value.toString()) }
+    } catch (error: Throwable) {
+      // stale event
+    }
+    return labels.any { raw -> normaliseLabel(raw) in INCOGNITO_CLICK_LABELS }
+  }
+
+  private fun normaliseLabel(value: String): String =
+    value.trim().lowercase().replace('\u2019', '\'')
+
+  /** True when [start] or any ancestor is a webpage view, never native browser chrome. */
+  private fun insideWebView(start: AccessibilityNodeInfo): Boolean {
+    var node: AccessibilityNodeInfo? = start
+    var level = 0
+    while (node != null && level <= INCOGNITO_MAX_DEPTH) {
+      val className = try {
+        node.className?.toString() ?: ""
+      } catch (error: Throwable) {
+        ""
+      }
+      if (isWebViewClass(className)) return true
+      node = try {
+        node.parent
+      } catch (error: Throwable) {
+        null
+      }
+      level += 1
+    }
+    return false
+  }
+
+  private fun isWebViewClass(className: String): Boolean {
+    if (className.isEmpty()) return false
+    val lower = className.lowercase()
+    return lower.contains("webview") ||
+      lower.contains("geckoview") ||
+      lower.contains("webviewchromium")
+  }
+
+  /**
+   * Collects private-mode evidence from visible native views only. The first WebView ends
+   * that subtree: nothing rendered by a page is ever read or matched.
+   */
+  private fun collectPrivateTabSignals(
+    node: AccessibilityNodeInfo?,
+    scan: PrivateTabScan,
+    depth: Int,
+    budget: IntArray
+  ) {
+    if (node == null || scan.viewIdHit || budget[0] <= 0 || depth > INCOGNITO_MAX_DEPTH) return
+    budget[0] -= 1
+    val visible = try {
+      node.isVisibleToUser
+    } catch (error: Throwable) {
+      false
+    }
+    // Only visible nodes are inspected; the window root itself is always walked because
+    // some vendor builds report its own visibility flag as false while children show.
+    if (!visible && depth > 0) return
+
+    val className = try {
+      node.className?.toString() ?: ""
+    } catch (error: Throwable) {
+      ""
+    }
+    if (isWebViewClass(className)) {
+      scan.hasVisibleWebView = true
+      return
+    }
+
+    if (incognitoViewIdHit(node)) {
+      scan.viewIdHit = true
+      return
+    }
+    if (!scan.sentenceHit && className.contains("TextView", ignoreCase = true) &&
+      incognitoSentence(node)
+    ) {
+      scan.sentenceHit = true
+    }
+
+    val childCount = try {
+      node.childCount
+    } catch (error: Throwable) {
+      0
+    }
+    for (index in 0 until childCount) {
+      val child = try {
+        node.getChild(index)
+      } catch (error: Throwable) {
+        null
+      }
+      collectPrivateTabSignals(child, scan, depth + 1, budget)
+    }
+  }
+
+  /** Native private-mode view ids; toggles only count while actually selected / checked. */
+  private fun incognitoViewIdHit(node: AccessibilityNodeInfo): Boolean {
+    val lower = try {
+      node.viewIdResourceName?.lowercase()
+    } catch (error: Throwable) {
+      null
+    } ?: return false
+    if (lower.isEmpty()) return false
+
+    if (lower.endsWith(":id/incognito_ntp") ||
+      lower.endsWith(":id/incognito_ntp_content") ||
+      lower.endsWith(":id/new_tab_incognito_container") ||
+      lower.endsWith(":id/incognito_badge") ||
+      lower.endsWith(":id/private_browsing_description") ||
+      lower.endsWith(":id/secret_mode_badge") ||
+      lower.endsWith(":id/secret_mode_empty_view")
+    ) {
+      return true
+    }
+
+    // A toggle or tabs button that is merely present proves nothing: it exists in normal
+    // browsing too. Only a selected / checked state means a private session is active.
+    val selected = try {
+      node.isSelected || node.isChecked
+    } catch (error: Throwable) {
+      false
+    }
+    if (!selected) return false
+    return lower.endsWith(":id/incognito_toggle_button") ||
+      lower.endsWith(":id/incognito_tabs_button") ||
+      lower.endsWith(":id/privatebrowsingbutton") ||
+      lower.endsWith(":id/private_browsing_button")
+  }
+
+  /** Exact native empty-tab sentence (curly and straight apostrophes both accepted). */
+  private fun incognitoSentence(node: AccessibilityNodeInfo): Boolean {
+    val text = try {
+      node.text?.toString()
+    } catch (error: Throwable) {
+      null
+    } ?: return false
+    if (text.isEmpty() || text.length > INCOGNITO_MAX_SENTENCE) return false
+    return normaliseLabel(text) in INCOGNITO_EMPTY_TAB_SENTENCES
   }
 
   /** Every window root that belongs to the browser currently in front. */
@@ -341,46 +531,6 @@ class HabitAccessibilityService : AccessibilityService() {
       if (activePackage == pkg && roots.none { it == active }) roots.add(active)
     }
     return roots
-  }
-
-  /**
-   * Text, contentDescription and view id of a browser window. The view id matters because
-   * Chrome and Brave mark the private page with `incognito_badge` rather than visible text
-   * in some builds.
-   *
-   * One plain pass, no lowercasing per node: rebuilding and re-testing the whole buffer on
-   * every node made the walk quadratic in the page size, which is the one thing this guard
-   * cannot afford on every browser event. The caller lowercases once, so a full window
-   * stays well under 50 ms.
-   */
-  private fun collectIncognitoText(
-    node: AccessibilityNodeInfo?,
-    builder: StringBuilder,
-    depth: Int,
-    budget: IntArray
-  ) {
-    if (node == null || budget[0] <= 0 || depth > INCOGNITO_MAX_DEPTH) return
-    if (builder.length > INCOGNITO_MAX_TEXT) return
-    budget[0] -= 1
-    appendNodeText(node, builder)
-    try {
-      node.viewIdResourceName?.let { id -> builder.append(id).append(' ') }
-    } catch (error: Throwable) {
-      // stale node
-    }
-    val childCount = try {
-      node.childCount
-    } catch (error: Throwable) {
-      0
-    }
-    for (index in 0 until childCount) {
-      val child = try {
-        node.getChild(index)
-      } catch (error: Throwable) {
-        null
-      }
-      collectIncognitoText(child, builder, depth + 1, budget)
-    }
   }
 
   /**
@@ -1033,7 +1183,8 @@ class HabitAccessibilityService : AccessibilityService() {
     /** Runaway guard for the private-tab node walk: a handful of screenfuls, < 50 ms. */
     private const val INCOGNITO_NODE_BUDGET = 900
     private const val INCOGNITO_MAX_DEPTH = 30
-    private const val INCOGNITO_MAX_TEXT = 24_000
+    /** Longer text is page content, never one of the short native empty-tab sentences. */
+    private const val INCOGNITO_MAX_SENTENCE = 120
 
     /** Habit's current package and the legacy package the shield already recognises. */
     private val HABIT_PACKAGES = setOf(
@@ -1058,54 +1209,29 @@ class HabitAccessibilityService : AccessibilityService() {
     )
 
     /**
-     * Menu items / buttons that open a private session. Blocked on the tap itself, before
-     * the tab renders, in Chrome, Brave, Firefox, Edge, Samsung Internet, Mi Browser and
-     * Opera.
+     * Exact native menu labels that open a private session, matched as whole labels on an
+     * outside-WebView click node. Blocked before the tab renders in Chrome, Brave, Firefox,
+     * Edge, Samsung Internet, Mi Browser, Opera and DuckDuckGo.
      */
-    private val INCOGNITO_CLICK_TRIGGERS = listOf(
+    private val INCOGNITO_CLICK_LABELS = setOf(
       "new incognito tab",
-      "incognito tabs",
       "new private tab",
-      "private tabs",
       "new inprivate tab",
       "turn on secret mode",
-      "use secret mode",
-      "incognito mode"
+      "start secret mode",
+      "new fire window"
     )
 
     /**
-     * Wording and view ids of a private page that is already on screen. These are the
-     * browsers' own strings, so they are not ordinary page content the user could type.
+     * Exact native empty-tab sentences, shown by the browser itself only when a private tab
+     * is open and no page is rendered. Never matched as substrings.
      */
-    private val INCOGNITO_ACTIVE_TRIGGERS = listOf(
-      // Chrome
-      "you’ve gone incognito",
+    private val INCOGNITO_EMPTY_TAB_SENTENCES = setOf(
       "you've gone incognito",
-      "now browsing privately",
-      "close all incognito tabs",
-      "incognito tab",
-      "switch out of incognito",
-      "incognito_badge",
-      "incognito mode",
-      // Brave
       "this is a private tab",
-      "close all private tabs",
-      "private tab",
-      // Firefox
-      "private browsing",
       "firefox clears your search and browsing history from private tabs",
-      // Edge
-      "inprivate browsing",
       "you're browsing inprivate",
-      "close all inprivate tabs",
-      // Samsung Internet
-      "welcome to secret mode",
-      "turn off secret mode",
-      "secret mode",
-      // Mi Browser / Opera
-      "in incognito mode",
-      "incognito mode is on",
-      "leave incognito mode"
+      "welcome to secret mode"
     )
     private const val MAX_DEPTH = 10
     private const val NODE_BUDGET = 220
