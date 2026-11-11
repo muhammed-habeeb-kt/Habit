@@ -12,8 +12,9 @@ import android.content.Context
  *  - Stage 2 is a 320x320 NudeNet YOLOv8n detector (`.onnx`, ONNX Runtime) and is additive:
  *    it only runs on the tiles stage 1 found suspicious, and it can flag an explicit frame
  *    stage 1 was unsure about.
- *  - a strict two-screen confirmation governs blocking: a positive frame only flags the
- *    screen, and the block flow runs on the next positive frame (never on the first one).
+ *  - a two-screen confirmation governs blocking: a positive frame only flags the screen,
+ *    and the block flow runs on the next positive frame. A clearly explicit frame bypasses
+ *    the wait and blocks immediately.
  *
  * Power is kept down by three gates:
  *  - a 16x16 pixel-diff check skips the whole cascade when the screen did not change,
@@ -62,29 +63,28 @@ object AiCascadeConfig {
    * Stage 2 gate: a tile needs at least one of these before NudeNet runs on it. Pure text
    * and UI tiles stay at zero, so a chat screen costs one stage 1 run and nothing else.
    */
-  const val STAGE2_GATE_SCORE = 0.04f
-  const val STAGE2_GATE_PORN = 0.01f
+  const val STAGE2_GATE_SCORE = 0.05f
+  const val STAGE2_GATE_PORN = 0.015f
   const val STAGE2_GATE_SEXY = 0.05f
 
   const val STAGE1_INPUT_SIZE = 224
   const val STAGE2_INPUT_SIZE = 320
 
   /**
-   * The media viewport inside the screenshot. Circular avatars live in the app header and
-   * the leftmost chat gutter, so those bands are never cropped or classified: only the
-   * central area where videos and photos actually play is sampled.
+   * The media viewport inside the screenshot: the proven full-width three-square layout,
+   * trimming only the top status / app bar (8%). No left gutter and no avatar masking, so
+   * even a photo at the edge of a Telegram chat is classified.
    */
-  const val MEDIA_LEFT_RATIO = 0.15f
-  const val MEDIA_TOP_RATIO = 0.12f
+  const val MEDIA_LEFT_RATIO = 0.00f
+  const val MEDIA_TOP_RATIO = 0.08f
   const val MEDIA_RIGHT_RATIO = 1.00f
   const val MEDIA_BOTTOM_RATIO = 1.00f
 
   /**
-   * NudeNet box filter: a detection smaller than 18% of the crop side (58 px of 320) or
-   * covering less than 4% of its area is an avatar, icon or thumbnail, never media.
+   * NudeNet box filter: only a detection smaller than 6% of the crop side (19 px of 320)
+   * is an icon or sticker. Real 18+ thumbnails and photos are kept, no matter how small.
    */
-  const val MIN_NUDE_BOX_RATIO = 0.18f
-  const val MIN_NUDE_BOX_AREA_RATIO = 0.04f
+  const val MIN_NUDE_BOX_RATIO = 0.06f
 
   /**
    * Strict 2-screen confirmation: Frame 1 that is positive only flags the screen, and the
@@ -93,15 +93,20 @@ object AiCascadeConfig {
    */
   const val POSITIVE_CONFIRM_FRAMES = 2
   /** A tile is a positive (18+) candidate when any of these is reached. */
-  const val POSITIVE_STAGE1_COMBINED = 0.42f
-  const val POSITIVE_STAGE1_EXPLICIT = 0.22f
-  const val POSITIVE_STAGE1_SEXY = 0.52f
-  const val POSITIVE_NUDE = 0.22f
+  const val POSITIVE_STAGE1_COMBINED = 0.38f
+  const val POSITIVE_STAGE1_EXPLICIT = 0.20f
+  const val POSITIVE_STAGE1_SEXY = 0.48f
+  const val POSITIVE_NUDE = 0.20f
+  /** A frame this explicit blocks immediately, without waiting for a second screen. */
+  const val INSTANT_STAGE1_COMBINED = 0.65f
+  const val INSTANT_PORN = 0.40f
+  const val INSTANT_NUDE = 0.40f
 
   /**
    * Sensitivity presets. The two-screen confirmation rule and its POSITIVE levels are fixed;
    * sensitivity only changes how strongly `p_sexy` counts in the combined stage 1 score, so
-   * `high` reaches the 0.42 level earlier and `low` waits for stronger explicit signal.
+   * `high` and `balanced` both use the proven 0.80 weight, while `low` waits for stronger
+   * explicit signal.
    */
   data class Thresholds(
     /** Weight of `p_sexy` inside the combined stage 1 score. */
@@ -109,10 +114,10 @@ object AiCascadeConfig {
   )
 
   /** Default preset; the two-screen rule and its POSITIVE levels are the same in every preset. */
-  val BALANCED = Thresholds(sexyWeight = 0.60f)
+  val BALANCED = Thresholds(sexyWeight = 0.80f)
 
-  /** Glamour / bikini frames reach the combined 0.42 level earlier. */
-  val HIGH = Thresholds(sexyWeight = 0.85f)
+  /** The proven high-sensitivity weight from the 606-frame calibration test. */
+  val HIGH = Thresholds(sexyWeight = 0.80f)
 
   /** Only strong explicit signal counts `p_sexy`; most adult scenes still need NudeNet. */
   val LOW = Thresholds(sexyWeight = 0.30f)

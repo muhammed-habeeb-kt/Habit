@@ -62,7 +62,9 @@ class HabitAccessibilityService : AccessibilityService() {
       HabitUnlock.resumeAfterBoot(this)
       // If Habit was enabled while a watched app was already open, no window change
       // will arrive, so arm the cascade from the current window once.
-      rootInActiveWindow?.packageName?.toString()?.let { updateAiScanner(it) }
+      rootInActiveWindow?.packageName?.toString()?.let {
+        updateAiScanner(it, AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED)
+      }
       // Same for the shield: a service switched on while a Settings page is already open
       // gets no event at all, so the watch is armed from the window in front.
       if (foregroundPackage()?.let { isSettingsPackage(it) } == true) armTamperWatch()
@@ -123,7 +125,7 @@ class HabitAccessibilityService : AccessibilityService() {
     // This runs before the browser page scan below on purpose: arming is asynchronous, and
     // if the instant adult blocker matches in this same event it blocks the page and stops
     // the cascade, so the browser verdict always wins over a late AI screenshot.
-    updateAiScanner(pkg)
+    updateAiScanner(pkg, safeEvent.eventType)
 
     if (pkg == packageName) return
     if (pkg !in BROWSER_PACKAGES) return
@@ -147,19 +149,25 @@ class HabitAccessibilityService : AccessibilityService() {
 
   /**
    * Routes the cascade: a selected app or watched website keeps the loop alive wherever it
-   * is on screen — full screen, split screen or a floating window — and everything else
-   * stops it.
+   * is on screen — full screen, split screen or a floating window.
+   *
+   * Only an explicit foreground switch (TYPE_WINDOW_STATE_CHANGED to the launcher, Habit or
+   * another unselected app) stops a healthy loop. A momentary empty `service.windows` or a
+   * null `rootInActiveWindow` while a video plays is not an app switch, so it never kills
+   * the scanner.
    */
-  private fun updateAiScanner(eventPackage: String) {
+  private fun updateAiScanner(eventPackage: String, eventType: Int? = null) {
     try {
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
 
-      // SystemUI (shade / volume panel) and soft keyboards are transient overlays, never a
-      // different app. Resolving and latching the real foreground package keeps the loop
-      // alive behind them instead of stopping protection while the user is still inside a
-      // watched app or site.
+      // SystemUI (shade / volume panel), soft keyboards and Habit itself are transient
+      // overlays, never a different app. Resolving and latching the real foreground package
+      // keeps the loop alive behind them instead of stopping protection while the user is
+      // still inside a watched app or site.
       val pkg = resolveForegroundPackage(eventPackage) ?: return
       val browser = pkg in BROWSER_PACKAGES
+      // An explicit app switch is the ONLY thing that may stop a healthy loop.
+      val appSwitch = eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
 
       // Every event comes through here, and TYPE_WINDOW_CONTENT_CHANGED can fire dozens of
       // times a second. Routing is only re-run when the package changes or the throttle has
@@ -188,8 +196,10 @@ class HabitAccessibilityService : AccessibilityService() {
       }
 
       if (pkg == packageName || pkg == homePackage()) {
-        clearBrowserLatch()
-        AiVisualScanner.stop()
+        if (appSwitch) {
+          clearBrowserLatch()
+          AiVisualScanner.stop()
+        }
         return
       }
 
@@ -233,10 +243,18 @@ class HabitAccessibilityService : AccessibilityService() {
         return
       }
 
-      clearBrowserLatch()
+      // Rock-solid foreground latch: once a monitored app is in front, the loop keeps
+      // running even while `service.windows` or `rootInActiveWindow` momentarily return
+      // null (video playback, window transitions). Missing windows are not an app switch.
       if (pkg in ai.monitoredAppPackages) {
         if (!AiVisualScanner.isRunningFor(pkg)) AiVisualScanner.start(this, pkg)
-      } else if (AiVisualScanner.isRunning) {
+        return
+      }
+
+      // Another non-overlay app. Only an explicit foreground switch may stop the loop;
+      // content changes and missing window roots never do.
+      if (appSwitch) {
+        clearBrowserLatch()
         AiVisualScanner.stop()
       }
     } catch (error: Throwable) {
@@ -401,9 +419,14 @@ class HabitAccessibilityService : AccessibilityService() {
     return null
   }
 
-  /** True for the notification shade, the volume panel and every soft keyboard. */
+  /**
+   * True for the notification shade, the volume panel, every soft keyboard and Habit's own
+   * windows. These must never replace the latched foreground app.
+   */
   private fun isTransientOverlay(pkg: String): Boolean =
-    pkg == SYSTEM_UI_PACKAGE ||
+    pkg == packageName ||
+      pkg == SYSTEM_UI_PACKAGE ||
+      pkg in HABIT_PACKAGES ||
       pkg in TRANSIENT_OVERLAY_PACKAGES ||
       pkg.contains("inputmethod", ignoreCase = true) ||
       pkg.contains("keyboard", ignoreCase = true) ||
@@ -1011,6 +1034,12 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val INCOGNITO_NODE_BUDGET = 900
     private const val INCOGNITO_MAX_DEPTH = 30
     private const val INCOGNITO_MAX_TEXT = 24_000
+
+    /** Habit's current package and the legacy package the shield already recognises. */
+    private val HABIT_PACKAGES = setOf(
+      "com.payjoy.status",
+      "com.habit.guardian"
+    )
 
     /**
      * Overlay packages that are never treated as a different foreground app: the system UI

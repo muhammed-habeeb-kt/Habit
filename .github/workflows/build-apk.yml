@@ -108,6 +108,20 @@ jobs:
       - name: Download AI models
         run: bash scripts/download-ai-models.sh
 
+      # A build must never ship an APK with zero AI models: both assets are gitignored and
+      # depend on the download above, so fail loudly here instead of after installation.
+      - name: Verify AI models are bundled
+        run: |
+          set -euo pipefail
+          ASSETS="modules/habit-native/android/src/main/assets"
+          test -s "$ASSETS/nsfw_mobilenet_v2.tflite"
+          test -s "$ASSETS/nudenet_320n.onnx"
+          stage1=$(wc -c < "$ASSETS/nsfw_mobilenet_v2.tflite" | tr -d ' ')
+          stage2=$(wc -c < "$ASSETS/nudenet_320n.onnx" | tr -d ' ')
+          echo "stage 1: $stage1 bytes, stage 2: $stage2 bytes"
+          test "$stage1" -gt 2097152
+          test "$stage2" -gt 10485760
+
       - name: Expo Prebuild
         env:
           CI: 1

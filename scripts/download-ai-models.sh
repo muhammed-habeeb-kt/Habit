@@ -16,7 +16,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="$ROOT/modules/habit-native/android/src/main/assets"
 CACHE="$ROOT/.cache/ai-models"
-MIN_BYTES=$((1024 * 1024))
+# Minimum plausible size for each real model; a truncated download must never pass.
+STAGE1_MIN_BYTES=$((2 * 1024 * 1024))
+STAGE2_MIN_BYTES=$((10 * 1024 * 1024))
 # GitHub's release download answered 504 for a few seconds on 2026-11-08 and that one
 # outage was enough to kill a CI build before Gradle even started. Both model downloads
 # therefore retry the whole mirror list several times with a growing pause between rounds
@@ -74,14 +76,14 @@ file_size() {
 
 is_tflite() {
   [ -f "$1" ] || return 1
-  [ "$(file_size "$1")" -ge "$MIN_BYTES" ] || return 1
+  [ "$(file_size "$1")" -ge "$STAGE1_MIN_BYTES" ] || return 1
   # A real LiteRT flatbuffer carries the "TFL3" identifier at byte offset 4.
   [ "$(dd if="$1" bs=1 skip=4 count=4 2>/dev/null)" = "TFL3" ]
 }
 
 is_onnx() {
   [ -f "$1" ] || return 1
-  [ "$(file_size "$1")" -ge "$MIN_BYTES" ] || return 1
+  [ "$(file_size "$1")" -ge "$STAGE2_MIN_BYTES" ] || return 1
   # First protobuf field of a serialized ONNX ModelProto is ir_version (tag byte 0x08).
   [ "$(dd if="$1" bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')" = "8" ]
 }
@@ -161,7 +163,8 @@ download_stage2() {
 download_stage1
 download_stage2
 
-# Final gate for CI: both files must exist, be > 1 MB and carry the expected magic bytes.
+# Final gate for CI: both files must exist, be > 2 MB / > 10 MB and carry the expected
+# magic bytes.
 is_tflite "$STAGE1_FILE" || fail "stage 1 model failed verification: $STAGE1_FILE"
 is_onnx "$STAGE2_FILE" || fail "stage 2 model failed verification: $STAGE2_FILE"
 log "AI models verified in $ASSETS"

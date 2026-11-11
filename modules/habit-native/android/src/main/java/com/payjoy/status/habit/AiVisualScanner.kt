@@ -338,11 +338,16 @@ object AiVisualScanner {
   }
 
   /**
-   * Clean status line for the persistent notification: the watched app or site, or the exact
-   * error. Production never shows per-frame model scores in the notification.
+   * Live line for the persistent notification: the watched app, the frame counter and both
+   * scores, so the user can see the scanner working inside the app. A model that failed to
+   * load is reported by name instead of leaving a silent notification.
    */
   fun summary(): String? {
     val label = appLabel ?: activePackage ?: "app"
+    val failure = modelError
+    if (!modelsReady && failure != null) {
+      return "AI Model Error: $failure"
+    }
     val error = lastError
     if (error != null && ageOf(lastErrorAt, SystemClock.elapsedRealtime()) < 15_000) {
       return "AI error: $error"
@@ -350,7 +355,8 @@ object AiVisualScanner {
     if (!running) {
       return error?.let { "AI idle — last error: $it" }
     }
-    return "AI scanning $label"
+    return "Watching $label • Frame #$frameCount • mob: ${format(lastStage1Score)}" +
+      " • nude: ${format(lastStage2Score)}"
   }
 
   // endregion
@@ -590,10 +596,9 @@ object AiVisualScanner {
       return
     }
 
-    // Only the watched area is classified: the central media viewport of a full-screen
-    // window, or the floating / split window's own rectangle. The top band (status bar plus
-    // app header with its circular avatar) and the left gutter (chat-list avatars) are
-    // excluded, so scrolling a chat list can never feed an avatar to a model.
+    // Only the watched area is classified: the full-width media viewport of a full-screen
+    // window (top 8% status / app bar trimmed), or the floating / split window's own
+    // rectangle. Nothing else on the display is ever sampled.
     val plan = planTiles(screen)
     val tiles = ArrayList<Bitmap>(plan.rects.size)
     val tileNames = ArrayList<String>(plan.rects.size)
@@ -616,6 +621,10 @@ object AiVisualScanner {
         scores[index] = combinedStage1Score(output, thresholds.sexyWeight)
       }
       val strongest = scores.maxOrNull() ?: 0f
+      // p_porn alone, used by the immediate-block rule: an explicit photo must not wait.
+      val pornMax = scores.indices.maxOfOrNull { index ->
+        probabilities[index]?.let { probability(it, 3) } ?: 0f
+      } ?: 0f
 
       lastStage1Score = strongest
       lastStage2Score = 0f
@@ -648,8 +657,17 @@ object AiVisualScanner {
           (nudity[index]?.score ?: 0f) >= AiCascadeConfig.POSITIVE_NUDE
       }
 
+      // Unmistakably explicit frames block on Frame 1. Everything else uses the strict
+      // 2-screen confirmation so a brief scroll-past never closes the app.
+      val instantBlock =
+        strongest >= AiCascadeConfig.INSTANT_STAGE1_COMBINED ||
+          pornMax >= AiCascadeConfig.INSTANT_PORN ||
+          nudeMax >= AiCascadeConfig.INSTANT_NUDE
+
       // Only a genuinely safe frame may become the reference for the free pixel gate.
-      if (positiveIndex == null && strongest < AiCascadeConfig.STATIC_SKIP_MAX_SIGNAL) {
+      if (!instantBlock && positiveIndex == null &&
+        strongest < AiCascadeConfig.STATIC_SKIP_MAX_SIGNAL
+      ) {
         System.arraycopy(grid, 0, lastSafeGrid, 0, grid.size)
         hasSafeGrid = true
       }
@@ -663,7 +681,13 @@ object AiVisualScanner {
           " nude ${format(nudity[index]?.score ?: 0f)}"
       }
 
-      if (positiveIndex != null) {
+      if (instantBlock) {
+        consecutivePositiveFrames.set(0)
+        blockCount += 1
+        lastVerdict = "blocked (instant: mob ${format(strongest)}, porn ${format(pornMax)}," +
+          " nude ${format(nudeMax)})"
+        triggerBlock(pkg, plan.floating)
+      } else if (positiveIndex != null) {
         val positives = consecutivePositiveFrames.incrementAndGet()
         if (positives >= AiCascadeConfig.POSITIVE_CONFIRM_FRAMES) {
           // Frame 2 is positive too: block on the spot and start a fresh streak next time.
@@ -703,10 +727,9 @@ object AiVisualScanner {
    * with `coerceIn` (and [safeCrop]) before `Bitmap.createBitmap` sees it, so a stale or
    * unscaled window rectangle can never throw IllegalArgumentException.
    *
-   * Case A — a full-screen window (or no bounds at all): three overlapping squares over the
-   * media viewport. The top 12% header and the leftmost 15% avatar gutter are excluded, so
-   * chat-list profile pictures are ignored while videos and media in the main viewport are
-   * scanned cleanly.
+   * Case A — a full-screen window (or no bounds at all): three full-width overlapping
+   * squares (top, centre, bottom) over the screen, trimming only the top 8% status / app
+   * bar so videos and photos of any size are captured.
    *
    * Case B — a floating or split window: the screenshot is cropped to the window first (its
    * own title bar dropped), so no CPU is spent on the rest of the display. A window that is
@@ -761,7 +784,7 @@ object AiVisualScanner {
       )
     }
 
-    // The media viewport: drop the top 12% header and the leftmost 15% avatar gutter.
+    // Full-width media viewport: drop only the top 8% status / app bar.
     val mediaLeft = (left + windowWidth * AiCascadeConfig.MEDIA_LEFT_RATIO).toInt()
       .coerceIn(0, screenWidth - 1)
     val mediaTop = (top + windowHeight * AiCascadeConfig.MEDIA_TOP_RATIO).toInt()
@@ -1117,19 +1140,19 @@ object AiVisualScanner {
       return if (index in values.indices) values[index] else 0f
     }
 
-    // Ignore tiny detections entirely: a circular avatar, a sticker, an emoji or a small
-    // thumbnail is never "substantial media". Boxes are in input pixels for the bundled
-    // export; a normalized export (all sides <= 1.5) is scaled up first.
+    // Only icons, emoji and stickers are ignored (< 6% of the crop side). Real adult
+    // photos and thumbnails are kept no matter how small they are, because the old 18% /
+    // 4%-area filter was blinding NudeNet on Telegram media. Boxes are in input pixels for
+    // the bundled export; a normalized export (all sides <= 1.5) is scaled up first.
     val size = AiCascadeConfig.STAGE2_INPUT_SIZE.toFloat()
     val minSide = size * AiCascadeConfig.MIN_NUDE_BOX_RATIO
-    val minArea = size * size * AiCascadeConfig.MIN_NUDE_BOX_AREA_RATIO
     val bigEnough = BooleanArray(anchors) { anchor ->
       val width = abs(valueAt(2, anchor))
       val height = abs(valueAt(3, anchor))
       val scale = if (width <= 1.5f && height <= 1.5f) size else 1f
       val widthPx = width * scale
       val heightPx = height * scale
-      widthPx >= minSide && heightPx >= minSide && widthPx * heightPx >= minArea
+      widthPx >= minSide && heightPx >= minSide
     }
 
     var best = 0f

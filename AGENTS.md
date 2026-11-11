@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-11 (Part 17: two-screen AI confirmation, crash-proof crops, foreground/browser latching)_
+_Last updated: 2026-11-11 (Part 19: restored AI sensitivity, instant block, app-switch-only latch, model gate)_
 
 ## Product
 
@@ -243,27 +243,35 @@ section lists the surface area and the rules the engine keeps.
    event (window state changed, windows changed, content changed, text changed, scrolled),
    because a monitored app can become visible without a window-state change. The router
    starts the loop when protection is on, AI monitoring is enabled and the package is in
-   `monitoredAppPackages`; it stops on Habit, the launcher or any other app. The foreground
-   package is resolved from the event and `rootInActiveWindow` while ignoring transient
-   overlays (SystemUI shade / volume panel, soft keyboards) and is latched, so pulling down
-   the notification shade or opening a keyboard inside a watched app never stops the loop.
+   `monitoredAppPackages`. The foreground package is resolved from the event and
+   `rootInActiveWindow` while ignoring transient overlays (SystemUI shade / volume panel,
+   soft keyboards, Habit itself) and is latched, so pulling down the notification shade or
+   opening a keyboard inside a watched app never stops the loop. Once armed, the loop is
+   only stopped by an explicit `TYPE_WINDOW_STATE_CHANGED` that switches to Habit, the
+   launcher or another unselected app — a momentarily empty `service.windows` or a null
+   `rootInActiveWindow` during video playback is not an app switch and never stops it.
 3. **Capture** — `AccessibilityService.takeScreenshot()` (Android 11+/API 30) on the default
    display while the screen is interactive. The frame is copied from the hardware buffer to
    ARGB_8888 and cut into top, centre and bottom squares. `FLAG_SECURE` windows are the
    honest “protected screens” limit.
-4. **Classification** — stage 1 (NSFW MobileNetV2, `FLOAT32 [1,224,224,3] -> [1,5]`) scores
-   `Porn + Hentai + sexyWeight*Sexy` (`0.85` high, `0.60` balanced, `0.30` low). A tile is
-   **positive** when it reaches combined `0.42`, `Porn + Hentai` `0.22`, `Sexy` `0.52` or
-   NudeNet `s_nude_max` `0.22`; stage 2 (NudeNet 320n, `FLOAT32 [N,3,H,W] -> [N,22,A]`) is
-   additive only and runs on tiles that crossed the 0.04 gate. Blocking is a strict
-   2-screen confirmation: a positive Frame 1 only flags the screen and Frame 2 must be
-   positive too; a safe Frame 2 clears the flag. The pixel gate is bypassed while a positive
-   frame waits for Frame 2, so a static image can never dodge confirmation.
+4. **Classification** — full-width top / centre / bottom tiles over the screen, trimming
+   only the top 8% status / app bar. Stage 1 (NSFW MobileNetV2,
+   `FLOAT32 [1,224,224,3] -> [1,5]`) scores `Porn + Hentai + sexyWeight*Sexy` (`0.80` high
+   and balanced, `0.30` low). A tile is **positive** when it reaches combined `0.38`,
+   `Porn + Hentai` `0.20`, `Sexy` `0.48` or NudeNet `s_nude_max` `0.20`; stage 2 (NudeNet
+   320n, `FLOAT32 [N,3,H,W] -> [N,22,A]`) is additive only, runs on tiles that crossed the
+   0.05 / porn 0.015 gate, and ignores only boxes smaller than 6% of the crop side. Blocking
+   is a 2-screen confirmation: a positive Frame 1 flags the screen and Frame 2 must be
+   positive too; a safe Frame 2 clears the flag. A clearly explicit frame (combined `0.65`,
+   porn `0.40` or nude `0.40`) blocks instantly on Frame 1. The pixel gate is bypassed while
+   a positive frame waits for Frame 2 and whenever the last stage-1 score was `>= 0.08`, so
+   a static image can never dodge confirmation.
 5. **Verdict** — `HabitGuard.onAiMatch(context, "<pkg>:ai-screenshot", appLabel)` keeps the
    5-second dedupe stable, shows `• AI • APP`, presses Back before the overlay takes focus,
    and falls back to Home when the overlay was refused.
 6. **Diagnostics** — `getAiScannerStatus` / `testAiModels` / `canDrawOverlays` on the bridge;
-   live notification line (`AI scanning Telegram • Frames: 12 • mob 0.14 • nude 0.02`), and
+   live notification line (`Watching Telegram • Frame #12 • mob: 0.14 • nude: 0.02`,
+   or `AI Model Error: <reason>` when a model cannot load), and
    the Apps tab status card with a model self-test. Never let a model or screenshot failure
    disappear into a log line again.
 7. **Lifecycle** — models load lazily on the scanner thread (retried every 15 s after a
@@ -501,6 +509,14 @@ longer trusts `rootInActiveWindow` alone.
   Clear cache / Manage space / Reset fires the 0 ms overlay + BACK + HOME kick-out, and a
   destructive confirmation bottom sheet is caught from the dialog wording. Accessibility
   and device-admin deactivation screens stay blocked on entry.
+- [x] Part 19 — AI monitoring works again: the proven high-sensitivity thresholds are back
+  (combined `0.38`, explicit `0.20`, sexy `0.48`, NudeNet `0.20`, with an instant block at
+  `0.65` / porn `0.40` / nude `0.40` on Frame 1), full-width three-square crops trimming only
+  the top 8%, the 6%-side NudeNet box filter, a 0.05 / 0.015 / 0.05 stage-2 gate, and a
+  foreground latch that only an explicit app switch can stop (empty `service.windows` during
+  video no longer kills the scanner). The notification shows
+  `Watching <app> • Frame #N • mob: … • nude: …` or `AI Model Error: …`, and CI fails the
+  build unless both model files exist at their real sizes before Gradle runs.
 
 ## Build & run (Termux, no PC)
 
@@ -567,6 +583,9 @@ the accessibility XML are unchanged, so the service does not need to be toggled 
 Part 17 changes Kotlin only (two-screen confirmation, normalized crops, foreground and
 browser-domain latching), so the development APK must be rebuilt. The manifest and the
 accessibility XML are unchanged, so the service does not need to be toggled off and on.
+
+Part 19 changes Kotlin only (AI thresholds, crops, foreground latch and the live
+notification line) and hardens the CI model check, so the development APK must be rebuilt.
 
 Part 18 changes Kotlin only (App info allowance, click interception and confirmation
 wording), so the development APK must be rebuilt. The manifest and the accessibility XML are
