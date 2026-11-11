@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-11 (Part 16: monotonic Clean streak counter on Home)_
+_Last updated: 2026-11-11 (Part 17: two-screen AI confirmation, crash-proof crops, foreground/browser latching)_
 
 ## Product
 
@@ -243,19 +243,22 @@ section lists the surface area and the rules the engine keeps.
    event (window state changed, windows changed, content changed, text changed, scrolled),
    because a monitored app can become visible without a window-state change. The router
    starts the loop when protection is on, AI monitoring is enabled and the package is in
-   `monitoredAppPackages`; it stops on Habit, the launcher or any other app, and it keeps
-   running for SystemUI so the notification stays readable inside a watched app.
+   `monitoredAppPackages`; it stops on Habit, the launcher or any other app. The foreground
+   package is resolved from the event and `rootInActiveWindow` while ignoring transient
+   overlays (SystemUI shade / volume panel, soft keyboards) and is latched, so pulling down
+   the notification shade or opening a keyboard inside a watched app never stops the loop.
 3. **Capture** — `AccessibilityService.takeScreenshot()` (Android 11+/API 30) on the default
    display while the screen is interactive. The frame is copied from the hardware buffer to
    ARGB_8888 and cut into top, centre and bottom squares. `FLAG_SECURE` windows are the
    honest “protected screens” limit.
 4. **Classification** — stage 1 (NSFW MobileNetV2, `FLOAT32 [1,224,224,3] -> [1,5]`) scores
-   `Porn + Hentai + sexyWeight*Sexy` (`0.85` high, `0.60` balanced, `0.30` low) and blocks on
-   its own: high = combined 0.45, `Porn + Hentai` 0.25 or `Sexy` 0.55; balanced = combined
-   0.58 or `Porn + Hentai` 0.35. Stage 2 (NudeNet 320n, `FLOAT32 [N,3,H,W] -> [N,22,A]`) is
-   additive only — it never clears a stage 1 hit, runs only on tiles that crossed the 0.04
-   gate, blocks at 0.25 (high) / 0.35 (balanced), and two consecutive borderline tiles
-   (NudeNet 0.14 or stage 1 0.24) still block. Sensitivity picks the preset.
+   `Porn + Hentai + sexyWeight*Sexy` (`0.85` high, `0.60` balanced, `0.30` low). A tile is
+   **positive** when it reaches combined `0.42`, `Porn + Hentai` `0.22`, `Sexy` `0.52` or
+   NudeNet `s_nude_max` `0.22`; stage 2 (NudeNet 320n, `FLOAT32 [N,3,H,W] -> [N,22,A]`) is
+   additive only and runs on tiles that crossed the 0.04 gate. Blocking is a strict
+   2-screen confirmation: a positive Frame 1 only flags the screen and Frame 2 must be
+   positive too; a safe Frame 2 clears the flag. The pixel gate is bypassed while a positive
+   frame waits for Frame 2, so a static image can never dodge confirmation.
 5. **Verdict** — `HabitGuard.onAiMatch(context, "<pkg>:ai-screenshot", appLabel)` keeps the
    5-second dedupe stable, shows `• AI • APP`, presses Back before the overlay takes focus,
    and falls back to Home when the overlay was refused.
@@ -480,6 +483,12 @@ longer trusts `rootInActiveWindow` alone.
   protection is ON with no OFF window, reset by every counted block and by protection
   turning OFF, exposed as `currentStreakMs` / `bestStreakMs` in `getSnapshot()`, and shown
   as the amber “Clean streak” Home card with milestone pill and best record.
+- [x] Part 17 — Reliable AI app + browser monitoring: strict 2-screen confirmation
+  (positive Frame 1 flags, positive Frame 2 blocks, safe Frame 2 clears) with the pixel gate
+  disabled while confirmation is pending; crash-proof normalized tile crops (top 12% header
+  and leftmost 15% avatar strip excluded); latched foreground package that ignores transient
+  overlays; and a latched watched browser domain that survives a hidden URL bar until a new
+  non-matching URL is read, plus flexible root-domain / `t.me` alias matching.
 
 ## Build & run (Termux, no PC)
 
@@ -542,6 +551,10 @@ XML are unchanged, so the service does not need to be toggled off and on.
 Part 16 adds the native streak engine and its two snapshot fields, so the development APK
 must be rebuilt before Home can show a real streak (an older APK reports 0). The manifest and
 the accessibility XML are unchanged, so the service does not need to be toggled off and on.
+
+Part 17 changes Kotlin only (two-screen confirmation, normalized crops, foreground and
+browser-domain latching), so the development APK must be rebuilt. The manifest and the
+accessibility XML are unchanged, so the service does not need to be toggled off and on.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,

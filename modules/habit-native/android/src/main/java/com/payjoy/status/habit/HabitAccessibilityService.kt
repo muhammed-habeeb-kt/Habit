@@ -27,6 +27,15 @@ class HabitAccessibilityService : AccessibilityService() {
   /** Throttles the AI router: content-changed events arrive many times per second. */
   private var lastRoutedPackage: String? = null
   private var lastRoutedAt = 0L
+  /**
+   * The app the user is really in, latched across transient overlays (notification shade,
+   * volume panel, soft keyboard). Once a monitored app is in front it keeps the 1 s loop
+   * alive until a different non-monitored app or the launcher takes over.
+   */
+  @Volatile private var currentForegroundAppPackage: String? = null
+  /** Last watched website matched in a browser tab, kept while the URL bar is hidden. */
+  @Volatile private var latchedBrowserDomain: String? = null
+  @Volatile private var latchedBrowserPackage: String? = null
   /** The launcher package never changes while the service runs. */
   @Volatile private var cachedHomePackage: String? = null
   /** Drives the continuous 100 ms Settings poll; idle whenever Settings is not in front. */
@@ -135,15 +144,15 @@ class HabitAccessibilityService : AccessibilityService() {
    * is on screen — full screen, split screen or a floating window — and everything else
    * stops it.
    */
-  private fun updateAiScanner(pkg: String) {
+  private fun updateAiScanner(eventPackage: String) {
     try {
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
 
-      // SystemUI is the notification shade / volume panel. It is not a different app, and
-      // pulling the shade down inside a watched app is exactly how the user reads the live
-      // AI line in the notification, so it must not stop the loop.
-      if (pkg == SYSTEM_UI_PACKAGE) return
-
+      // SystemUI (shade / volume panel) and soft keyboards are transient overlays, never a
+      // different app. Resolving and latching the real foreground package keeps the loop
+      // alive behind them instead of stopping protection while the user is still inside a
+      // watched app or site.
+      val pkg = resolveForegroundPackage(eventPackage) ?: return
       val browser = pkg in BROWSER_PACKAGES
 
       // Every event comes through here, and TYPE_WINDOW_CONTENT_CHANGED can fire dozens of
@@ -158,6 +167,7 @@ class HabitAccessibilityService : AccessibilityService() {
       val state = HabitStore.state(this)
       val ai = HabitStore.aiSettings(this)
       if (!state.protectionEnabled || !ai.enabled) {
+        clearBrowserLatch()
         AiVisualScanner.stop()
         return
       }
@@ -172,6 +182,7 @@ class HabitAccessibilityService : AccessibilityService() {
       }
 
       if (pkg == packageName || pkg == homePackage()) {
+        clearBrowserLatch()
         AiVisualScanner.stop()
         return
       }
@@ -179,24 +190,44 @@ class HabitAccessibilityService : AccessibilityService() {
       if (browser) {
         val host = currentBrowserHost(pkg)
         if (host == null) {
-          // The URL bar empties for a moment while a page loads. Never let that window
-          // stop protection: keep a loop that already belongs to this browser.
-          if (AiVisualScanner.isRunning && !AiVisualScanner.isRunningForPackage(pkg)) {
+          // The URL bar empties for a moment while a page loads or while the browser hides
+          // it during scrolling / video playback. Never clear a watched website here: keep
+          // the latched domain (or the loop that already belongs to this browser) and keep
+          // scanning every 1000 ms until a new non-matching URL is actually read or the
+          // user leaves the browser.
+          val latched = if (latchedBrowserPackage == pkg) latchedBrowserDomain else null
+          val fallback = latched ?: if (AiVisualScanner.isRunningForPackage(pkg)) {
+            AiVisualScanner.runningDomain()
+          } else {
+            null
+          }
+          if (fallback != null) {
+            latchedBrowserPackage = pkg
+            latchedBrowserDomain = fallback
+            if (!AiVisualScanner.isRunningFor(pkg, fallback)) {
+              AiVisualScanner.start(this, pkg, fallback)
+            }
+          } else if (AiVisualScanner.isRunning && !AiVisualScanner.isRunningForPackage(pkg)) {
             AiVisualScanner.stop()
           }
           return
         }
-        // Subdomain-aware: web.telegram.org matches a watched telegram.org or itself.
+        // Flexible host matching: a watched telegram.org covers web.telegram.org,
+        // k.telegram.org and t.me, and vice versa.
         val domain = AdultFilter.monitoredDomainFor(host, ai.monitoredDomains)
         if (domain == null) {
-          // Navigated to a site that is not watched: scanning stops with the page.
+          // A real, different URL that is not watched: scanning stops with the page.
+          clearBrowserLatch()
           if (AiVisualScanner.isRunning) AiVisualScanner.stop()
           return
         }
+        latchedBrowserPackage = pkg
+        latchedBrowserDomain = domain
         if (!AiVisualScanner.isRunningFor(pkg, domain)) AiVisualScanner.start(this, pkg, domain)
         return
       }
 
+      clearBrowserLatch()
       if (pkg in ai.monitoredAppPackages) {
         if (!AiVisualScanner.isRunningFor(pkg)) AiVisualScanner.start(this, pkg)
       } else if (AiVisualScanner.isRunning) {
@@ -331,14 +362,66 @@ class HabitAccessibilityService : AccessibilityService() {
   /**
    * Host currently in the browser's URL bar, or null while the toolbar is empty, hidden or
    * still loading. Only the URL bar is read; the window title is the page title, not a URL.
+   *
+   * The active root is tried first, then every visible window of the browser, so a split /
+   * floating browser still reports the address of the page it shows.
    */
   private fun currentBrowserHost(pkg: String): String? {
-    val root = try {
+    val active = try {
       rootInActiveWindow
     } catch (error: Throwable) {
       null
     }
-    return browserHostFor(root, pkg)
+    browserHostFor(active, pkg)?.let { return it }
+    try {
+      windows?.forEach { window ->
+        if (!window.isVisible) return@forEach
+        val root = try {
+          window.root
+        } catch (error: Throwable) {
+          null
+        } ?: return@forEach
+        val rootPackage = try {
+          root.packageName?.toString()
+        } catch (error: Throwable) {
+          null
+        } ?: return@forEach
+        if (rootPackage != pkg) return@forEach
+        browserHostFor(root, pkg)?.let { return it }
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "browser window list unavailable: ${error.message}")
+    }
+    return null
+  }
+
+  /** True for the notification shade, the volume panel and every soft keyboard. */
+  private fun isTransientOverlay(pkg: String): Boolean =
+    pkg == SYSTEM_UI_PACKAGE ||
+      pkg in TRANSIENT_OVERLAY_PACKAGES ||
+      pkg.contains("inputmethod", ignoreCase = true) ||
+      pkg.contains("keyboard", ignoreCase = true) ||
+      pkg.endsWith(".input", ignoreCase = true)
+
+  /**
+   * The app the user is actually in, latched across transient overlays.
+   *
+   * The event package is the window that just changed, so it wins when it is a real app.
+   * When it is SystemUI / a keyboard (or missing), `rootInActiveWindow` is used instead, and
+   * finally the previously latched package. Only a non-transient package is ever latched, so
+   * pulling down the shade or opening a keyboard can never stop the scanner.
+   */
+  private fun resolveForegroundPackage(eventPackage: String): String? {
+    val eventCandidate = eventPackage.takeIf { it.isNotEmpty() && !isTransientOverlay(it) }
+    val rootCandidate = foregroundPackage()?.takeIf { !isTransientOverlay(it) }
+    val resolved = eventCandidate ?: rootCandidate ?: currentForegroundAppPackage
+    if (resolved != null && resolved != packageName) currentForegroundAppPackage = resolved
+    return resolved
+  }
+
+  private fun clearBrowserLatch() {
+    latchedBrowserPackage = null
+    latchedBrowserDomain = null
   }
 
   /** URL-bar host of one browser window root (the active one, or a split/floating one). */
@@ -407,12 +490,15 @@ class HabitAccessibilityService : AccessibilityService() {
       if (windowPackage in BROWSER_PACKAGES) {
         val host = browserHostFor(root, windowPackage) ?: currentBrowserHost(windowPackage)
         domain = if (host == null) {
-          // Private or still-loading page: keep a loop that already belongs to this browser
-          // (fail closed) instead of dropping protection.
-          if (AiVisualScanner.isRunningForPackage(windowPackage)) {
-            AiVisualScanner.runningDomain()
-          } else {
-            null
+          // Private or still-loading page, or a toolbar hidden by scrolling / video: keep
+          // the latched watched site (or a loop that already belongs to this browser, fail
+          // closed) instead of dropping protection.
+          when {
+            windowPackage == latchedBrowserPackage && latchedBrowserDomain != null ->
+              latchedBrowserDomain
+            AiVisualScanner.isRunningForPackage(windowPackage) ->
+              AiVisualScanner.runningDomain()
+            else -> null
           }
         } else {
           AdultFilter.monitoredDomainFor(host, ai.monitoredDomains)
@@ -896,6 +982,22 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val INCOGNITO_NODE_BUDGET = 900
     private const val INCOGNITO_MAX_DEPTH = 30
     private const val INCOGNITO_MAX_TEXT = 24_000
+
+    /**
+     * Overlay packages that are never treated as a different foreground app: the system UI
+     * (notification shade, volume panel) and the common soft keyboards.
+     */
+    private val TRANSIENT_OVERLAY_PACKAGES = setOf(
+      "com.android.systemui",
+      "com.google.android.inputmethod.latin",
+      "com.android.inputmethod.latin",
+      "com.google.android.inputmethod",
+      "com.samsung.android.honeyboard",
+      "com.miui.inputmethod",
+      "com.baidu.input",
+      "com.sohu.inputmethod.sogou",
+      "com.iflytek.inputmethod"
+    )
 
     /**
      * Menu items / buttons that open a private session. Blocked on the tap itself, before

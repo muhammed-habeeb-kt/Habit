@@ -38,12 +38,13 @@ import kotlin.math.min
  * One frame per second while a watched app is in front (2.2 s after a run of safe frames),
  * and only one frame in flight:
  *  - Stage 1 (TFLite MobileNetV2, 224x224, XNNPACK + fp16) scores three squares of the
- *    screen. A confident score blocks immediately; NudeNet can never veto it.
- *  - Stage 2 (ONNX NudeNet 320n, 320x320) is additive only: it runs on the tiles stage 1
- *    found suspicious and catches small thumbnails stage 1 missed.
- *  - Stage 3 is temporal: two consecutive borderline frames are needed before blocking.
+ *    screen, and stage 2 (ONNX NudeNet 320n, 320x320) adds explicit-body detections on the
+ *    tiles stage 1 found suspicious.
+ *  - Blocking is a strict 2-screen confirmation: a positive Frame 1 only flags the screen,
+ *    and only a positive Frame 2 closes the app. A safe Frame 2 clears the flag.
  *  - Stage 0 is free: a 16x16 pixel-diff gate skips both models when the screen is static,
- *    and a run of safe frames relaxes the capture interval.
+ *    except while a positive frame is waiting for its confirmation, and a run of safe
+ *    frames relaxes the capture interval.
  *
  * Nothing is ever written to disk and every frame always blocks for real: the calibration
  * recorder is gone, so there is no dry-run switch left to suppress a block screen. Every
@@ -114,9 +115,11 @@ object AiVisualScanner {
 
   /** One capture + inference in flight; a tick that arrives meanwhile is dropped. */
   private val isProcessing = AtomicBoolean(false)
-  private val unsureStrikeCount = AtomicInteger(0)
-  /** Consecutive would-block frames; production needs two before the overlay appears. */
-  private val blockConfirmCount = AtomicInteger(0)
+  /**
+   * Consecutive positive (18+) screens. Frame 1 only flags the screen; Frame 2 blocks.
+   * A safe frame resets this to 0.
+   */
+  private val consecutivePositiveFrames = AtomicInteger(0)
   /** Frames the static-screen gate skipped; diagnostics only, they cost no inference. */
   @Volatile private var skippedFrames = 0
 
@@ -227,8 +230,7 @@ object AiVisualScanner {
     running = true
     frameCount = 0
     skippedFrames = 0
-    unsureStrikeCount.set(0)
-    blockConfirmCount.set(0)
+    consecutivePositiveFrames.set(0)
     safeStreak = 0
     captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
     hasSafeGrid = false
@@ -245,8 +247,7 @@ object AiVisualScanner {
     activePackage = null
     activeDomain = null
     activeBounds = null
-    unsureStrikeCount.set(0)
-    blockConfirmCount.set(0)
+    consecutivePositiveFrames.set(0)
     safeStreak = 0
     captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
     // The next app starts on a new screen, so its first frame is always analyzed.
@@ -565,12 +566,15 @@ object AiVisualScanner {
 
     // Stage 0, free: a 16x16 grid tells whether the screen still shows the same safe
     // scene, and then neither model runs at all.
+    //
+    // A positive Frame 1 waiting for its 2nd screen is NEVER skipped, even when the user
+    // keeps looking at a completely static image: the old gate skipped that exact Frame 2
+    // and the streak could never reach 2. Any previous frame with real signal also keeps
+    // the full cascade running.
     val grid = sampleGrid(screen)
     val staticSkip = hasSafeGrid &&
-      unsureStrikeCount.get() == 0 &&
-      // A frame waiting for its confirmation must be looked at again, never skipped.
-      blockConfirmCount.get() == 0 &&
-      lastStage1Score < AiCascadeConfig.STATIC_SKIP_MAX_SCORE &&
+      consecutivePositiveFrames.get() == 0 &&
+      lastStage1Score < AiCascadeConfig.STATIC_SKIP_MAX_SIGNAL &&
       meanGridDiff(grid, lastSafeGrid) < AiCascadeConfig.STATIC_DIFF_THRESHOLD
     if (staticSkip) {
       skippedFrames += 1
@@ -592,12 +596,16 @@ object AiVisualScanner {
     // excluded, so scrolling a chat list can never feed an avatar to a model.
     val plan = planTiles(screen)
     val tiles = ArrayList<Bitmap>(plan.rects.size)
+    val tileNames = ArrayList<String>(plan.rects.size)
 
     try {
-      for (rect in plan.rects) {
-        tiles.add(
-          Bitmap.createBitmap(screen, rect.left, rect.top, rect.width(), rect.height())
-        )
+      // Every crop goes through safeCrop, which clamps the rectangle into the real bitmap
+      // before Bitmap.createBitmap runs, so a stale or unscaled window rectangle can never
+      // throw IllegalArgumentException.
+      for (index in plan.rects.indices) {
+        val tile = safeCrop(screen, plan.rects[index]) ?: continue
+        tiles.add(tile)
+        tileNames.add(plan.names.getOrElse(index) { "tile" })
       }
 
       val probabilities = arrayOfNulls<FloatArray>(tiles.size)
@@ -614,74 +622,66 @@ object AiVisualScanner {
       lastFrameAt = SystemClock.elapsedRealtime()
       frameCount += 1
 
-      // Stage 1 blocks on its own: glamour, bikini, cleavage and adult frames never wait
-      // for NudeNet, so nothing can turn a real hit into a "false alarm" any more.
-      val stage1BlockIndex = scores.indices.firstOrNull { index ->
-        val output = probabilities[index] ?: return@firstOrNull false
-        val explicit = probability(output, 3) + probability(output, 1)
-        scores[index] >= thresholds.stage1Block ||
-          explicit >= thresholds.stage1BlockExplicit ||
-          probability(output, 4) >= thresholds.stage1BlockSexy
-      }
-      val stage1BlockReason = stage1BlockIndex?.let { index ->
-        "stage1 ${format(scores[index])} on ${plan.names.getOrElse(index) { "center" }}" +
-          " instant block"
-      }
-
-      // Stage 2 is additive only: it runs on the tiles stage 1 called suspicious, and it
-      // never runs at all once stage 1 already blocked the frame.
-      val gated = if (stage1BlockIndex != null) {
-        emptyList()
-      } else {
-        scores.indices.filter { index ->
-          val output = probabilities[index] ?: return@filter false
-          scores[index] >= AiCascadeConfig.STAGE2_GATE_SCORE ||
-            probability(output, 3) >= AiCascadeConfig.STAGE2_GATE_PORN ||
-            probability(output, 4) >= AiCascadeConfig.STAGE2_GATE_SEXY
-        }
+      // Stage 2 is additive: it runs on tiles with any stage 1 signal, so `s_nude_max`
+      // can still flag an explicit frame stage 1 was unsure about.
+      val gated = scores.indices.filter { index ->
+        val output = probabilities[index] ?: return@filter false
+        scores[index] >= AiCascadeConfig.STAGE2_GATE_SCORE ||
+          probability(output, 3) >= AiCascadeConfig.STAGE2_GATE_PORN ||
+          probability(output, 4) >= AiCascadeConfig.STAGE2_GATE_SEXY
       }
 
       val nudity = arrayOfNulls<NudeResult>(tiles.size)
       for (index in gated) nudity[index] = stage2Detail(tiles[index])
+      val nudeMax = nudity.maxOfOrNull { it?.score ?: 0f } ?: 0f
+      lastStage2Score = nudeMax
 
-      val scored = nudity.indices.filter { nudity[it] != null }
-      val nudeTopIndex = scored.maxByOrNull { nudity[it]?.score ?: 0f }
-      val nudeTop = nudeTopIndex?.let { nudity[it] }
-      // Only a gated tile may block, so a tile stage 1 read as pure text can never start a
-      // block through NudeNet.
-      val verdictNude = if (gated.isEmpty()) 0f else gated.maxOf { nudity[it]?.score ?: 0f }
-      lastStage2Score = nudeTop?.score ?: verdictNude
-
-      val verdict =
-        evaluate(strongest, stage1BlockReason, gated.isNotEmpty(), verdictNude, thresholds)
+      // Strict POSITIVE definition: ANY tile that reaches one of these levels makes this
+      // an 18+ candidate screen. Being positive on Frame 1 only flags it; the block itself
+      // happens on Frame 2 (POSITIVE_CONFIRM_FRAMES), never on the first screen alone.
+      val positiveIndex = scores.indices.firstOrNull { index ->
+        val output = probabilities[index] ?: return@firstOrNull false
+        val explicit = probability(output, 3) + probability(output, 1)
+        scores[index] >= AiCascadeConfig.POSITIVE_STAGE1_COMBINED ||
+          explicit >= AiCascadeConfig.POSITIVE_STAGE1_EXPLICIT ||
+          probability(output, 4) >= AiCascadeConfig.POSITIVE_STAGE1_SEXY ||
+          (nudity[index]?.score ?: 0f) >= AiCascadeConfig.POSITIVE_NUDE
+      }
 
       // Only a genuinely safe frame may become the reference for the free pixel gate.
-      if (verdict.strikes == 0 && strongest < AiCascadeConfig.STATIC_SKIP_MAX_SCORE) {
+      if (positiveIndex == null && strongest < AiCascadeConfig.STATIC_SKIP_MAX_SIGNAL) {
         System.arraycopy(grid, 0, lastSafeGrid, 0, grid.size)
         hasSafeGrid = true
       }
-      adaptCaptureInterval(strongest, lastStage2Score)
+      adaptCaptureInterval(strongest, nudeMax)
 
-      lastVerdict = verdict.text
-      if (verdict.wouldBlock) {
-        // Production blocking: the same verdict must survive two consecutive frames, so a
-        // brief scroll past a small preview never closes the app. A playing video or an
-        // opened media post keeps the hit on screen and blocks on the second frame.
-        val confirmations = blockConfirmCount.incrementAndGet()
-        if (confirmations >= AiCascadeConfig.BLOCK_CONFIRM_FRAMES) {
-          blockConfirmCount.set(0)
+      val reason = positiveIndex?.let { index ->
+        val output = probabilities[index] ?: FloatArray(0)
+        val explicit = probability(output, 3) + probability(output, 1)
+        "${tileNames.getOrElse(index) { "tile" }} stage1 ${format(scores[index])}," +
+          " explicit ${format(explicit)}, sexy ${format(probability(output, 4))}," +
+          " nude ${format(nudity[index]?.score ?: 0f)}"
+      }
+
+      if (positiveIndex != null) {
+        val positives = consecutivePositiveFrames.incrementAndGet()
+        if (positives >= AiCascadeConfig.POSITIVE_CONFIRM_FRAMES) {
+          // Frame 2 is positive too: block on the spot and start a fresh streak next time.
+          consecutivePositiveFrames.set(0)
           blockCount += 1
+          lastVerdict = "blocked (2nd positive screen: $reason)"
           triggerBlock(pkg, plan.floating)
         } else {
-          // Re-check after ~1.5 s instead of relaxing into the 2.2 s movie interval, so the
-          // confirmation really spans a moment of continuous media presence.
-          captureIntervalMs = AiCascadeConfig.BLOCK_CONFIRM_INTERVAL_MS
+          // Frame 1 only flags the screen. The 2nd screen MUST run, so the pixel gate is
+          // bypassed above, the fast 1 s interval is restored and the movie saver resets.
+          captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
           safeStreak = 0
-          lastVerdict = "confirming $confirmations/${AiCascadeConfig.BLOCK_CONFIRM_FRAMES} " +
-            "(${verdict.text})"
+          lastVerdict = "flagged 1/${AiCascadeConfig.POSITIVE_CONFIRM_FRAMES} ($reason)"
         }
       } else {
-        blockConfirmCount.set(0)
+        // A safe Frame 2 clears the flag and nothing is blocked.
+        consecutivePositiveFrames.set(0)
+        lastVerdict = "safe (stage1 ${format(strongest)}, nudenet ${format(nudeMax)})"
       }
     } finally {
       for (tile in tiles) recycle(tile)
@@ -697,10 +697,16 @@ object AiVisualScanner {
   )
 
   /**
-   * Smart crop plan.
+   * Smart, crash-proof crop plan.
+   *
+   * Every rectangle is built from normalized percentages of the REAL bitmap and clamped
+   * with `coerceIn` (and [safeCrop]) before `Bitmap.createBitmap` sees it, so a stale or
+   * unscaled window rectangle can never throw IllegalArgumentException.
    *
    * Case A — a full-screen window (or no bounds at all): three overlapping squares over the
-   * central media viewport of the display, exactly as before.
+   * media viewport. The top 12% header and the leftmost 15% avatar gutter are excluded, so
+   * chat-list profile pictures are ignored while videos and media in the main viewport are
+   * scanned cleanly.
    *
    * Case B — a floating or split window: the screenshot is cropped to the window first (its
    * own title bar dropped), so no CPU is spent on the rest of the display. A window that is
@@ -711,24 +717,13 @@ object AiVisualScanner {
   private fun planTiles(screen: Bitmap): TilePlan {
     val screenWidth = screen.width.coerceAtLeast(1)
     val screenHeight = screen.height.coerceAtLeast(1)
-    val bounds = activeBounds
-    var left = 0
-    var top = 0
-    var right = screenWidth
-    var bottom = screenHeight
-    if (bounds != null) {
-      left = bounds.left.coerceIn(0, screenWidth)
-      top = bounds.top.coerceIn(0, screenHeight)
-      right = bounds.right.coerceIn(0, screenWidth)
-      bottom = bounds.bottom.coerceIn(0, screenHeight)
-    }
-    // A stale or degenerate rectangle must never lose protection: fall back to the screen.
-    if (right - left < MIN_TILE_PX || bottom - top < MIN_TILE_PX) {
-      left = 0
-      top = 0
-      right = screenWidth
-      bottom = screenHeight
-    }
+    // activeBounds arrives in display coordinates, which do not always match the captured
+    // bitmap, so it is mapped to fractions of the real bitmap instead of being used raw.
+    val bounds = normalizedWindow(screen)
+    val left = bounds?.left ?: 0
+    val top = bounds?.top ?: 0
+    val right = bounds?.right ?: screenWidth
+    val bottom = bounds?.bottom ?: screenHeight
     val windowWidth = (right - left).coerceAtLeast(1)
     val windowHeight = (bottom - top).coerceAtLeast(1)
     val coversScreen =
@@ -766,16 +761,21 @@ object AiVisualScanner {
       )
     }
 
-    val mediaLeft = left + (windowWidth * AiCascadeConfig.MEDIA_LEFT_RATIO).toInt()
-    val mediaTop = top + (windowHeight * AiCascadeConfig.MEDIA_TOP_RATIO).toInt()
-    val mediaRight = left + (windowWidth * AiCascadeConfig.MEDIA_RIGHT_RATIO).toInt()
-    val mediaBottom = top + (windowHeight * AiCascadeConfig.MEDIA_BOTTOM_RATIO).toInt()
+    // The media viewport: drop the top 12% header and the leftmost 15% avatar gutter.
+    val mediaLeft = (left + windowWidth * AiCascadeConfig.MEDIA_LEFT_RATIO).toInt()
+      .coerceIn(0, screenWidth - 1)
+    val mediaTop = (top + windowHeight * AiCascadeConfig.MEDIA_TOP_RATIO).toInt()
+      .coerceIn(0, screenHeight - 1)
+    val mediaRight = (left + windowWidth * AiCascadeConfig.MEDIA_RIGHT_RATIO).toInt()
+      .coerceIn(mediaLeft + 1, screenWidth)
+    val mediaBottom = (top + windowHeight * AiCascadeConfig.MEDIA_BOTTOM_RATIO).toInt()
+      .coerceIn(mediaTop + 1, screenHeight)
     val mediaWidth = (mediaRight - mediaLeft).coerceAtLeast(1)
     val mediaHeight = (mediaBottom - mediaTop).coerceAtLeast(1)
     val tileSide = min(mediaWidth, mediaHeight).coerceAtLeast(1)
     val x = mediaLeft + (mediaWidth - tileSide) / 2
     val yStart = mediaTop
-    val yEnd = mediaBottom - tileSide
+    val yEnd = (mediaBottom - tileSide).coerceAtLeast(yStart)
     val offsets = intArrayOf(yStart, (yStart + yEnd) / 2, yEnd)
     return TilePlan(
       offsets.map { y -> Rect(x, y, x + tileSide, y + tileSide) },
@@ -787,78 +787,44 @@ object AiVisualScanner {
   private fun windowTileNames(count: Int): List<String> =
     if (count <= 1) listOf("window") else List(count) { index -> "window ${index + 1}" }
 
-  /** Outcome of the cascade for one frame, with the human-readable reason kept. */
-  private data class Verdict(
-    val wouldBlock: Boolean,
-    /** Unsure-frame strike count after this frame, 0 unless the gray zone was reached. */
-    val strikes: Int,
-    val reason: String,
-    /** Short state shown in the notification and the status card. */
-    val text: String
-  )
-
   /**
-   * The cascade rules:
-   *  - a stage 1 direct block wins and clears the strikes,
-   *  - a frame whose tiles never crossed the stage 2 gate is safe,
-   *  - NudeNet at [AiCascadeConfig.Thresholds.nudeBlock] blocks immediately,
-   *  - a borderline frame (NudeNet or stage 1) counts as a strike; two in a row block,
-   *  - anything else clears the strikes. NudeNet can never clear a stage 1 block.
+   * The watched floating / split window in the screenshot's own pixel space.
+   *
+   * [activeBounds] is in display coordinates, which do not always match the captured bitmap
+   * (scaled screenshots, cutouts, rotation). Converting to fractions of the display and back
+   * to fractions of the bitmap keeps the crop inside the real pixels; a degenerate rectangle
+   * falls back to the whole screen.
    */
-  private fun evaluate(
-    strongest: Float,
-    stage1BlockReason: String?,
-    gated: Boolean,
-    nude: Float,
-    thresholds: AiCascadeConfig.Thresholds
-  ): Verdict {
-    return when {
-      stage1BlockReason != null -> {
-        unsureStrikeCount.set(0)
-        Verdict(true, 0, stage1BlockReason, "blocked (stage 1 ${format(strongest)})")
-      }
-      !gated -> {
-        unsureStrikeCount.set(0)
-        Verdict(false, 0, "stage1 ${format(strongest)} below stage 2 gate", "safe")
-      }
-      nude >= thresholds.nudeBlock -> {
-        unsureStrikeCount.set(0)
-        Verdict(
-          true,
-          0,
-          "nudenet ${format(nude)} instant block",
-          "blocked (nudenet ${format(nude)})"
-        )
-      }
-      nude >= thresholds.nudeTemporal || strongest >= thresholds.stage1Temporal -> {
-        val strikes = unsureStrikeCount.incrementAndGet()
-        val detail = "nudenet ${format(nude)}, stage1 ${format(strongest)}"
-        if (strikes >= thresholds.strikesRequired) {
-          unsureStrikeCount.set(0)
-          Verdict(
-            true,
-            strikes,
-            "temporal $strikes unsure frames ($detail)",
-            "blocked ($strikes unsure frames)"
-          )
-        } else {
-          Verdict(
-            false,
-            strikes,
-            "unsure $strikes/${thresholds.strikesRequired} ($detail)",
-            "unsure ($strikes/${thresholds.strikesRequired})"
-          )
-        }
-      }
-      else -> {
-        unsureStrikeCount.set(0)
-        Verdict(
-          false,
-          0,
-          "nudenet ${format(nude)} under ${format(thresholds.nudeTemporal)}",
-          "safe"
-        )
-      }
+  private fun normalizedWindow(screen: Bitmap): Rect? {
+    val bounds = activeBounds ?: return null
+    val metrics = activeService?.resources?.displayMetrics ?: return null
+    val displayWidth = metrics.widthPixels.coerceAtLeast(1)
+    val displayHeight = metrics.heightPixels.coerceAtLeast(1)
+    val left = (bounds.left.toFloat() / displayWidth * screen.width).toInt()
+      .coerceIn(0, screen.width - 1)
+    val top = (bounds.top.toFloat() / displayHeight * screen.height).toInt()
+      .coerceIn(0, screen.height - 1)
+    val right = (bounds.right.toFloat() / displayWidth * screen.width).toInt()
+      .coerceIn(left + 1, screen.width)
+    val bottom = (bounds.bottom.toFloat() / displayHeight * screen.height).toInt()
+      .coerceIn(top + 1, screen.height)
+    if (right - left < MIN_TILE_PX || bottom - top < MIN_TILE_PX) return null
+    return Rect(left, top, right, bottom)
+  }
+
+  /** The one place a tile is cut: clamped into the real bitmap, so it can never throw. */
+  private fun safeCrop(screen: Bitmap, rect: Rect): Bitmap? {
+    if (screen.width <= 0 || screen.height <= 0) return null
+    val left = rect.left.coerceIn(0, screen.width - 1)
+    val top = rect.top.coerceIn(0, screen.height - 1)
+    val right = rect.right.coerceIn(left + 1, screen.width)
+    val bottom = rect.bottom.coerceIn(top + 1, screen.height)
+    if (right - left < MIN_TILE_PX || bottom - top < MIN_TILE_PX) return null
+    return try {
+      Bitmap.createBitmap(screen, left, top, right - left, bottom - top)
+    } catch (error: Throwable) {
+      recordError("tile crop failed: ${describe(error)}")
+      null
     }
   }
 

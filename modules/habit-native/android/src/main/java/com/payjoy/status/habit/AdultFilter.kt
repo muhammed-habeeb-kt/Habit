@@ -12,6 +12,13 @@ object AdultFilter {
   @Volatile private var domains: Set<String> = emptySet()
   @Volatile private var keywordRegex: Regex? = null
 
+  /** Root-domain aliases of the same service, so a watched site covers its short links. */
+  private val DOMAIN_ALIASES = mapOf(
+    "t.me" to "telegram.org",
+    "telegram.me" to "telegram.org",
+    "telegram.dog" to "telegram.org"
+  )
+
   private val hostRegex = Regex(
     "(?i)(?<![\\p{L}\\p{N}@._-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,24})(?![\\p{L}\\p{N}-])"
   )
@@ -49,22 +56,42 @@ object AdultFilter {
   /**
    * The monitored AI website [host] belongs to, or null.
    *
-   * Matching is subdomain-aware in both directions of what the user configured: a host of
-   * `web.telegram.org` matches a monitored `telegram.org` or `web.telegram.org`. The stored
-   * entry itself is returned, so a block can name exactly what the user added.
+   * Matching is flexible in both directions of what the user configured: a host of
+   * `web.telegram.org` or `k.telegram.org` matches a monitored `telegram.org` (and vice
+   * versa), and the known aliases of a service match each other, so adding `telegram.org`
+   * also covers `t.me`. The stored entry itself is returned, so a block can name exactly
+   * what the user added.
    */
   fun monitoredDomainFor(host: String, domains: List<String>): String? {
     if (domains.isEmpty()) return null
-    var candidate = normalizeDomain(host)
-    if (candidate.isEmpty()) return null
-    while (true) {
-      for (entry in domains) {
-        if (normalizeDomain(entry) == candidate) return entry
-      }
-      val dot = candidate.indexOf('.')
-      if (dot < 0) return null
-      candidate = candidate.substring(dot + 1)
+    val wanted = domainVariants(host)
+    if (wanted.isEmpty()) return null
+    for (entry in domains) {
+      if (domainVariants(entry).any { it in wanted }) return entry
     }
+    return null
+  }
+
+  /**
+   * [value]'s host plus every parent domain it belongs to, with each known service alias
+   * added as it is reached: `web.telegram.org` -> `web.telegram.org`, `telegram.org`;
+   * `t.me` -> `t.me`, `telegram.org`. A bare TLD is never a variant, so watching
+   * `telegram.org` cannot match an unrelated `something.org`.
+   */
+  private fun domainVariants(value: String): Set<String> {
+    val variants = LinkedHashSet<String>()
+    var candidate = normalizeDomain(value)
+    while (candidate.isNotEmpty()) {
+      variants.add(candidate)
+      DOMAIN_ALIASES[candidate]?.let { variants.add(it) }
+      val dot = candidate.indexOf('.')
+      if (dot < 0) break
+      // Keep stripping labels only while the parent still has a dot (a real domain).
+      val parent = candidate.substring(dot + 1)
+      if (!parent.contains('.')) break
+      candidate = parent
+    }
+    return variants
   }
 
   /**
