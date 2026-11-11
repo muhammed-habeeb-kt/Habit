@@ -351,15 +351,21 @@ end protection. No screenshot, no model, nothing captured or stored.
    6 000-node / depth 60 runaway guard instead of a page-sized cap, because “Turn off Habit?”
    is a separate dialog window.
 5. **Triggers (case-insensitive)** — `Use Habit`, `Habit shortcut`, `Turn off Habit`,
-   `Habit blocks adult websites`; a tap on a `Habit` row while the window shows
-   `Accessibility` / `Downloaded apps`; Habit’s name next to `App info` + `Settings`; Habit’s
-   name next to `Force stop`, `Clear data`, `Clear all data`, `Uninstall`, `Deactivate` or
-   `Remove admin`. Destructive taps and their confirmation dialogs are refused even during
-   grace.
+   `Habit blocks adult websites`; a tap on a Habit row while the window shows
+   `Accessibility` / `Downloaded apps`; Habit’s device-admin page by `Deactivate this device
+   admin` / `Remove admin` (blocked on entry); a tap on `Force stop`, `Uninstall`, `Delete`,
+   `Clear data`, `Clear all data`, `Clear cache`, `Manage space`, `Reset`, `Deactivate` or
+   `Remove admin` while Habit’s App info / Storage page is open; and its confirmation bottom
+   sheet (`Force stop?`, `If you force stop`, `Misbehave`, `Clear all data?`, `All of this
+   app’s data`, `Deleted permanently`, `Clear cache?`, `Do you want to uninstall`, …).
+   Habit’s plain App info page is deliberately allowed — buttons being visible is not
+   tampering — so App permissions, Notifications, Power and the `⋮` menu (`Allow restricted
+   settings`) stay reachable. `isHabitAppInfoContext` is derived from all open Settings
+   windows, because the confirmation dialog in front may not repeat the app name.
 6. **Grace window** — `HabitModule.openBatterySettings` / `openAutostartSettings` /
-   `openAppDetails` mark `HabitStore.markTamperGrace` (`TAMPER_GRACE_MS`, 12 s) before starting
-   the intent, so the plain app-info page those “Fix” buttons need can be read. It never
-   covers the accessibility screen, a destructive tap or a dialog.
+   `openAppDetails` still mark `HabitStore.markTamperGrace` (`TAMPER_GRACE_MS`, 12 s) before
+   starting the intent. The App info page no longer needs it; destructive taps and dialogs
+   are refused whether or not it is active.
 7. **Kick-out** — `HabitGuard.onTamperDetected` shows the opaque `BlockOverlay` with the
    `• TAMPER SHIELD` badge first, at 0 ms, so the switch under the finger is covered, then
    fires four escape pulses at 0/80/180/320 ms, each one BACK, BACK, HOME. The tamper shield
@@ -489,6 +495,12 @@ longer trusts `rootInActiveWindow` alone.
   and leftmost 15% avatar strip excluded); latched foreground package that ignores transient
   overlays; and a latched watched browser domain that survives a hidden URL bar until a new
   non-matching URL is read, plus flexible root-domain / `t.me` alias matching.
+- [x] Part 18 — Tamper-shield refinement for Habit’s App info page: opening App info,
+  Storage, Permissions or Notifications is allowed (visible buttons no longer trigger the
+  shield), while a tap on Force stop / Uninstall / Delete / Clear data / Clear all data /
+  Clear cache / Manage space / Reset fires the 0 ms overlay + BACK + HOME kick-out, and a
+  destructive confirmation bottom sheet is caught from the dialog wording. Accessibility
+  and device-admin deactivation screens stay blocked on entry.
 
 ## Build & run (Termux, no PC)
 
@@ -555,6 +567,11 @@ the accessibility XML are unchanged, so the service does not need to be toggled 
 Part 17 changes Kotlin only (two-screen confirmation, normalized crops, foreground and
 browser-domain latching), so the development APK must be rebuilt. The manifest and the
 accessibility XML are unchanged, so the service does not need to be toggled off and on.
+
+Part 18 changes Kotlin only (App info allowance, click interception and confirmation
+wording), so the development APK must be rebuilt. The manifest and the accessibility XML are
+unchanged, and `typeViewClicked` is already declared, so the service does not need to be
+toggled off and on.
 
 Part 5 added `@expo-google-fonts/inter`, `@expo-google-fonts/space-mono` and
 `@expo/vector-icons` (all JS/assets). The frosted surfaces are layered React Native views,

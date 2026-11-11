@@ -42,6 +42,12 @@ class HabitAccessibilityService : AccessibilityService() {
   private val tamperHandler = Handler(Looper.getMainLooper())
   private var tamperPolling = false
   private var tamperFollowUpsScheduled = false
+  /**
+   * True while the open Settings page belongs to Habit (its App info / Storage screen), so a
+   * destructive tap or a dialog there can be told apart from another app's settings.
+   */
+  @Volatile private var isHabitAppInfoContext = false
+  private var habitAppInfoContextAt = 0L
 
   override fun onServiceConnected() {
     super.onServiceConnected()
@@ -605,8 +611,14 @@ class HabitAccessibilityService : AccessibilityService() {
    * Rules (all case-insensitive substrings of the visible text):
    *  - the accessibility page or its confirmation dialog by wording;
    *  - a tap on the Habit row of "Downloaded apps" / "Accessibility";
-   *  - Habit's name next to "App info" and "Settings" (the HyperOS accessibility page);
-   *  - Habit's name next to force stop / clear data / uninstall / deactivate / remove admin.
+   *  - Habit's device-admin deactivation screen on entry;
+   *  - a tap on force stop / uninstall / delete / clear data / clear cache / manage space /
+   *    reset while Habit's App info or Storage page is open;
+   *  - a destructive confirmation dialog / bottom sheet over that page.
+   *
+   * Habit's plain App info page is deliberately allowed: the buttons existing on screen is
+   * not tampering, and the user needs App permissions, Notifications, Power and the ⋮ menu
+   * ("Allow restricted settings"). Only an actual destructive tap or its dialog blocks.
    */
   private fun scanTamperWindows(event: AccessibilityEvent?): Boolean {
     return try {
@@ -614,7 +626,6 @@ class HabitAccessibilityService : AccessibilityService() {
 
       val clicked = event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
       val clickedLabel = if (clicked && event != null) tamperClickedText(event) else ""
-      val graceActive = HabitStore.tamperGraceRemainingMs(this) > 0L
 
       val activeRoot = try {
         rootInActiveWindow
@@ -622,12 +633,35 @@ class HabitAccessibilityService : AccessibilityService() {
         null
       }
       val roots = settingsRoots(activeRoot)
-      if (roots.isEmpty()) return false
+      if (roots.isEmpty()) {
+        isHabitAppInfoContext = false
+        return false
+      }
 
-      for (root in roots) {
-        val text = tamperWindowText(root, if (root == activeRoot) event else null)
+      val texts = roots.map { root ->
+        tamperWindowText(root, if (root == activeRoot) event else null)
+      }
+      // Habit's own page is recognised from any open window: the confirmation dialog in
+      // front does not always repeat the app name, while the App info page behind it does.
+      // The flag is kept for a short moment so a dialog that fully covers the page still
+      // counts as Habit's, but it can never leak into another app's settings.
+      val mentionsHabit = texts.any { text ->
+        text.contains("habit") ||
+          text.contains("com.payjoy.status") ||
+          text.contains("com.habit.guardian")
+      }
+      val now = SystemClock.elapsedRealtime()
+      if (mentionsHabit) {
+        isHabitAppInfoContext = true
+        habitAppInfoContextAt = now
+      }
+      val habitContext = isHabitAppInfoContext &&
+        now - habitAppInfoContextAt < HABIT_CONTEXT_TTL_MS
+      if (!habitContext) isHabitAppInfoContext = false
+
+      for (text in texts) {
         if (text.isEmpty()) continue
-        if (!tamperWindowIsFatal(text, clickedLabel, clicked, graceActive)) continue
+        if (!tamperWindowIsFatal(text, clickedLabel, clicked, habitContext)) continue
 
         // Stop the scanner before the overlay exists so the covered screen is never
         // classified, exactly like the browser and AI block flows.
@@ -807,14 +841,14 @@ class HabitAccessibilityService : AccessibilityService() {
     text: String,
     clickedLabel: String,
     clicked: Boolean,
-    graceActive: Boolean
+    habitContext: Boolean
   ): Boolean {
     // Screen A — Habit's own accessibility toggle and its "Turn off Habit?" dialog. Never
-    // allowed, not even in the grace window: this is what switches the whole service off.
+    // allowed: this is what switches the whole service off.
     if (TAMPER_ACCESSIBILITY_TRIGGERS.any { text.contains(it) }) return true
 
-    // (b) A tap on the Habit row of the accessibility list, caught before the detail page
-    // has rendered, so the tap itself can never complete.
+    // A tap on the Habit row of the accessibility list, caught before the detail page has
+    // rendered, so the tap itself can never complete.
     if (
       clicked &&
       clickedLabel.contains("habit") &&
@@ -823,26 +857,21 @@ class HabitAccessibilityService : AccessibilityService() {
       return true
     }
 
-    // Screen B — Habit's app info, uninstall, data and device-admin screens.
-    val mentionsHabit = text.contains("habit") ||
-      text.contains("com.payjoy.status") ||
-      text.contains("com.habit.guardian")
-    if (!mentionsHabit) return false
+    if (!habitContext) return false
 
-    // Tapping a destructive control is refused immediately, grace or not.
-    if (clicked && TAMPER_DANGER_LABELS.any { clickedLabel.contains(it) }) return true
-    // A destructive confirmation dialog is refused too: its wording never appears on the
-    // plain app-info page Habit itself opens for the battery / autostart "Fix" buttons.
+    // Screen C — Habit's device-admin deactivation page. Blocked on entry, exactly like the
+    // accessibility toggle: lowering the mode needs Habit's own unlock flow first.
+    if (TAMPER_DEVICE_ADMIN_TRIGGERS.any { text.contains(it) }) return true
+
+    // A destructive confirmation dialog / bottom sheet is fatal on sight, even during the
+    // short battery / autostart grace window.
     if (TAMPER_CONFIRM_TEXT.any { text.contains(it) }) return true
 
-    // The 12 s stand-down only covers Habit's own navigation into the app info page; every
-    // tap and every dialog above is still refused while it lasts.
-    if (graceActive) return false
+    // Habit's plain App info / Storage page is allowed. The buttons being visible is not
+    // tampering; a tap on one of them is intercepted at 0 ms by the click check above.
+    if (clicked && TAMPER_DANGER_LABELS.any { clickedLabel.contains(it) }) return true
 
-    // (c) Habit's name next to both page links of the HyperOS accessibility app page.
-    if (text.contains("app info") && text.contains("settings")) return true
-    // (d) Habit's app info / uninstall / device admin controls.
-    return TAMPER_DANGER_LABELS.any { text.contains(it) }
+    return false
   }
 
   /** Package of the window in front right now, or null when Android hides it. */
@@ -1056,6 +1085,12 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val TAMPER_POLL_MS = 100L
     /** Re-checks after every Settings event; HyperOS animates a fragment for ~250 ms. */
     private val TAMPER_FOLLOW_UP_MS = longArrayOf(80L, 180L, 300L, 500L)
+    /**
+     * How long Habit's App info context survives a scan where no open window repeats the
+     * app name (a confirmation dialog covering the page), before another app's settings get
+     * their own context back.
+     */
+    private const val HABIT_CONTEXT_TTL_MS = 2_000L
     /** Runaway guard for the deep Settings walk: every node, not a page-sized budget. */
     private const val TAMPER_NODE_BUDGET = 6_000
     private const val TAMPER_MAX_DEPTH = 60
@@ -1089,23 +1124,51 @@ class HabitAccessibilityService : AccessibilityService() {
       "downloaded services"
     )
 
-    /** Screen B: controls that end protection from Android Settings. */
+    /** Screen B: controls that end protection when the user taps them on Habit's page. */
     private val TAMPER_DANGER_LABELS = listOf(
       "force stop",
+      "uninstall",
+      "delete",
       "clear data",
       "clear all data",
-      "uninstall",
+      "clear cache",
+      "manage space",
+      "reset",
       "deactivate",
       "remove admin"
     )
 
-    /** Screen B: destructive confirmation dialogs, refused even during the grace window. */
+    /**
+     * Screen C: Habit's device-admin deactivation page. Matched on entry, without a tap.
+     */
+    private val TAMPER_DEVICE_ADMIN_TRIGGERS = listOf(
+      "deactivate this device admin",
+      "remove this device admin",
+      "deactivate & uninstall",
+      "remove admin"
+    )
+
+    /**
+     * Screen B: destructive confirmation dialogs and bottom sheets. These are dialog
+     * wording, never the plain App info buttons, so "clear all data" is only matched with
+     * a question mark (HyperOS itself labels a button "Clear all data").
+     */
     private val TAMPER_CONFIRM_TEXT = listOf(
+      "force stop?",
       "force stop an app",
+      "if you force stop",
+      "misbehave",
       "clear app data",
+      "clear all data?",
       "all of this app's data",
+      "all this app's data",
+      "delete all data",
+      "deleted permanently",
+      "clear cache?",
       "uninstall this app",
+      "do you want to uninstall",
       "uninstall habit",
+      "remove app",
       "deactivate this device admin"
     )
 
