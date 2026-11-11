@@ -31,6 +31,15 @@ class HabitAccessibilityService : AccessibilityService() {
   /** Throttles the FLAG_SECURE screenshot probe: >= 1.2 s, events and watchdog ticks. */
   private var lastSecureProbeAt = 0L
   /**
+   * True once a probe screenshot of an ordinary browser page has succeeded in this service
+   * session. It proves the installed APK really has the `canTakeScreenshot` capability, so a
+   * later "no accessibility access" refusal (error 2, which HyperOS and other OEM builds
+   * return for a FLAG_SECURE window instead of the documented error 6) can be trusted as
+   * secure content. Without that proof the same error would mean the capability is missing,
+   * and treating it as a private tab would block every browser page.
+   */
+  @Volatile private var screenshotProbeWorked = false
+  /**
    * The private-tab watchdog. Chrome, Brave and Firefox swap between a normal and an
    * Incognito tab inside the same activity, often without a window-state event, and a
    * visible WebView in that activity must not hide the private tab's secure window. A
@@ -531,10 +540,9 @@ class HabitAccessibilityService : AccessibilityService() {
     } catch (error: Throwable) {
       false
     }
-    // Only visible nodes are inspected; the window root itself is always walked because
-    // some vendor builds report its own visibility flag as false while children show.
-    if (!visible && depth > 0) return
-
+    // An intermediate container on HyperOS often reports itself as not visible while its
+    // children are exactly what the user sees, so an invisible node never contributes a
+    // label but its children are still walked. Nothing inside a WebView is ever read.
     val className = try {
       node.className?.toString() ?: ""
     } catch (error: Throwable) {
@@ -546,23 +554,27 @@ class HabitAccessibilityService : AccessibilityService() {
       return
     }
 
-    if (incognitoViewIdHit(node)) {
+    if (visible && incognitoViewIdHit(node)) {
       scan.viewIdHit = true
       return
     }
 
     // Text and contentDescription both count: Firefox puts its private-tab sentence in a
     // description, and a Chromium tab-switcher row may only expose one of the two.
-    val textLabel = try {
-      nativeLabel(node.text)
-    } catch (error: Throwable) {
-      null
-    }
-    val descriptionLabel = try {
-      nativeLabel(node.contentDescription)
-    } catch (error: Throwable) {
-      null
-    }
+    val textLabel = if (visible) {
+      try {
+        nativeLabel(node.text)
+      } catch (error: Throwable) {
+        null
+      }
+    } else null
+    val descriptionLabel = if (visible) {
+      try {
+        nativeLabel(node.contentDescription)
+      } catch (error: Throwable) {
+        null
+      }
+    } else null
     for (label in arrayOf(textLabel, descriptionLabel)) {
       if (label == null) continue
       // Tab-switcher rows only exist inside a private session, so they are decisive on
@@ -814,6 +826,9 @@ class HabitAccessibilityService : AccessibilityService() {
         object : TakeScreenshotCallback {
           override fun onSuccess(screenshot: ScreenshotResult) {
             var bitmap: Bitmap? = null
+            // A frame came back for a browser window, so screenshots work in this session;
+            // a later refusal can only be about the window's content (see onFailure).
+            screenshotProbeWorked = true
             try {
               bitmap = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
                 ?.copy(Bitmap.Config.ARGB_8888, false)
@@ -832,11 +847,28 @@ class HabitAccessibilityService : AccessibilityService() {
           }
 
           override fun onFailure(errorCode: Int) {
-            // ERROR_TAKE_SCREENSHOT_SECURE_WINDOW (API 34+, value 6): the browser is showing
-            // a secure (private) window, which is exactly what this guard exists to catch.
-            if (errorCode == ERROR_TAKE_SCREENSHOT_SECURE_WINDOW) {
-              Log.i(TAG, "Secure window in $pkg — treating it as a private tab")
+            // Two codes mean "this window is FLAG_SECURE", which is exactly a private tab:
+            //  - 6, ERROR_TAKE_SCREENSHOT_SECURE_WINDOW (API 34+, the documented one);
+            //  - 2, ERROR_TAKE_SCREENSHOT_NO_ACCESSIBILITY_ACCESS, which HyperOS / MIUI
+            //    (and some other vendor builds) return instead for a secure window.
+            // Code 2 is only trusted once this session has already screenshotted an
+            // ordinary browser page: otherwise it means the capability itself is missing
+            // (a dev APK built before `canTakeScreenshot`, or a service that has not been
+            // reconnected since), and blocking on it would block every normal page too.
+            val secureWindow = errorCode == ERROR_TAKE_SCREENSHOT_SECURE_WINDOW ||
+              (errorCode == SCREENSHOT_ACCESS_REFUSED && screenshotProbeWorked)
+            if (secureWindow) {
+              Log.i(TAG, "Secure window in $pkg (probe code $errorCode) — private tab")
               blockPrivateTab()
+              return
+            }
+            if (errorCode == SCREENSHOT_ACCESS_REFUSED) {
+              Log.w(
+                TAG,
+                "Screenshot refused for $pkg (code 2) and no frame has ever succeeded: " +
+                  "turn Habit's accessibility service off and on so Android grants " +
+                  "canTakeScreenshot again"
+              )
               return
             }
             // 3 = interval time short (a tick raced the previous probe) and 1 = internal
@@ -1582,6 +1614,11 @@ class HabitAccessibilityService : AccessibilityService() {
     /** FLAG_SECURE probe cadence: >= 1.2 s, on events and on every watchdog tick. */
     private const val SECURE_PROBE_INTERVAL_MS = 1_200L
     private const val SECURE_PROBE_STRIDE = 4
+    /**
+     * `takeScreenshot` refused the frame because the window is secure (error 2 on HyperOS
+     * and other vendor builds; Android 14+ uses ERROR_TAKE_SCREENSHOT_SECURE_WINDOW = 6).
+     */
+    private const val SCREENSHOT_ACCESS_REFUSED = 2
     /** Watchdog wake-up: one wake-up per second while protection and the switch are on. */
     private const val INCOGNITO_TICK_MS = 1_000L
     /** Native-chrome node walk cadence; ~1 s, so a private-mode row is read at once. */

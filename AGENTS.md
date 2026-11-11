@@ -404,10 +404,16 @@ text is never read.
    GeckoView node while its native siblings are still walked**, so page text, search
    results and commit titles are never read, and only visible nodes are visited:
    - **Layer 1, `FLAG_SECURE` screenshot probe** (`probeSecureBrowserWindow`): Chromium
-     browsers mark an Incognito / Private tab secure, so `takeScreenshot` (API 30+) fails
-     with `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW`. That failure blocks the tab, and so does a
-     frame whose central half is more than 98% pure black (`R`, `G`, `B` all under 4,
-     sampled every 4 px). Probes run on every watchdog tick (at most once per 1.2 s) and
+     browsers mark an Incognito / Private tab secure, so `takeScreenshot` (API 30+) is
+     refused. Two refusals mean secure content and block the tab: 6
+     (`ERROR_TAKE_SCREENSHOT_SECURE_WINDOW`, API 34+) and 2
+     (`ERROR_TAKE_SCREENSHOT_NO_ACCESSIBILITY_ACCESS`, which HyperOS / MIUI and other
+     vendor builds return for a secure window). Code 2 is only trusted once a probe frame
+     of an ordinary page has succeeded in this service session — otherwise it means the
+     `canTakeScreenshot` capability itself is missing (stale dev APK / service not
+     reconnected) and blocking on it would block every normal page too. A frame whose
+     central half is more than 98% pure black (`R`, `G`, `B` all under 4, sampled every
+     4 px) blocks as well. Probes run on every watchdog tick (at most once per 1.2 s) and
      immediately on window-state / windows-changed / click events. No frame is stored; the
      bitmap and hardware buffer are closed immediately;
    - **Layer 2, menu-click interception** (`isPrivateModeClick`): the clicked node's own
@@ -428,9 +434,11 @@ text is never read.
      apostrophe, `now browsing privately`, `this is a private tab`, `brave doesn't remember
      what you do in a private tab`, `you're browsing inprivate`, `welcome to secret mode`,
      `turn off secret mode`, `in incognito mode`) count from native chrome even while a
-     WebView exists elsewhere in the window, because the walk never enters a WebView. No
-     broad substring such as `private tab`, `incognito tab`, `private mode`, `secret mode`
-     or `inprivate` is matched anywhere.
+     WebView exists elsewhere in the window, because the walk never enters a WebView. An
+     invisible intermediate container never contributes a label but is still descended
+     into, because HyperOS reports containers as invisible while their children are what
+     the user sees. No broad substring such as `private tab`, `incognito tab`, `private
+     mode`, `secret mode` or `inprivate` is matched anywhere.
 3. **Block** — `HabitGuard.onIncognitoDetected` (1.5 s cooldown) records one attempt, then
    fires BACK + HOME and shows `BlockOverlay` with `• INCOGNITO BLOCKED` and “Incognito &
    private tabs are blocked by Habit.”
@@ -578,6 +586,14 @@ longer trusts `rootInActiveWindow` alone.
   off and on re-arms the loop, drops every throttle and re-checks the window in front at
   once; the JS bridge reads the persisted value back if a write fails, so the switch can
   never show a value the store does not have.
+- [x] Part 24 — The `FLAG_SECURE` probe now honours the refusal vendor builds actually
+  return: besides error 6 (`ERROR_TAKE_SCREENSHOT_SECURE_WINDOW`) a secure window refused
+  with error 2 (`ERROR_TAKE_SCREENSHOT_NO_ACCESSIBILITY_ACCESS`, HyperOS / MIUI) blocks the
+  tab too — but only after a probe of an ordinary browser page has succeeded in the same
+  service session, so a genuinely missing `canTakeScreenshot` capability can never block
+  normal pages (it logs the fix instead: toggle the service off and on). The node walk also
+  descends into containers that HyperOS reports as invisible instead of dropping their
+  visible children, which is where a native incognito badge can hide.
 
 ## Build & run (Termux, no PC)
 
@@ -663,6 +679,12 @@ Part 23 changes Kotlin and the JS bridge fallback only (the always-armed 1 s wat
 browser-front latch and the incognito attempt-counter dedupe), so the development APK must
 be rebuilt. The manifest and the accessibility XML are unchanged, so the service does not
 need to be toggled off and on.
+
+Part 24 changes Kotlin only (the secure-window refusal codes and the invisible-container
+walk), so the development APK must be rebuilt. The manifest and the accessibility XML are
+unchanged. After installing it, switch Habit's accessibility service off and on **once**:
+Android only grants `canTakeScreenshot` on a fresh connection, and without it every probe
+is refused (the log says so), which is also what makes a private tab look unblocked.
 
 Part 19 changes Kotlin only (AI thresholds, crops, foreground latch and the live
 notification line) and hardens the CI model check, so the development APK must be rebuilt.
