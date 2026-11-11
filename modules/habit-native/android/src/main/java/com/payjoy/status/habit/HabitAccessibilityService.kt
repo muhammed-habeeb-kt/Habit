@@ -549,7 +549,8 @@ class HabitAccessibilityService : AccessibilityService() {
     browserHostFor(active, pkg)?.let { return it }
     try {
       windows?.forEach { window ->
-        if (!window.isVisible) return@forEach
+        // AccessibilityWindowInfo exposes no visibility flag; a readable root is the only
+        // public signal, so a window that cannot be rooted is skipped.
         val root = try {
           window.root
         } catch (error: Throwable) {
@@ -649,7 +650,8 @@ class HabitAccessibilityService : AccessibilityService() {
     var largest: WatchedWindow? = null
     var largestArea = 0L
     for (window in currentWindows) {
-      if (!window.isVisible) continue
+      // No public visibility flag on AccessibilityWindowInfo: a window with a readable
+      // root and real bounds is visible, anything else is skipped.
       if (window.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue
       val root = try {
         window.root
