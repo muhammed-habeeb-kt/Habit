@@ -39,18 +39,4 @@ object HabitDeviceAdmin {
         "Aggressive mode uses device admin only to make removing Habit require an extra confirmation. It cannot lock or wipe your phone."
       )
   }
-
-  /** Best effort. Android allows an app to drop its own admin. */
-  fun remove(context: Context): Boolean {
-    return try {
-      val manager = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
-        ?: return false
-      if (!manager.isAdminActive(component(context))) return true
-      manager.removeActiveAdmin(component(context))
-      true
-    } catch (error: Throwable) {
-      Log.w(TAG, "remove failed: ${error.message}")
-      false
-    }
-  }
 }

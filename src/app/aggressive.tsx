@@ -14,8 +14,9 @@ import { activateDeviceAdmin, isDeviceAdminActive } from '@/native/habit';
  * Bottom-sheet confirmation shown before Aggressive mode is switched on.
  *
  * Aggressive is Strict plus device-admin uninstall protection, so the sheet explains the
- * trade in plain language first. "Activate" asks Android for device admin when it is not
- * granted yet, waits for the grant, then switches the native mode.
+ * trade in plain language first. Device admin is a one-time grant: when it is already
+ * active the permission row is hidden and the button raises the mode directly, so the
+ * Android dialog is only ever opened for a first-time grant.
  */
 type InfoRow = {
   icon: keyof typeof MaterialCommunityIcons.glyphMap;
@@ -25,11 +26,6 @@ type InfoRow = {
 };
 
 const ROWS: InfoRow[] = [
-  {
-    icon: 'key-outline',
-    title: 'Needs the Device admin permission',
-    badge: 'REQUIRED',
-  },
   {
     icon: 'shield-lock-outline',
     title: 'Strict rules still apply',
@@ -46,8 +42,22 @@ export default function AggressiveModeScreen() {
   const [busy, setBusy] = useState(false);
   const [waitingForAdmin, setWaitingForAdmin] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  /** null while the native check runs; true means the one-time grant is already in place. */
+  const [adminActive, setAdminActive] = useState<boolean | null>(null);
   const closeSheet = useCallback(() => router.back(), []);
   const { panHandlers, animatedStyle, dismiss } = useSheetDismiss(closeSheet);
+
+  // Read the real admin state before the sheet renders, so a second Aggressive session
+  // never asks for a permission the user already granted.
+  useEffect(() => {
+    let cancelled = false;
+    void isDeviceAdminActive().then((active) => {
+      if (!cancelled) setAdminActive(active);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Android's admin dialog pauses Habit. When it comes back, either the admin is on and
   // Aggressive can be switched on, or the user backed out and can try again.
@@ -57,6 +67,7 @@ export default function AggressiveModeScreen() {
       if (state !== 'active') return;
       void (async () => {
         const active = await isDeviceAdminActive();
+        setAdminActive(active);
         if (!active) {
           setWaitingForAdmin(false);
           setHint('Device admin was not activated. Tap Activate to try again.');
@@ -75,10 +86,12 @@ export default function AggressiveModeScreen() {
     setBusy(true);
     try {
       if (await isDeviceAdminActive()) {
+        setAdminActive(true);
         await changeMode('aggressive');
         router.back();
         return;
       }
+      setAdminActive(false);
       setWaitingForAdmin(true);
       const launched = await activateDeviceAdmin();
       if (!launched) {
@@ -115,6 +128,21 @@ export default function AggressiveModeScreen() {
           </Text>
 
           <View style={styles.rows}>
+            {adminActive ? null : (
+              <NeuCard padded={false} style={styles.row}>
+                <View style={styles.rowIcon}>
+                  <MaterialCommunityIcons name="key-outline" size={20} color={Palette.amber} />
+                </View>
+                <View style={styles.rowText}>
+                  <View style={styles.rowTitleLine}>
+                    <Text style={styles.rowTitle}>Needs the Device admin permission</Text>
+                    <View style={styles.rowBadge}>
+                      <Text style={styles.rowBadgeLabel}>ONE-TIME</Text>
+                    </View>
+                  </View>
+                </View>
+              </NeuCard>
+            )}
             {ROWS.map((row) => (
               <NeuCard key={row.title} padded={false} style={styles.row}>
                 <View style={styles.rowIcon}>
@@ -138,7 +166,13 @@ export default function AggressiveModeScreen() {
           </View>
 
           <PrimaryGlowButton
-            label={waitingForAdmin ? 'Waiting for Android…' : 'Activate'}
+            label={
+              waitingForAdmin
+                ? 'Waiting for Android…'
+                : adminActive === false
+                  ? 'Activate'
+                  : 'Turn on Aggressive'
+            }
             onPress={activate}
             disabled={busy || waitingForAdmin}
             icon={<MaterialCommunityIcons name="lightning-bolt" size={20} color={Palette.canvas} />}

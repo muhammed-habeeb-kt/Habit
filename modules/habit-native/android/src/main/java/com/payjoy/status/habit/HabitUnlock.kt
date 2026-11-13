@@ -574,7 +574,6 @@ object HabitUnlock {
 
   private fun exitStrict(context: Context): ProtectionState {
     CharacterChallenge.clear()
-    val wasAggressive = HabitStore.state(context).mode == ProtectionState.MODE_AGGRESSIVE
     val unlock = HabitStore.unlockState(context)
     HabitStore.writeUnlockState(
       context,
@@ -591,7 +590,9 @@ object HabitUnlock {
     HabitAlarms.cancel(context)
     HabitAlarms.cancelWatchdog(context)
     HabitNotifier.clearProtectionWarnings(context)
-    if (wasAggressive) HabitDeviceAdmin.remove(context)
+    // Device admin is NEVER revoked here. Once the user grants it, it stays active exactly
+    // like the accessibility permission, so turning Aggressive back on is instant instead
+    // of asking Android for the same grant again.
     HabitForegroundService.stop(context)
     return next
   }
@@ -611,13 +612,8 @@ object HabitUnlock {
       else -> ProtectionState.MODE_NORMAL
     }
 
-    // Strict can be restored without device admin, so drop an Aggressive admin when the
-    // lock is only Strict. Aggressive must keep it: re-adding admin needs a user prompt,
-    // and without it the watchdog could not report a real Aggressive state after the
-    // window. A Normal-mode turn-off leaves the admin state alone.
-    if (target == ProtectionState.MODE_STRICT) {
-      HabitDeviceAdmin.remove(context)
-    }
+    // Device admin is deliberately left active for every target mode: it is a one-time
+    // grant, and revoking it here was why the next Aggressive session asked for it again.
 
     val unlock = HabitStore.unlockState(context)
     val now = SystemClock.elapsedRealtime()

@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-11 (Part 23: always-on private-tab watchdog + honest switch sync)_
+_Last updated: 2026-11-13 (Part 25: anti-UI skin gate, permanent device admin, universal private-tab detection)_
 
 ## Product
 
@@ -126,8 +126,8 @@ Part 4 / 6:
 - Aggressive inherits every Strict rule: protection always ON; turning it off or lowering
   the mode is refused until an unlock (methods A or B).
 - Turning Aggressive back to Strict is a *lower*, so it needs an unlock too.
-- Unlock A from Aggressive: mode → Normal, protection OFF, and Habit removes its own device
-  admin again.
+- Unlock A from Aggressive: mode → Normal, protection OFF. Device admin stays active — it is
+  a one-time grant, like Accessibility, so turning Aggressive back on is instant.
 - Timer unlock from Aggressive: protection OFF only for the 10-minute window, then returns to
   Aggressive (admin is kept, so the restore works).
 - Watchdog: while Aggressive, if the accessibility service or device admin is off, Habit shows
@@ -586,6 +586,18 @@ longer trusts `rootInActiveWindow` alone.
   off and on re-arms the loop, drops every throttle and re-checks the window in front at
   once; the JS bridge reads the persisted value back if a write fails, so the switch can
   never show a value the store does not have.
+- [x] Part 25 — Three fixes. (1) AI false positives on dark-mode UIs: every 224x224 stage 1
+  tile now measures its skin-tone pixel ratio, a tile below `SKIN_MIN_RATIO` (0.06) can only
+  be flagged by NudeNet at `>= 0.35`, and `Hentai` alone needs `>= 0.65` or NudeNet
+  `>= 0.25`, so `github.com` in dark mode is safe. (2) Device admin is a permanent one-time
+  grant: unlocking or finishing a cooldown no longer calls `removeActiveAdmin`, and the
+  Aggressive sheet/Home/configure screens skip the activation prompt when it is already
+  active. (3) Private-tab blocking is browser-agnostic: installed browsers come from
+  `PackageManager.queryIntentActivities(http VIEW)` (cached, refreshed on package changes,
+  `<queries>` intent declared), the 1 s `FLAG_SECURE` probe blocks immediately on error 2 or
+  6, native chrome text/view ids are matched with one universal private-mode vocabulary
+  (incognito / inprivate / private tab / secret mode / fire window / ghost / stealth / burn
+  tabs), and Firefox Focus and Tor block on entry.
 - [x] Part 24 — The `FLAG_SECURE` probe now honours the refusal vendor builds actually
   return: besides error 6 (`ERROR_TAKE_SCREENSHOT_SECURE_WINDOW`) a secure window refused
   with error 2 (`ERROR_TAKE_SCREENSHOT_NO_ACCESSIBILITY_ACCESS`, HyperOS / MIUI) blocks the
@@ -679,6 +691,10 @@ Part 23 changes Kotlin and the JS bridge fallback only (the always-armed 1 s wat
 browser-front latch and the incognito attempt-counter dedupe), so the development APK must
 be rebuilt. The manifest and the accessibility XML are unchanged, so the service does not
 need to be toggled off and on.
+
+Part 25 changes Kotlin, the Expo config plugin (a browser `VIEW` intent in `<queries>`) and
+the Aggressive UI, so the development APK must be rebuilt. The accessibility XML is
+unchanged, so the service does not need to be toggled off and on.
 
 Part 24 changes Kotlin only (the secure-window refusal codes and the invisible-container
 walk), so the development APK must be rebuilt. The manifest and the accessibility XML are

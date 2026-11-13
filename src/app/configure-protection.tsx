@@ -131,6 +131,14 @@ export default function ConfigureProtectionScreen() {
     try {
       await configureProtection(length, total, offTotal);
       if (targetMode === 'aggressive') {
+        // Device admin is already granted: no second explanation or Android dialog, just
+        // raise the mode. Only a missing grant opens the Aggressive sheet.
+        if (snapshot?.deviceAdminActive) {
+          await changeMode('aggressive');
+          if (router.canGoBack()) router.back();
+          else router.dismissTo('/');
+          return;
+        }
         // The Aggressive sheet explains device admin and then activates the mode.
         router.replace('/aggressive');
         return;

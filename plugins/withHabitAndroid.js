@@ -154,6 +154,27 @@ const withHabitManifest = (config) =>
         ],
       });
     }
+    // Private-tab blocking must cover EVERY installed browser, not a fixed list, so the
+    // service resolves an http VIEW intent through PackageManager. On Android 11+ that
+    // query only sees packages declared here.
+    const hasBrowserIntent = queries.some((q) =>
+      (q.intent || []).some((intent) =>
+        (intent.action || []).some(
+          (action) => action.$['android:name'] === 'android.intent.action.VIEW'
+        ) &&
+        (intent.data || []).some((data) => data.$['android:scheme'] === 'http')
+      )
+    );
+    if (!hasBrowserIntent) {
+      queries.push({
+        intent: [
+          {
+            action: [{ $: { 'android:name': 'android.intent.action.VIEW' } }],
+            data: [{ $: { 'android:scheme': 'http' } }],
+          },
+        ],
+      });
+    }
     manifest.manifest.queries = queries;
 
     // --- application entries ----------------------------------------------

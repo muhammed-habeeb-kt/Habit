@@ -92,7 +92,7 @@ const BROWSERS = [
 ];
 
 export default function HomeScreen() {
-  const { snapshot, busy, toggle, setSnapshot, refresh } = useProtection();
+  const { snapshot, busy, toggle, setSnapshot, changeMode, refresh } = useProtection();
   // The AI summary mirrors the native settings, so the counts match the AI tab exactly.
   const {
     settings: aiSettings,
@@ -214,6 +214,12 @@ export default function HomeScreen() {
     }
 
     if (id === 'aggressive') {
+      // Device admin is a one-time grant. When it is already active, raise the mode
+      // straight away instead of showing the activation sheet again.
+      if (snapshot.deviceAdminActive) {
+        void changeMode('aggressive');
+        return;
+      }
       // The bottom sheet explains device admin and requests it when needed.
       router.push('/aggressive');
       return;

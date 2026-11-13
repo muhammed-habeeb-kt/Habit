@@ -614,17 +614,39 @@ object AiVisualScanner {
       }
 
       val probabilities = arrayOfNulls<FloatArray>(tiles.size)
+      val skinRatios = FloatArray(tiles.size)
       val scores = FloatArray(tiles.size)
       for (index in tiles.indices) {
-        val output = stage1Probabilities(tiles[index])
-        probabilities[index] = output
-        scores[index] = combinedStage1Score(output, thresholds.sexyWeight)
+        val result = stage1Result(tiles[index])
+        probabilities[index] = result.probabilities
+        skinRatios[index] = result.skinRatio
+        scores[index] = combinedStage1Score(result.probabilities, thresholds.sexyWeight)
       }
-      val strongest = scores.maxOrNull() ?: 0f
+
+      // Skin gate: a text / code / dashboard tile has (almost) no human skin, so its stage 1
+      // output is not evidence on its own. GitHub in dark mode scored `Hentai` 0.25+ from
+      // coloured icons and white text and used to be blocked after two frames. Such a tile
+      // can only be positive when NudeNet actually sees an exposed body part.
+      fun stage1Allowed(index: Int): Boolean =
+        skinRatios[index] >= AiCascadeConfig.SKIN_MIN_RATIO
+
+      // Stage 1 `Hentai` alone is the second false-positive source (dark high-contrast UI).
+      // It only counts at full confidence or when NudeNet backs it up.
+      fun hentaiTrusted(index: Int, nude: Float): Boolean {
+        val output = probabilities[index] ?: return false
+        return probability(output, 1) >= AiCascadeConfig.HENTAI_SOLO_TRUST ||
+          nude >= AiCascadeConfig.HENTAI_NUDE_TRUST
+      }
+
+      val strongest = scores.indices
+        .filter { index -> stage1Allowed(index) }
+        .maxOfOrNull { index -> scores[index] } ?: 0f
       // p_porn alone, used by the immediate-block rule: an explicit photo must not wait.
-      val pornMax = scores.indices.maxOfOrNull { index ->
-        probabilities[index]?.let { probability(it, 3) } ?: 0f
-      } ?: 0f
+      // Restricted to tiles with skin in them, for the same reason as the positive rule.
+      val pornMax = scores.indices
+        .filter { index -> stage1Allowed(index) }
+        .maxOfOrNull { index -> probabilities[index]?.let { probability(it, 3) } ?: 0f }
+        ?: 0f
 
       lastStage1Score = strongest
       lastStage2Score = 0f
@@ -648,13 +670,24 @@ object AiVisualScanner {
       // Strict POSITIVE definition: ANY tile that reaches one of these levels makes this
       // an 18+ candidate screen. Being positive on Frame 1 only flags it; the block itself
       // happens on Frame 2 (POSITIVE_CONFIRM_FRAMES), never on the first screen alone.
+      //
+      // A tile without human skin in it is never positive from stage 1, and `Hentai` alone
+      // needs full confidence or NudeNet confirmation. That keeps dark-mode websites and
+      // code dashboards out of the cascade while a real photo still scores normally.
       val positiveIndex = scores.indices.firstOrNull { index ->
         val output = probabilities[index] ?: return@firstOrNull false
-        val explicit = probability(output, 3) + probability(output, 1)
-        scores[index] >= AiCascadeConfig.POSITIVE_STAGE1_COMBINED ||
+        val nudeScore = nudity[index]?.score ?: 0f
+        if (!stage1Allowed(index)) {
+          return@firstOrNull nudeScore >= AiCascadeConfig.SKINLESS_NUDE_CONFIRM
+        }
+        val hentai = if (hentaiTrusted(index, nudeScore)) probability(output, 1) else 0f
+        val porn = probability(output, 3)
+        val explicit = porn + hentai
+        val combined = porn + hentai + thresholds.sexyWeight * probability(output, 4)
+        combined >= AiCascadeConfig.POSITIVE_STAGE1_COMBINED ||
           explicit >= AiCascadeConfig.POSITIVE_STAGE1_EXPLICIT ||
           probability(output, 4) >= AiCascadeConfig.POSITIVE_STAGE1_SEXY ||
-          (nudity[index]?.score ?: 0f) >= AiCascadeConfig.POSITIVE_NUDE
+          nudeScore >= AiCascadeConfig.POSITIVE_NUDE
       }
 
       // Unmistakably explicit frames block on Frame 1. Everything else uses the strict
@@ -675,10 +708,14 @@ object AiVisualScanner {
 
       val reason = positiveIndex?.let { index ->
         val output = probabilities[index] ?: FloatArray(0)
-        val explicit = probability(output, 3) + probability(output, 1)
-        "${tileNames.getOrElse(index) { "tile" }} stage1 ${format(scores[index])}," +
-          " explicit ${format(explicit)}, sexy ${format(probability(output, 4))}," +
-          " nude ${format(nudity[index]?.score ?: 0f)}"
+        val nudeScore = nudity[index]?.score ?: 0f
+        val hentai = if (hentaiTrusted(index, nudeScore)) probability(output, 1) else 0f
+        val porn = probability(output, 3)
+        val effective = porn + hentai + thresholds.sexyWeight * probability(output, 4)
+        "${tileNames.getOrElse(index) { "tile" }} stage1 ${format(effective)}," +
+          " explicit ${format(porn + hentai)}, sexy ${format(probability(output, 4))}," +
+          " nude ${format(nudeScore)}," +
+          " skin ${format(skinRatios[index])}"
       }
 
       if (instantBlock) {
@@ -1005,14 +1042,20 @@ object AiVisualScanner {
 
   /** Stage 1 combined score for the self-test. */
   private fun stage1Score(crop: Bitmap, sexyWeight: Float): Float =
-    combinedStage1Score(stage1Probabilities(crop), sexyWeight)
+    combinedStage1Score(stage1Result(crop).probabilities, sexyWeight)
+
+  /** One stage 1 run: every class probability plus the tile's skin-tone fraction. */
+  private data class Stage1Result(val probabilities: FloatArray, val skinRatio: Float)
 
   /**
    * Stage 1 raw output: RGB / 255, NHWC [1, 224, 224, 3] -> one probability per class, in
    * the model order drawing, hentai, neutral, porn, sexy. The combined score is computed
    * separately by [combinedStage1Score], which needs the per-class probabilities.
+   *
+   * The same 224x224 pixels give the tile's skin-tone ratio for free: text, code and a
+   * dashboard UI have none, so the caller can refuse a stage 1-only verdict on them.
    */
-  private fun stage1Probabilities(crop: Bitmap): FloatArray {
+  private fun stage1Result(crop: Bitmap): Stage1Result {
     val interpreter = stage1 ?: error("stage 1 model is not loaded")
     val buffer = stage1Input ?: error("stage 1 buffer is missing")
     val size = AiCascadeConfig.STAGE1_INPUT_SIZE
@@ -1021,13 +1064,18 @@ object AiVisualScanner {
     try {
       resized.getPixels(stage1Pixels, 0, size, 0, 0, size, size)
 
+      var skinPixels = 0
       buffer.rewind()
       val floats = buffer.asFloatBuffer()
       floats.clear()
       for (pixel in stage1Pixels) {
-        floats.put(((pixel shr 16) and 0xFF) / 255f)
-        floats.put(((pixel shr 8) and 0xFF) / 255f)
-        floats.put((pixel and 0xFF) / 255f)
+        val red = (pixel shr 16) and 0xFF
+        val green = (pixel shr 8) and 0xFF
+        val blue = pixel and 0xFF
+        if (isSkinTone(red, green, blue)) skinPixels += 1
+        floats.put(red / 255f)
+        floats.put(green / 255f)
+        floats.put(blue / 255f)
       }
       floats.rewind()
       buffer.rewind()
@@ -1036,11 +1084,21 @@ object AiVisualScanner {
       val classes = outputShape.lastOrNull()?.coerceAtLeast(1) ?: STAGE1_CLASSES
       val output = Array(1) { FloatArray(classes) }
       interpreter.run(buffer, output)
-      return output[0]
+      val skinRatio = if (stage1Pixels.isEmpty()) {
+        0f
+      } else {
+        skinPixels.toFloat() / stage1Pixels.size
+      }
+      return Stage1Result(output[0], skinRatio)
     } finally {
       if (resized !== crop) recycle(resized)
     }
   }
+
+  /** Classic RGB skin-tone test: warm, bright enough and clearly red-dominant. */
+  private fun isSkinTone(red: Int, green: Int, blue: Int): Boolean =
+    red > 95 && green > 40 && blue > 20 &&
+      red > green && red > blue && red - green > 15
 
   /**
    * Stage 1 combined score: Porn + Hentai + sexyWeight * Sexy. The sexy weight is the

@@ -103,6 +103,20 @@ object AiCascadeConfig {
   const val INSTANT_NUDE = 0.40f
 
   /**
+   * Skin-tone gate (anti-UI false positive). A dark-mode or light-mode text / code /
+   * dashboard screen (GitHub, an editor, a settings page) has no human skin and can still
+   * score high on stage 1 as `Hentai` / `Porn` because of high-contrast coloured UI. Below
+   * this fraction of skin-tone pixels a tile can therefore only be flagged by NudeNet.
+   */
+  const val SKIN_MIN_RATIO = 0.06f
+  /** NudeNet confidence that lets a tile without skin in it count at all. */
+  const val SKINLESS_NUDE_CONFIRM = 0.35f
+  /** Stage 1 `Hentai` needs this much on its own; below it the tile must have another signal. */
+  const val HENTAI_SOLO_TRUST = 0.65f
+  /** ...or NudeNet must confirm this much skinless-proof body detail. */
+  const val HENTAI_NUDE_TRUST = 0.25f
+
+  /**
    * Sensitivity presets. The two-screen confirmation rule and its POSITIVE levels are fixed;
    * sensitivity only changes how strongly `p_sexy` counts in the combined stage 1 score, so
    * `high` and `balanced` both use the proven 0.80 weight, while `low` waits for stronger
