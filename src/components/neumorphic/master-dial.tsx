@@ -10,7 +10,7 @@ type Props = {
   onPress: () => void;
 };
 
-/** 180dp circular master control: sunken housing, raised puck, amber power glyph. */
+/** 148dp circular master control: sunken housing, raised puck, amber power glyph. */
 export function MasterDial({ enabled, locked, busy, onPress }: Props) {
   return (
     <Pressable
@@ -23,17 +23,15 @@ export function MasterDial({ enabled, locked, busy, onPress }: Props) {
       <View style={[styles.puck, enabled && styles.puckOn]}>
         <MaterialCommunityIcons
           name="power"
-          size={46}
+          size={40}
           color={enabled ? Palette.amber : Palette.textMuted}
           style={enabled ? styles.glyphOn : undefined}
         />
-        <Text style={[styles.state, enabled && styles.stateOn]}>
-          {enabled ? 'ON' : 'OFF'}
-        </Text>
+        <Text style={[styles.state, enabled && styles.stateOn]}>{enabled ? 'ON' : 'OFF'}</Text>
       </View>
       {locked && (
         <View style={styles.lockBadge}>
-          <MaterialCommunityIcons name="lock" size={16} color={Palette.canvas} />
+          <MaterialCommunityIcons name="lock" size={15} color={Palette.canvas} />
         </View>
       )}
     </Pressable>
@@ -42,18 +40,18 @@ export function MasterDial({ enabled, locked, busy, onPress }: Props) {
 
 const styles = StyleSheet.create({
   housing: {
-    width: 180,
-    height: 180,
-    borderRadius: 90,
+    width: 148,
+    height: 148,
+    borderRadius: 74,
     backgroundColor: Palette.well,
     boxShadow: Shadows.sunken,
     alignItems: 'center',
     justifyContent: 'center',
   },
   puck: {
-    width: 124,
-    height: 124,
-    borderRadius: 62,
+    width: 104,
+    height: 104,
+    borderRadius: 52,
     backgroundColor: Palette.raised,
     boxShadow: Shadows.raisedLarge,
     alignItems: 'center',
@@ -69,19 +67,19 @@ const styles = StyleSheet.create({
   },
   state: {
     fontFamily: FontNames.monoBold,
-    fontSize: 12,
-    lineHeight: 16,
+    fontSize: 11,
+    lineHeight: 15,
     letterSpacing: 1.4,
     color: Palette.textMuted,
   },
   stateOn: { color: Palette.amber },
   lockBadge: {
     position: 'absolute',
-    right: 8,
-    bottom: 8,
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    right: 6,
+    bottom: 6,
+    width: 30,
+    height: 30,
+    borderRadius: 15,
     backgroundColor: Palette.amber,
     alignItems: 'center',
     justifyContent: 'center',

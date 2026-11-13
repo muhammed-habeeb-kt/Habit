@@ -3,7 +3,7 @@ import type { BottomTabBarProps } from 'expo-router/build/react-navigation/botto
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { FontNames, Palette, Radii, Space } from '@/constants/theme';
+import { FontNames, Palette, Radii, Shadows } from '@/constants/theme';
 
 type TabVisual = {
   label: string;
@@ -19,7 +19,7 @@ const VISUALS: Record<string, TabVisual> = {
   settings: { label: 'Settings', icon: 'cog-outline', activeIcon: 'cog' },
 };
 
-/** 64dp frosted bar, floating 16dp above the bottom edge, with an amber active pill. */
+/** 60dp floating dock, 16dp above the bottom edge, with a solid amber active tab. */
 export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarProps) {
   const insets = useSafeAreaInsets();
 
@@ -61,16 +61,16 @@ export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarP
               <View style={[styles.pill, focused && styles.pillActive]}>
                 <MaterialCommunityIcons
                   name={focused ? visual.activeIcon : visual.icon}
-                  size={17}
-                  color={focused ? Palette.amber : Palette.textSecondary}
+                  size={16}
+                  color={focused ? Palette.canvas : Palette.textSecondary}
                 />
                 <Text
                   style={[styles.label, focused && styles.labelActive]}
                   numberOfLines={1}
-                  maxFontSizeMultiplier={1}>
+                  maxFontSizeMultiplier={1}
+                  allowFontScaling={false}>
                   {visual.label}
                 </Text>
-                {focused && <View style={styles.glowDot} />}
               </View>
             </Pressable>
           );
@@ -83,20 +83,19 @@ export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarP
 const styles = StyleSheet.create({
   frame: {
     position: 'absolute',
-    // Wider than the old inset so each tab gets enough room for the full "Settings" label.
-    left: Space.xs,
-    right: Space.xs,
-    borderRadius: 24,
+    left: 12,
+    right: 12,
+    borderRadius: Radii.pill,
     boxShadow: '0px 12px 32px rgba(0, 0, 0, 0.55)',
   },
   bar: {
-    height: 64,
-    borderRadius: 24,
+    height: 60,
+    borderRadius: Radii.pill,
     borderWidth: 1,
     borderColor: Palette.glassBorder,
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 4,
+    paddingHorizontal: 6,
     overflow: 'hidden',
     backgroundColor: 'rgba(18, 19, 22, 0.94)',
   },
@@ -127,36 +126,27 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 3,
+    gap: 6,
     maxWidth: '100%',
-    height: 44,
-    paddingHorizontal: 6,
+    height: 40,
+    paddingHorizontal: 10,
     borderRadius: Radii.pill,
   },
   pillActive: {
-    backgroundColor: Palette.amberHighlight,
-    borderWidth: 1,
-    borderColor: 'rgba(251, 191, 36, 0.35)',
+    backgroundColor: Palette.amber,
+    boxShadow: Shadows.amberGlow,
   },
   label: {
     flexShrink: 0,
     fontFamily: FontNames.interMedium,
-    fontSize: 10,
-    lineHeight: 14,
-    letterSpacing: -0.2,
+    fontSize: 11,
+    lineHeight: 15,
+    letterSpacing: -0.1,
     color: Palette.textSecondary,
   },
   labelActive: {
-    fontFamily: FontNames.interSemiBold,
-    color: Palette.amber,
-  },
-  glowDot: {
-    position: 'absolute',
-    bottom: 3,
-    width: 4,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: Palette.amber,
-    boxShadow: '0px 0px 6px rgba(251, 191, 36, 0.9)',
+    fontFamily: FontNames.interBold,
+    color: Palette.canvas,
   },
 });
+

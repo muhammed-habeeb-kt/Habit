@@ -13,11 +13,22 @@ type Props<T extends string> = {
   options: readonly SegmentOption<T>[];
   value: T;
   onChange: (value: T) => void;
+  /**
+   * `raised` (default) lifts the active segment off the track; `solid` fills it with
+   * amber and flips the label to dark text, as on the Home mode picker.
+   */
+  variant?: 'raised' | 'solid';
 };
 
-/** Sunken track with one raised amber segment; used for the protection mode. */
-export function NeuSegmented<T extends string>({ options, value, onChange }: Props<T>) {
+/** Sunken pill track with one highlighted segment; used for modes and sensitivity. */
+export function NeuSegmented<T extends string>({
+  options,
+  value,
+  onChange,
+  variant = 'raised',
+}: Props<T>) {
   const tall = options.some((option) => option.hint);
+  const solid = variant === 'solid';
   return (
     <View style={[styles.track, tall && styles.trackTall]}>
       {options.map((option) => {
@@ -28,19 +39,25 @@ export function NeuSegmented<T extends string>({ options, value, onChange }: Pro
             accessibilityRole="button"
             accessibilityState={{ selected: active }}
             onPress={() => onChange(option.id)}
-            style={[styles.segment, active && styles.segmentActive]}>
+            style={[
+              styles.segment,
+              active && (solid ? styles.segmentSolid : styles.segmentRaised),
+            ]}>
             {/* Capped font scaling keeps "Aggressive" on one line on large-font phones. */}
             <Text
               numberOfLines={1}
               maxFontSizeMultiplier={1.15}
-              style={[styles.label, active && styles.labelActive]}>
+              style={[
+                styles.label,
+                active && (solid ? styles.labelSolid : styles.labelRaised),
+              ]}>
               {option.label}
             </Text>
             {option.hint ? (
               <Text
                 numberOfLines={1}
                 maxFontSizeMultiplier={1.15}
-                style={[styles.hint, active && styles.hintActive]}>
+                style={[styles.hint, active && (solid ? styles.hintSolid : styles.hintRaised)]}>
                 {option.hint}
               </Text>
             ) : null}
@@ -55,9 +72,9 @@ const styles = StyleSheet.create({
   track: {
     width: '100%',
     flexDirection: 'row',
-    height: 56,
+    height: 52,
     padding: 4,
-    borderRadius: Radii.well,
+    borderRadius: Radii.pill,
     backgroundColor: Palette.well,
     boxShadow: Shadows.sunken,
     gap: 2,
@@ -68,14 +85,18 @@ const styles = StyleSheet.create({
     minWidth: 0,
     // No horizontal padding: the segment width is the label's whole budget.
     paddingHorizontal: 0,
-    borderRadius: 16,
+    borderRadius: Radii.pill,
     alignItems: 'center',
     justifyContent: 'center',
     gap: 1,
   },
-  segmentActive: {
+  segmentRaised: {
     backgroundColor: Palette.raised,
     boxShadow: Shadows.raisedSmall,
+  },
+  segmentSolid: {
+    backgroundColor: Palette.amber,
+    boxShadow: Shadows.amberGlow,
   },
   label: {
     fontFamily: FontNames.interMedium,
@@ -86,9 +107,13 @@ const styles = StyleSheet.create({
     width: '100%',
     color: Palette.textSecondary,
   },
-  labelActive: {
+  labelRaised: {
     fontFamily: FontNames.interSemiBold,
     color: Palette.amber,
+  },
+  labelSolid: {
+    fontFamily: FontNames.interBold,
+    color: Palette.canvas,
   },
   hint: {
     fontFamily: FontNames.monoRegular,
@@ -96,5 +121,6 @@ const styles = StyleSheet.create({
     lineHeight: 12,
     color: Palette.textMuted,
   },
-  hintActive: { color: Palette.amber },
+  hintRaised: { color: Palette.amber },
+  hintSolid: { color: Palette.canvas },
 });

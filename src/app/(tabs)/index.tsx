@@ -13,7 +13,6 @@ import { formatDuration, useCountdown } from '@/components/countdown';
 import { formatClockMinutes } from '@/components/duration-wheels';
 import { OffWindowSheet } from '@/components/off-window-sheet';
 import {
-  AppTile,
   FrostedBanner,
   MasterDial,
   NeuCard,
@@ -28,7 +27,6 @@ import { TabScreen } from '@/components/tab-screen';
 import {
   FontNames,
   Palette,
-  Radii,
   Shadows,
   Space,
   Typography,
@@ -37,7 +35,6 @@ import { useAiMonitoring } from '@/hooks/use-ai-monitoring';
 import { useProtection } from '@/hooks/use-protection';
 import {
   activateDeviceAdmin,
-  getInstalledApps,
   setProtectionEnabled,
   startTimedOffWindow,
   type ProtectionMode,
@@ -55,12 +52,17 @@ const MODE_DESCRIPTIONS: Record<ProtectionMode, string> = {
   aggressive: 'Aggressive adds device-admin uninstall protection.',
 };
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+const MODE_LINES: Record<ProtectionMode, string> = {
+  normal: 'Normal mode · no restrictions',
+  strict: 'Strict mode · unlock required to lower',
+  aggressive: 'Aggressive mode · uninstall armoured',
+};
+
 /** How often Home re-reads the native snapshot so the live streak keeps counting. */
 const STREAK_REFRESH_MS = 5_000;
 
 /**
- * Streak display: `12d 06h`, `04h 18m`, or `42m` under an hour. The value is always whole
+ * Streak display: `12d 06h`, `06h 05m`, or `42m` under an hour. The value is always whole
  * minutes, so the card never shows a jumpy seconds counter.
  */
 function formatStreak(ms: number): string {
@@ -74,21 +76,12 @@ function formatStreak(ms: number): string {
   return `${minutes}m`;
 }
 
-/** `• PAUSED` while protection is off, then the highest milestone reached. */
-function streakMilestone(ms: number, protectionOn: boolean): string {
-  if (!protectionOn) return '• PAUSED';
-  if (ms >= 30 * DAY_MS) return '• 30 DAYS';
-  if (ms >= 7 * DAY_MS) return '• 1 WEEK';
-  if (ms >= 3 * DAY_MS) return '• 3 DAY STREAK';
-  if (ms >= DAY_MS) return '• 1+ DAY';
-  return '• ACTIVE';
-}
-
+/** Tiny 22 dp browser chips: just the first letter, never a heavy icon tile. */
 const BROWSERS = [
-  { name: 'Chrome', packages: ['com.android.chrome'] },
-  { name: 'Firefox', packages: ['org.mozilla.firefox'] },
-  { name: 'Samsung Internet', packages: ['com.sec.android.app.sbrowser'] },
-  { name: 'Brave', packages: ['com.brave.browser'] },
+  { name: 'Chrome', letter: 'C' },
+  { name: 'Firefox', letter: 'F' },
+  { name: 'Samsung Internet', letter: 'S' },
+  { name: 'Brave', letter: 'B' },
 ];
 
 export default function HomeScreen() {
@@ -100,24 +93,8 @@ export default function HomeScreen() {
     toggleMaster: toggleAiMaster,
   } = useAiMonitoring();
   const askedForSetup = useRef(false);
-  const [browserIcons, setBrowserIcons] = useState<Record<string, string>>({});
   const [offSheetVisible, setOffSheetVisible] = useState(false);
   const [offBusy, setOffBusy] = useState(false);
-
-  useEffect(() => {
-    let mounted = true;
-    getInstalledApps().then((apps) => {
-      if (!mounted) return;
-      const icons: Record<string, string> = {};
-      for (const app of apps) {
-        if (app.iconUri) icons[app.packageName] = app.iconUri;
-      }
-      setBrowserIcons(icons);
-    });
-    return () => {
-      mounted = false;
-    };
-  }, []);
 
   const cooldownRemaining = useCountdown(snapshot?.unlock.cooldownRemainingMs ?? 0);
   const offWindowRemaining = useCountdown(snapshot?.unlock.offWindowRemainingMs ?? 0);
@@ -187,10 +164,12 @@ export default function HomeScreen() {
   };
 
   const aiOn = aiSettings?.enabled ?? false;
+  const watchedApps = aiSettings?.monitoredAppPackages.length ?? 0;
+  const watchedSites = aiSettings?.monitoredDomains.length ?? 0;
   const aiSubtitle = aiOn
-    ? `Active • ${aiSettings?.monitoredAppPackages.length ?? 0} apps • ${
-        aiSettings?.monitoredDomains.length ?? 0
-      } sites watched`
+    ? `Active • ${watchedApps} ${watchedApps === 1 ? 'app' : 'apps'} • ${watchedSites} ${
+        watchedSites === 1 ? 'site' : 'sites'
+      } watched`
     : 'Paused';
 
   // Turning AI monitoring off removes protection, so a locked Strict/Aggressive setup asks
@@ -235,18 +214,16 @@ export default function HomeScreen() {
     <TabScreen>
       <View style={styles.header}>
         <View style={styles.logoTile}>
-          <MaterialCommunityIcons name="shield-outline" size={22} color={Palette.amber} />
+          <MaterialCommunityIcons name="shield-outline" size={20} color={Palette.amber} />
         </View>
         <Text style={styles.headerTitle} numberOfLines={1}>
           Habit
         </Text>
-        <View style={styles.headerBadge}>
-          <StatusPill
-            label={enabled ? 'PROTECTION ON' : 'PROTECTION OFF'}
-            tone={enabled ? 'amber' : 'neutral'}
-            dot
-          />
-        </View>
+        <StatusPill
+          label={enabled ? 'PROTECTION ON' : 'PROTECTION OFF'}
+          tone={enabled ? 'amber' : 'neutral'}
+          dot
+        />
       </View>
 
       {!snapshot.accessibilityEnabled && (
@@ -270,9 +247,14 @@ export default function HomeScreen() {
         />
       )}
 
-      <View style={styles.dialWrap}>
+      <View style={styles.hero}>
         <MasterDial enabled={enabled} locked={locked} busy={busy} onPress={handleToggle} />
-        <Text style={styles.dialCaption}>{enabled ? 'Protection ON' : 'Protection OFF'}</Text>
+        <View style={styles.heroCaption}>
+          <Text style={styles.heroTitle}>{enabled ? 'Shield Active' : 'Protection Off'}</Text>
+          <Text style={styles.heroSubtitle} numberOfLines={1}>
+            {MODE_LINES[snapshot.mode]}
+          </Text>
+        </View>
       </View>
 
       {offWindowActive && (
@@ -300,6 +282,18 @@ export default function HomeScreen() {
         </NeuCard>
       )}
 
+      <NeuCard style={styles.modeCard}>
+        <NeuSegmented
+          options={MODE_OPTIONS}
+          value={snapshot.mode}
+          onChange={handleMode}
+          variant="solid"
+        />
+        <Text style={styles.modeHint} numberOfLines={1}>
+          {MODE_DESCRIPTIONS[snapshot.mode]}
+        </Text>
+      </NeuCard>
+
       {cooldownActive && (
         <NeuWell style={styles.cooldown}>
           <View style={styles.rowBetween}>
@@ -317,110 +311,112 @@ export default function HomeScreen() {
         </NeuWell>
       )}
 
-      <NeuCard style={styles.modeCard}>
-        <NeuSegmented options={MODE_OPTIONS} value={snapshot.mode} onChange={handleMode} />
-        <Text style={styles.modeHint}>{MODE_DESCRIPTIONS[snapshot.mode]}</Text>
-      </NeuCard>
-
-      <NeuCard style={styles.streakCard}>
-        <View style={styles.streakRow}>
-          <View style={styles.streakIconTile}>
-            <MaterialCommunityIcons name="fire" size={22} color={Palette.amber} />
-          </View>
-          <View style={styles.grow}>
-            <View style={styles.streakTitleRow}>
-              <Text style={[styles.cardTitle, styles.streakTitle]}>Clean streak</Text>
-              <View style={styles.streakMilestone}>
-                <Text style={styles.streakMilestoneText}>
-                  {streakMilestone(currentStreakMs, enabled)}
-                </Text>
-              </View>
+      <View style={styles.metricsRow}>
+        <NeuCard style={styles.metricCard}>
+          <View style={styles.metricTopRow}>
+            <Text style={styles.metricLabel}>Clean Streak</Text>
+            <View style={styles.metricBadge}>
+              <MaterialCommunityIcons name="fire" size={14} color={Palette.amber} />
             </View>
-            <Text style={styles.cardSubtitle}>
-              {`Best record: ${formatStreak(bestStreakMs)} • Resets on block or unlock`}
+          </View>
+          <Text
+            style={styles.metricValue}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+            minimumFontScale={0.7}>
+            {formatStreak(currentStreakMs)}
+          </Text>
+          <View style={styles.metricFooter}>
+            <Text style={styles.metricFoot} numberOfLines={1}>
+              {`Best: ${formatStreak(bestStreakMs)}`}
+            </Text>
+            <Text style={styles.metricFoot} numberOfLines={1}>
+              Resets on block
             </Text>
           </View>
-          <Text style={styles.streakValue}>{formatStreak(currentStreakMs)}</Text>
-        </View>
-      </NeuCard>
+        </NeuCard>
 
-      <NeuCard style={styles.metricCard}>
-        <View style={styles.metricText}>
-          <Text style={styles.cardTitle}>Blocked attempts today</Text>
-          <Text style={styles.cardSubtitle}>All monitored channels</Text>
-        </View>
-        <Text style={styles.metricValue}>{snapshot.attemptsToday}</Text>
-      </NeuCard>
+        <NeuCard style={styles.metricCard}>
+          <View style={styles.metricTopRow}>
+            <Text style={styles.metricLabel}>Blocked Today</Text>
+            <View style={styles.metricBadge}>
+              <MaterialCommunityIcons name="shield-outline" size={14} color={Palette.amber} />
+            </View>
+          </View>
+          <Text
+            style={styles.metricValue}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+            minimumFontScale={0.7}>
+            {snapshot.attemptsToday}
+          </Text>
+          <View style={styles.metricFooter}>
+            <Text style={styles.metricFoot}>All monitored</Text>
+            <Text style={styles.metricFoot}>channels secure</Text>
+          </View>
+        </NeuCard>
+      </View>
 
       <Pressable
         accessibilityRole="button"
         accessibilityLabel="Open Browser Blocking"
         onPress={() => router.push('/browsers')}
         style={({ pressed }) => [pressed && styles.pressed]}>
-        <NeuCard style={styles.browserCard}>
-          <View style={styles.rowBetween}>
-            <View style={styles.browserLabel}>
-              <View style={styles.iconWell}>
-                <MaterialCommunityIcons
-                  name="shield-outline"
-                  size={20}
-                  color={enabled ? Palette.amber : Palette.textMuted}
-                />
-              </View>
-              <View style={styles.grow}>
-                <Text style={styles.cardTitle}>Browser Blocking</Text>
-                <Text style={styles.cardSubtitle}>
-                  {enabled ? 'Active • Watching all browsers' : 'Paused'}
-                </Text>
-              </View>
-            </View>
-            <NeuSwitch
-              value={enabled}
-              onValueChange={handleToggle}
-              disabled={busy}
-              label="Browser Blocking"
+        <NeuCard style={styles.channelCard}>
+          <View style={styles.channelTile}>
+            <MaterialCommunityIcons
+              name="shield-outline"
+              size={20}
+              color={enabled ? Palette.amber : Palette.textMuted}
             />
           </View>
-          <View style={styles.tiles}>
-            {BROWSERS.map((browser) => (
-              <AppTile
-                key={browser.name}
-                name={browser.name}
-                iconUri={browser.packages.map((pkg) => browserIcons[pkg]).find(Boolean)}
-                muted={!enabled}
-              />
-            ))}
+          <View style={styles.grow}>
+            <Text style={styles.cardTitle}>Browser Blocking</Text>
+            <Text style={styles.cardSubtitle} numberOfLines={1}>
+              {enabled ? `Active • Watching ${BROWSERS.length} browsers` : 'Paused'}
+            </Text>
+            <View style={styles.browserRow}>
+              {BROWSERS.map((browser) => (
+                <View key={browser.name} style={styles.browserBadge}>
+                  <Text style={styles.browserLetter}>{browser.letter}</Text>
+                </View>
+              ))}
+            </View>
           </View>
+          <NeuSwitch
+            value={enabled}
+            onValueChange={handleToggle}
+            disabled={busy}
+            label="Browser Blocking"
+          />
         </NeuCard>
       </Pressable>
 
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel="Open AI Monitoring"
+        accessibilityLabel="Open AI Content Guard"
         onPress={() => router.push('/apps')}
         style={({ pressed }) => [pressed && styles.pressed]}>
-        <NeuCard style={styles.browserCard}>
-          <View style={styles.rowBetween}>
-            <View style={styles.browserLabel}>
-              <View style={styles.iconWell}>
-                <MaterialCommunityIcons
-                  name="star-four-points-outline"
-                  size={20}
-                  color={aiOn ? Palette.amber : Palette.textMuted}
-                />
-              </View>
-              <View style={styles.grow}>
-                <Text style={styles.cardTitle}>AI Monitoring</Text>
-                <Text style={styles.cardSubtitle}>{aiSubtitle}</Text>
-              </View>
-            </View>
-            <NeuSwitch
-              value={aiOn}
-              onValueChange={handleAiToggle}
-              disabled={aiBusy || !aiSettings}
-              label="AI Monitoring"
+        <NeuCard style={styles.channelCard}>
+          <View style={styles.channelTile}>
+            <MaterialCommunityIcons
+              name="star-four-points-outline"
+              size={20}
+              color={aiOn ? Palette.amber : Palette.textMuted}
             />
           </View>
+          <View style={styles.grow}>
+            <Text style={styles.cardTitle}>AI Content Guard</Text>
+            <Text style={styles.cardSubtitle} numberOfLines={2}>
+              {aiSubtitle}
+            </Text>
+          </View>
+          <NeuSwitch
+            value={aiOn}
+            onValueChange={handleAiToggle}
+            disabled={aiBusy || !aiSettings}
+            label="AI Content Guard"
+          />
         </NeuCard>
       </Pressable>
 
@@ -460,15 +456,10 @@ const styles = StyleSheet.create({
     gap: Space.sm,
     paddingVertical: Space.sm,
   },
-  /** Reserves the trailing slot so the badge never runs into another header icon. */
-  headerBadge: {
-    flexShrink: 0,
-    marginLeft: 'auto',
-  },
   logoTile: {
-    width: Radii.tileSize,
-    height: Radii.tileSize,
-    borderRadius: Radii.tile,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     backgroundColor: Palette.raised,
     boxShadow: Shadows.raisedSmall,
     alignItems: 'center',
@@ -476,14 +467,20 @@ const styles = StyleSheet.create({
   },
   headerTitle: {
     ...Typography.headlineLg,
+    fontSize: 20,
     color: Palette.textPrimary,
     flex: 1,
     flexShrink: 1,
   },
-  dialWrap: { alignItems: 'center', gap: Space.md, paddingTop: Space.md },
-  dialCaption: {
+  hero: { alignItems: 'center', gap: Space.md, paddingTop: Space.xs },
+  heroCaption: { alignItems: 'center', gap: 2 },
+  heroTitle: {
     ...Typography.headlineLg,
     color: Palette.textPrimary,
+  },
+  heroSubtitle: {
+    ...Typography.bodyMd,
+    color: Palette.textSecondary,
   },
   rowBetween: {
     flexDirection: 'row',
@@ -526,6 +523,14 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     paddingHorizontal: 14,
   },
+  modeCard: {
+    gap: Space.gutter,
+    paddingVertical: 16,
+  },
+  modeHint: {
+    ...Typography.bodyMd,
+    color: Palette.textSecondary,
+  },
   cooldown: { paddingVertical: 14 },
   monoLabel: {
     ...Typography.monoLabelSm,
@@ -542,85 +547,57 @@ const styles = StyleSheet.create({
     fontFamily: FontNames.interSemiBold,
     color: Palette.amber,
   },
-  modeCard: { gap: Space.md },
-  modeHint: {
-    ...Typography.bodyMd,
-    color: Palette.textSecondary,
-  },
-  streakCard: {
-    paddingVertical: 18,
-  },
-  streakRow: {
+  metricsRow: {
     flexDirection: 'row',
-    alignItems: 'center',
     gap: Space.gutter,
   },
-  /** Raised amber tile with the flame; the halo is what makes it glow. */
-  streakIconTile: {
-    width: Radii.tileSize,
-    height: Radii.tileSize,
-    borderRadius: Radii.tile,
-    backgroundColor: Palette.amberHighlight,
-    boxShadow: `${Shadows.raisedSmall}, ${Shadows.amberHalo}`,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  streakTitleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    flexWrap: 'wrap',
-  },
-  streakTitle: {
-    fontFamily: FontNames.interBold,
-  },
-  streakMilestone: {
-    borderRadius: Radii.pill,
-    backgroundColor: Palette.amberHighlight,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-  },
-  streakMilestoneText: {
-    ...Typography.monoLabelSm,
-    color: Palette.amber,
-  },
-  streakValue: {
-    fontFamily: FontNames.monoBold,
-    fontSize: 26,
-    lineHeight: 32,
-    letterSpacing: -0.5,
-    color: Palette.amber,
-    flexShrink: 0,
-  },
   metricCard: {
+    flex: 1,
+    minWidth: 0,
+    padding: 16,
+    gap: Space.sm,
+  },
+  metricTopRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: 18,
+    gap: 4,
   },
-  metricText: { flex: 1, gap: 3 },
-  cardTitle: {
-    ...Typography.headlineMd,
-    fontSize: 16,
-    lineHeight: 21,
-    color: Palette.textPrimary,
-  },
-  cardSubtitle: {
+  metricLabel: {
     ...Typography.bodyMd,
+    fontFamily: FontNames.interMedium,
     color: Palette.textSecondary,
+    flexShrink: 1,
+  },
+  metricBadge: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: Palette.amberHighlight,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   metricValue: {
     ...Typography.displayMd,
+    fontSize: 26,
+    lineHeight: 32,
     color: Palette.amber,
   },
-  browserCard: { gap: Space.md },
-  browserLabel: {
+  metricFooter: { gap: 1 },
+  metricFoot: {
+    ...Typography.bodySm,
+    fontSize: 10,
+    lineHeight: 14,
+    color: Palette.textMuted,
+  },
+  channelCard: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: Space.gutter,
-    flex: 1,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
   },
-  iconWell: {
+  channelTile: {
     width: 40,
     height: 40,
     borderRadius: 20,
@@ -628,11 +605,37 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  grow: { flex: 1, gap: 2 },
-  tiles: {
-    flexDirection: 'row',
-    gap: Space.sm,
+  cardTitle: {
+    ...Typography.headlineMd,
+    fontSize: 15,
+    lineHeight: 20,
+    color: Palette.textPrimary,
   },
+  cardSubtitle: {
+    ...Typography.bodyMd,
+    color: Palette.textSecondary,
+  },
+  browserRow: {
+    flexDirection: 'row',
+    gap: 4,
+    marginTop: 2,
+  },
+  browserBadge: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: Palette.raised,
+    boxShadow: Shadows.raisedSmall,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  browserLetter: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 10,
+    lineHeight: 14,
+    color: Palette.textPrimary,
+  },
+  grow: { flex: 1, gap: 2 },
   setupLink: {
     flexDirection: 'row',
     alignItems: 'center',
