@@ -5,13 +5,20 @@ import {
   AppState,
   Image,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
 
-import { FrostedBanner, NeuCard, NeuSwitch, NeuWell } from '@/components/neumorphic';
+import {
+  FrostedBanner,
+  NeuCard,
+  NeuSwitch,
+  NeuWell,
+  StatusPill,
+} from '@/components/neumorphic';
 import { TabScreen } from '@/components/tab-screen';
 import { FontNames, Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
 import { useAiMonitoring } from '@/hooks/use-ai-monitoring';
@@ -115,6 +122,10 @@ export default function AppsScreen() {
       ? fromSettings
       : (snapshot?.aiMonitoredDomains ?? []);
   }, [settings, snapshot]);
+  const suggestions = useMemo(
+    () => QUICK_DOMAINS.filter((domain) => !domains.includes(domain)),
+    [domains]
+  );
   const enabled = settings?.enabled ?? false;
   const removalLocked = isMonitoringLocked(snapshot);
   const incognitoBlocking =
@@ -225,7 +236,14 @@ export default function AppsScreen() {
           <MaterialCommunityIcons name="shield-outline" size={20} color={Palette.amber} />
         </View>
         <View style={styles.grow}>
-          <Text style={styles.cardTitle}>AI Visual Protection</Text>
+          <View style={styles.masterTitleRow}>
+            <Text style={styles.cardTitle} numberOfLines={1}>
+              {mode === 'apps' ? 'AI Visual Protection' : 'AI Web Guard'}
+            </Text>
+            {mode === 'browser' && enabled && (
+              <StatusPill label="ACTIVE" tone="success" dot />
+            )}
+          </View>
           <Text style={styles.cardSubtitle}>Real-time on-device screen scan</Text>
         </View>
         <NeuSwitch
@@ -240,13 +258,13 @@ export default function AppsScreen() {
         <SegmentPill
           active={mode === 'apps'}
           icon="view-grid-outline"
-          label={`Apps (${watched.length} active)`}
+          label={`Apps (${apps.length})`}
           onPress={() => setMode('apps')}
         />
         <SegmentPill
           active={mode === 'browser'}
           icon="web"
-          label={`Browser (${domains.length} sites)`}
+          label={`Websites (${domains.length} Active)`}
           onPress={() => setMode('browser')}
         />
       </View>
@@ -368,94 +386,79 @@ export default function AppsScreen() {
       ) : (
         <>
           <NeuCard style={styles.incognitoCard}>
-            <View style={styles.iconWell}>
-              <MaterialCommunityIcons
-                name="eye-off-outline"
-                size={20}
-                color={Palette.amber}
-              />
+            <View style={styles.incognitoTile}>
+              <MaterialCommunityIcons name="shield-outline" size={18} color={Palette.amber} />
             </View>
             <View style={styles.grow}>
-              <Text style={styles.cardTitle}>Block Incognito & Private Tabs</Text>
-              <Text style={styles.cardSubtitle} numberOfLines={2}>
-                Blocks Incognito, Private, Secret & InPrivate tabs in every watched browser
+              <Text style={styles.cardTitle}>Incognito Shield</Text>
+              <Text style={styles.cardSubtitle} numberOfLines={1}>
+                Zero-trace tabs suppressed system-wide
               </Text>
             </View>
             <NeuSwitch
               value={incognitoBlocking}
               onValueChange={handleIncognitoToggle}
               disabled={busy || !settings}
-              label="Block Incognito & Private Tabs"
+              label="Incognito Shield"
             />
           </NeuCard>
 
-          <NeuCard style={styles.addCard}>
-            <View style={styles.addRow}>
-              <NeuWell padded={false} style={styles.domainWell}>
-                <MaterialCommunityIcons name="web" size={18} color={Palette.textMuted} />
-                <TextInput
-                  value={domainInput}
-                  onChangeText={(text) => {
-                    setDomainInput(text);
-                    if (domainNote) setDomainNote(null);
-                  }}
-                  placeholder="Enter website domain (e.g. web.telegram.org)"
-                  placeholderTextColor={Palette.textMuted}
-                  selectionColor={Palette.amber}
-                  style={styles.domainInput}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  keyboardType="url"
-                  returnKeyType="done"
-                  onSubmitEditing={() => addSite(domainInput)}
-                />
-              </NeuWell>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Add website"
-                onPress={() => addSite(domainInput)}
-                style={({ pressed }) => [
-                  styles.addButton,
-                  pressed && styles.addButtonPressed,
-                ]}>
-                <MaterialCommunityIcons name="plus" size={16} color={Palette.canvas} />
-                <Text style={styles.addButtonLabel}>Add</Text>
-              </Pressable>
-            </View>
-            <Text style={styles.addHint}>
-              AI screenshots run while this site is open in a watched browser. The scheme,
-              `www.` and paths are removed automatically.
-            </Text>
-          </NeuCard>
-
-          <View style={styles.chips}>
-            {QUICK_DOMAINS.map((domain) => {
-              const added = domains.includes(domain);
-              return (
-                <Pressable
-                  key={domain}
-                  accessibilityRole="button"
-                  accessibilityLabel={
-                    added ? `${domain} is already watched` : `Add ${domain}`
-                  }
-                  onPress={() => addSite(domain)}
-                  style={({ pressed }) => [
-                    styles.chip,
-                    added && styles.chipAdded,
-                    pressed && styles.pressed,
-                  ]}>
-                  {added && (
-                    <MaterialCommunityIcons name="check" size={12} color={Palette.amber} />
-                  )}
-                  <Text style={[styles.chipLabel, added && styles.chipLabelAdded]}>
-                    {domain}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
+          <NeuWell padded={false} style={styles.capsule}>
+            <TextInput
+              value={domainInput}
+              onChangeText={(text) => {
+                setDomainInput(text);
+                if (domainNote) setDomainNote(null);
+              }}
+              placeholder="+ Add domain to AI watch…"
+              placeholderTextColor={Palette.textMuted}
+              selectionColor={Palette.amber}
+              style={styles.capsuleInput}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="url"
+              returnKeyType="done"
+              onSubmitEditing={() => addSite(domainInput)}
+            />
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Watch domain"
+              onPress={() => addSite(domainInput)}
+              style={({ pressed }) => [
+                styles.watchButton,
+                pressed && styles.watchButtonPressed,
+              ]}>
+              <MaterialCommunityIcons name="plus" size={13} color={Palette.canvas} />
+              <Text style={styles.watchButtonLabel}>Watch</Text>
+            </Pressable>
+          </NeuWell>
 
           {domainNote && <Text style={styles.note}>{domainNote}</Text>}
+
+          {suggestions.length > 0 && (
+            <View style={styles.suggestedRow}>
+              <Text style={styles.suggestedLabel}>Suggested:</Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+                contentContainerStyle={styles.suggestedContent}>
+                {suggestions.map((domain) => (
+                  <Pressable
+                    key={domain}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Add ${domain}`}
+                    onPress={() => addSite(domain)}
+                    style={({ pressed }) => [
+                      styles.suggestedChip,
+                      pressed && styles.pressed,
+                    ]}>
+                    <Text style={styles.suggestedChipLabel}>{`+ ${domain}`}</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            </View>
+          )}
 
           {!canSetAiDomains && (
             <Text style={styles.empty}>
@@ -464,54 +467,65 @@ export default function AppsScreen() {
             </Text>
           )}
 
-          <View style={styles.group}>
-            <Text style={styles.sectionLabel}>AI WATCHED WEBSITES</Text>
+          <NeuCard padded={false} style={styles.targetsCard}>
+            <View style={styles.targetsHeader}>
+              <Text style={styles.targetsTitle}>{`ACTIVE TARGETS (${domains.length})`}</Text>
+              {removalLocked && (
+                <Text style={styles.targetsLock}>Strict Lock Enabled</Text>
+              )}
+            </View>
 
             {domains.length === 0 ? (
-              <Text style={styles.empty}>
-                No websites yet. Add a domain above, or tap a quick-add chip.
+              <Text style={styles.targetsEmpty}>
+                No websites watched yet. Add one above.
               </Text>
             ) : (
-              <View style={styles.list}>
+              <View style={styles.targetsList}>
                 {domains.map((domain) => (
-                  <View key={domain} style={styles.siteRow}>
-                    <View style={styles.siteTile}>
-                      <Text style={styles.siteLetter}>{domain.slice(0, 1).toUpperCase()}</Text>
-                    </View>
+                  <View key={domain} style={styles.targetRow}>
                     <View style={styles.grow}>
-                      <Text style={styles.siteDomain} numberOfLines={1}>
+                      <Text style={styles.targetDomain} numberOfLines={1}>
                         {domain}
                       </Text>
-                      <Text style={styles.watchLabel}>• AI WATCHING</Text>
+                      <Text style={styles.targetStatus}>• ACTIVE • AI WATCHING</Text>
                     </View>
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel={`Remove ${domain}`}
-                      hitSlop={8}
-                      onPress={() => handleRemoveDomain(domain)}
-                      style={({ pressed }) => [
-                        styles.removeButton,
-                        pressed && styles.pressed,
-                      ]}>
-                      <MaterialCommunityIcons
-                        name="trash-can-outline"
-                        size={18}
-                        color={Palette.danger}
-                      />
-                    </Pressable>
+                    {removalLocked ? (
+                      <View style={styles.targetLock}>
+                        <MaterialCommunityIcons
+                          name="lock"
+                          size={15}
+                          color={Palette.amber}
+                        />
+                      </View>
+                    ) : (
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`Remove ${domain}`}
+                        hitSlop={8}
+                        onPress={() => handleRemoveDomain(domain)}
+                        style={({ pressed }) => [
+                          styles.targetRemove,
+                          pressed && styles.pressed,
+                        ]}>
+                        <MaterialCommunityIcons
+                          name="trash-can-outline"
+                          size={16}
+                          color={Palette.textSecondary}
+                        />
+                      </Pressable>
+                    )}
                   </View>
                 ))}
               </View>
             )}
 
-            {domains.length > 0 && (
-              <Text style={styles.lockHint}>
-                {removalLocked
-                  ? 'Removal is locked until Strict/Aggressive is unlocked. Adding new sites still works.'
-                  : 'Subdomains count too: watching telegram.org also covers web.telegram.org.'}
-              </Text>
+            {removalLocked && domains.length > 0 && (
+              <View style={styles.targetsFooter}>
+                <MaterialCommunityIcons name="lock" size={11} color={Palette.textMuted} />
+                <Text style={styles.targetsFooterText}>De-listing locked: Strict Mode</Text>
+              </View>
             )}
-          </View>
+          </NeuCard>
         </>
       )}
     </TabScreen>
@@ -615,6 +629,11 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     paddingHorizontal: 16,
   },
+  masterTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
   iconWell: {
     width: 40,
     height: 40,
@@ -629,6 +648,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 21,
     color: Palette.textPrimary,
+    flexShrink: 1,
   },
   cardSubtitle: {
     ...Typography.bodyMd,
@@ -800,134 +820,163 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: Space.gutter,
-    paddingVertical: 16,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
   },
-  addCard: { gap: Space.sm, paddingVertical: 14 },
-  addRow: {
+  incognitoTile: {
+    width: 38,
+    height: 38,
+    borderRadius: 12,
+    backgroundColor: Palette.well,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  capsule: {
+    height: 48,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: Space.sm,
+    borderRadius: Radii.control,
+    borderWidth: 1,
+    borderColor: Palette.glassBorder,
+    paddingLeft: 14,
+    paddingRight: 6,
   },
-  domainWell: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Space.sm,
-    paddingHorizontal: 12,
-    height: 46,
-    borderRadius: Radii.input,
-  },
-  domainInput: {
+  capsuleInput: {
     flex: 1,
     ...Typography.bodyMd,
     color: Palette.textPrimary,
     paddingVertical: 0,
   },
-  addButton: {
-    height: 46,
-    borderRadius: Radii.control,
+  watchButton: {
+    height: 34,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 4,
-    paddingHorizontal: 16,
+    gap: 3,
+    paddingHorizontal: 12,
+    borderRadius: Radii.pill,
     backgroundColor: Palette.amber,
     boxShadow: Shadows.amberGlow,
   },
-  addButtonPressed: {
+  watchButtonPressed: {
     backgroundColor: Palette.amberPressed,
     boxShadow: undefined,
   },
-  addButtonLabel: {
+  watchButtonLabel: {
     fontFamily: FontNames.interBold,
-    fontSize: 14,
-    lineHeight: 20,
+    fontSize: 12,
+    lineHeight: 16,
     color: Palette.canvas,
   },
-  addHint: {
-    ...Typography.bodySm,
-    color: Palette.textMuted,
-  },
-  chips: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: Space.sm,
-  },
-  chip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    borderRadius: Radii.pill,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderWidth: 1,
-    borderColor: 'transparent',
-    backgroundColor: Palette.raised,
-    boxShadow: Shadows.raisedSmall,
-  },
-  chipAdded: {
-    backgroundColor: Palette.amberHighlight,
-    borderColor: 'rgba(251, 191, 36, 0.4)',
-  },
-  chipLabel: {
-    fontFamily: FontNames.monoRegular,
-    fontSize: 11,
-    lineHeight: 14,
-    color: Palette.textSecondary,
-  },
-  chipLabelAdded: { color: Palette.amber },
   note: {
     ...Typography.bodyMd,
     color: Palette.amber,
     fontSize: 12,
   },
-  siteRow: {
+  suggestedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.sm,
+    marginTop: -4,
+  },
+  suggestedLabel: {
+    ...Typography.bodySm,
+    color: Palette.textMuted,
+    flexShrink: 0,
+  },
+  suggestedContent: {
+    gap: 6,
+    paddingRight: Space.md,
+  },
+  suggestedChip: {
+    height: 28,
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+    borderRadius: Radii.pill,
+    borderWidth: 1,
+    borderColor: 'rgba(251, 191, 36, 0.4)',
+    backgroundColor: Palette.amberHighlight,
+  },
+  suggestedChipLabel: {
+    fontFamily: FontNames.monoRegular,
+    fontSize: 10,
+    lineHeight: 14,
+    color: Palette.amber,
+  },
+  targetsCard: {
+    padding: 14,
+    gap: Space.sm,
+    borderRadius: Radii.control,
+  },
+  targetsHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Space.sm,
+  },
+  targetsTitle: {
+    ...Typography.monoLabelSm,
+    fontSize: 10,
+    color: Palette.textSecondary,
+  },
+  targetsLock: {
+    ...Typography.monoLabelSm,
+    fontSize: 10,
+    color: Palette.amber,
+  },
+  targetsEmpty: {
+    ...Typography.bodyMd,
+    color: Palette.textMuted,
+    paddingVertical: Space.sm,
+  },
+  targetsList: { gap: 6 },
+  targetRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: Space.gutter,
-    backgroundColor: Palette.raised,
-    borderRadius: Radii.card,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    boxShadow: Shadows.raised,
-  },
-  siteTile: {
-    width: 44,
-    height: 44,
-    borderRadius: Radii.tile,
-    backgroundColor: Palette.amberHighlight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  siteLetter: {
-    fontFamily: FontNames.monoBold,
-    fontSize: 18,
-    lineHeight: 22,
-    color: Palette.amber,
-  },
-  siteDomain: {
-    ...Typography.headlineMd,
-    fontSize: 15,
-    lineHeight: 20,
-    color: Palette.textPrimary,
-  },
-  watchLabel: {
-    ...Typography.monoLabelSm,
-    color: Palette.success,
-    fontSize: 9,
-    lineHeight: 13,
-  },
-  removeButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
     backgroundColor: Palette.well,
+    borderRadius: Radii.tile,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
     boxShadow: Shadows.sunkenSmall,
   },
-  lockHint: {
+  targetDomain: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 12,
+    lineHeight: 16,
+    color: Palette.textPrimary,
+  },
+  targetStatus: {
+    fontFamily: FontNames.monoRegular,
+    fontSize: 9,
+    lineHeight: 13,
+    letterSpacing: 0.3,
+    color: Palette.success,
+  },
+  targetLock: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Palette.amberHighlight,
+  },
+  targetRemove: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  targetsFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingTop: 2,
+  },
+  targetsFooterText: {
     ...Typography.bodySm,
+    fontSize: 10,
     color: Palette.textMuted,
   },
   empty: {
