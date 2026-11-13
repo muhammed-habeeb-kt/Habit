@@ -18,6 +18,8 @@ type Props<T extends string> = {
    * amber and flips the label to dark text, as on the Home mode picker.
    */
   variant?: 'raised' | 'solid';
+  /** 34 dp control with an amber-tinted active segment, for dense settings rows. */
+  compact?: boolean;
 };
 
 /** Sunken pill track with one highlighted segment; used for modes and sensitivity. */
@@ -26,11 +28,12 @@ export function NeuSegmented<T extends string>({
   value,
   onChange,
   variant = 'raised',
+  compact = false,
 }: Props<T>) {
-  const tall = options.some((option) => option.hint);
+  const tall = options.some((option) => option.hint) && !compact;
   const solid = variant === 'solid';
   return (
-    <View style={[styles.track, tall && styles.trackTall]}>
+    <View style={[styles.track, compact && styles.trackCompact, tall && styles.trackTall]}>
       {options.map((option) => {
         const active = option.id === value;
         return (
@@ -41,7 +44,13 @@ export function NeuSegmented<T extends string>({
             onPress={() => onChange(option.id)}
             style={[
               styles.segment,
-              active && (solid ? styles.segmentSolid : styles.segmentRaised),
+              compact && styles.segmentCompact,
+              active &&
+                (solid
+                  ? styles.segmentSolid
+                  : compact
+                    ? styles.segmentCompactActive
+                    : styles.segmentRaised),
             ]}>
             {/* Capped font scaling keeps "Aggressive" on one line on large-font phones. */}
             <Text
@@ -49,6 +58,7 @@ export function NeuSegmented<T extends string>({
               maxFontSizeMultiplier={1.15}
               style={[
                 styles.label,
+                compact && styles.labelCompact,
                 active && (solid ? styles.labelSolid : styles.labelRaised),
               ]}>
               {option.label}
@@ -80,6 +90,7 @@ const styles = StyleSheet.create({
     gap: 2,
   },
   trackTall: { height: 64 },
+  trackCompact: { height: 34, padding: 3 },
   segment: {
     flex: 1,
     minWidth: 0,
@@ -93,6 +104,14 @@ const styles = StyleSheet.create({
   segmentRaised: {
     backgroundColor: Palette.raised,
     boxShadow: Shadows.raisedSmall,
+  },
+  segmentCompact: {
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  segmentCompactActive: {
+    backgroundColor: Palette.amberHighlight,
+    borderColor: Palette.amber,
   },
   segmentSolid: {
     backgroundColor: Palette.amber,
@@ -114,6 +133,10 @@ const styles = StyleSheet.create({
   labelSolid: {
     fontFamily: FontNames.interBold,
     color: Palette.canvas,
+  },
+  labelCompact: {
+    fontSize: 11,
+    lineHeight: 15,
   },
   hint: {
     fontFamily: FontNames.monoRegular,

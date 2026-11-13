@@ -1,27 +1,25 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import Constants from 'expo-constants';
-import { router } from 'expo-router';
+import { router, useFocusEffect } from 'expo-router';
+import { useCallback, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import {
   NeuCard,
   NeuSegmented,
   NeuSwitch,
-  StatusPill,
   type SegmentOption,
 } from '@/components/neumorphic';
 import { TabScreen } from '@/components/tab-screen';
-import {
-  FontNames,
-  Palette,
-  Radii,
-  Shadows,
-  Space,
-  Typography,
-} from '@/constants/theme';
+import { FontNames, Palette, Radii, Space, Typography } from '@/constants/theme';
 import { useAiMonitoring } from '@/hooks/use-ai-monitoring';
 import { useProtection } from '@/hooks/use-protection';
-import { isMonitoringLocked, type AiSensitivity } from '@/native/habit';
+import {
+  canQueryInstalledPackages,
+  getInstalledPackages,
+  isMonitoringLocked,
+  type AiSensitivity,
+} from '@/native/habit';
 
 const SENSITIVITY_OPTIONS: SegmentOption<AiSensitivity>[] = [
   { id: 'low', label: 'Low' },
@@ -29,19 +27,37 @@ const SENSITIVITY_OPTIONS: SegmentOption<AiSensitivity>[] = [
   { id: 'high', label: 'High' },
 ];
 
-const MODE_PILL: Record<string, { label: string; tone: 'amber' | 'neutral' }> = {
-  normal: { label: 'NORMAL', tone: 'neutral' },
-  strict: { label: 'STRICT', tone: 'amber' },
-  aggressive: { label: 'AGGRESSIVE', tone: 'amber' },
+const MODE_TITLES: Record<string, string> = {
+  normal: 'Normal',
+  strict: 'Strict',
+  aggressive: 'Aggressive',
 };
 
-const SENSITIVITY_NOTES: Record<AiSensitivity, string> = {
-  low: 'Blocks only clear, confident matches.',
-  balanced: 'A careful balance between misses and false blocks.',
-  high: 'Catches more, including borderline content.',
-};
+/** Package groups for the eight supported browsers, matching the Browser Blocking screen. */
+const BROWSER_GROUPS: string[][] = [
+  ['com.android.chrome'],
+  ['com.mi.globalbrowser', 'com.android.browser'],
+  ['com.brave.browser'],
+  ['org.mozilla.firefox'],
+  ['com.microsoft.emmx'],
+  ['com.sec.android.app.sbrowser'],
+  ['com.opera.browser'],
+  ['com.duckduckgo.mobile.android'],
+];
+
+const BROWSER_PACKAGES = BROWSER_GROUPS.flat();
 
 const PERMISSION_COUNT = 5;
+const DIVIDER = 'rgba(255, 255, 255, 0.06)';
+
+/** `3h`, `3h 30m` or `10m` — compact enough for a one-line row subtitle. */
+function formatLimit(minutes: number): string {
+  const total = Math.max(0, Math.round(minutes));
+  const hours = Math.floor(total / 60);
+  const rest = total % 60;
+  if (hours === 0) return `${rest}m`;
+  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+}
 
 export default function SettingsScreen() {
   const { snapshot } = useProtection();
@@ -52,18 +68,35 @@ export default function SettingsScreen() {
     toggleBlockAlerts,
     toggleIncognitoBlocking,
   } = useAiMonitoring();
+  const [installedBrowserCount, setInstalledBrowserCount] = useState(0);
+
+  // Browsers can be installed or removed while Habit is in the background, so the count is
+  // re-read every time Settings is shown rather than cached for the whole session.
+  useFocusEffect(
+    useCallback(() => {
+      if (!canQueryInstalledPackages) return;
+      let active = true;
+      getInstalledPackages(BROWSER_PACKAGES).then((packages) => {
+        if (!active) return;
+        setInstalledBrowserCount(
+          BROWSER_GROUPS.filter((group) => group.some((pkg) => packages.includes(pkg))).length
+        );
+      });
+      return () => {
+        active = false;
+      };
+    }, [])
+  );
 
   const mode = snapshot?.mode ?? 'normal';
-  const pill = MODE_PILL[mode] ?? MODE_PILL.normal;
-  // Same shared native snapshot the Setup screen uses: all five are live Android checks,
-  // so both screens always show exactly the same count.
+  const modeTitle = MODE_TITLES[mode] ?? 'Normal';
+  // Same shared native snapshot the Setup screen uses: all five are live Android checks.
   const grantedCount =
     (snapshot?.accessibilityEnabled ? 1 : 0) +
     (snapshot?.notificationsGranted ? 1 : 0) +
     (snapshot?.batteryOptimizationIgnored ? 1 : 0) +
     (snapshot?.restrictedSettingsAllowed ? 1 : 0) +
     (snapshot?.deviceAdminActive ? 1 : 0);
-  const allGranted = grantedCount >= PERMISSION_COUNT;
   const sensitivity = settings?.aiSensitivity ?? 'balanced';
   const version = Constants.expoConfig?.version ?? '1.0.0';
 
@@ -74,9 +107,31 @@ export default function SettingsScreen() {
   const watchedAppsCount = settings?.monitoredAppPackages.length ?? 0;
   const watchedDomainsCount =
     settings?.monitoredDomains.length ?? snapshot?.aiMonitoredDomains?.length ?? 0;
+
+  const removalLocked = isMonitoringLocked(snapshot);
+  const challengeLength = snapshot?.configuredChallengeLength ?? 200;
+  const waitText = formatLimit(snapshot?.configuredCooldownMinutes ?? 180);
+  const offWindowText = formatLimit(snapshot?.configuredOffWindowMinutes ?? 10);
+
+  // Tapping the mode row opens the switcher on Home; while Strict/Aggressive protects the
+  // phone the only way to lower it is the Unlock screen, so route there instead.
+  const openModeRow = () => {
+    if (removalLocked) {
+      router.push('/unlock');
+      return;
+    }
+    router.navigate('/');
+  };
+
+  const openLockLimits = () => {
+    router.push({
+      pathname: '/configure-protection',
+      params: { mode: mode === 'aggressive' ? 'aggressive' : 'strict' },
+    });
+  };
+
   // Turning it ON adds protection and is instant; turning it OFF lowers a
   // Strict/Aggressive lock, so native refuses it and this opens Unlock instead.
-  const removalLocked = isMonitoringLocked(snapshot);
   const handleIncognitoToggle = (next: boolean) => {
     if (!next && removalLocked) {
       router.push('/unlock');
@@ -84,366 +139,256 @@ export default function SettingsScreen() {
     }
     void toggleIncognitoBlocking(next);
   };
-  const openBrowserSites = () =>
-    router.push({ pathname: '/(tabs)/apps', params: { tab: 'browser' } });
 
   return (
     <TabScreen>
       <View style={styles.header}>
         <Text style={styles.title}>Settings</Text>
+        <Text style={styles.version}>{`Habit v${version}`}</Text>
       </View>
 
-      <Text style={styles.sectionLabel}>AI</Text>
+      <Text style={styles.sectionLabel}>PROTECTION RULES</Text>
+      <NeuCard padded={false} style={styles.group}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Protection mode"
+          onPress={openModeRow}
+          style={({ pressed }) => [styles.row, pressed && styles.pressed]}>
+          <Text style={styles.rowTitle}>Protection Mode</Text>
+          <View style={styles.rowRight}>
+            <Text style={styles.valueAmber}>{modeTitle}</Text>
+            <MaterialCommunityIcons name="chevron-right" size={16} color={Palette.amber} />
+          </View>
+        </Pressable>
 
-      <NeuCard style={styles.sensitivityCard}>
-        <Text style={styles.cardTitle}>AI detection sensitivity</Text>
-        <Text style={styles.cardSubtitle}>How careful Habit is before blocking</Text>
-        <View style={styles.sensitivityControl}>
-          <NeuSegmented
-            options={SENSITIVITY_OPTIONS}
-            value={sensitivity}
-            onChange={(next) => {
-              if (!busy) changeSensitivity(next);
-            }}
-          />
-        </View>
-        <Text style={styles.note}>{SENSITIVITY_NOTES[sensitivity]}</Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Configure lock limits"
+          onPress={openLockLimits}
+          style={({ pressed }) => [
+            styles.row,
+            styles.rowDivider,
+            pressed && styles.pressed,
+          ]}>
+          <View style={styles.grow}>
+            <Text style={styles.rowTitle}>Configure Lock Limits</Text>
+            <Text style={styles.rowSubtitle} numberOfLines={1}>
+              {`${challengeLength} chars • ${waitText} wait • ${offWindowText} auto`}
+            </Text>
+          </View>
+          <MaterialCommunityIcons name="chevron-right" size={18} color={Palette.textMuted} />
+        </Pressable>
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="System permissions"
+          onPress={() => router.push('/onboarding')}
+          style={({ pressed }) => [
+            styles.row,
+            styles.rowDivider,
+            pressed && styles.pressed,
+          ]}>
+          <Text style={styles.rowTitle}>System Permissions</Text>
+          <View style={styles.rowRight}>
+            <Text style={styles.valueGreen}>{`${grantedCount} of ${PERMISSION_COUNT} granted`}</Text>
+            <MaterialCommunityIcons name="chevron-right" size={16} color={Palette.success} />
+          </View>
+        </Pressable>
       </NeuCard>
 
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel="AI Visual Protection"
-        onPress={() => router.push('/apps')}
-        style={({ pressed }) => [pressed && styles.pressed]}>
-        <NeuCard style={styles.rowCard}>
-          <View style={styles.iconWell}>
-            <MaterialCommunityIcons
-              name="star-four-points-outline"
-              size={22}
-              color={Palette.amber}
+      <Text style={styles.sectionLabel}>INTERCEPTION ENGINE</Text>
+      <NeuCard padded={false} style={styles.group}>
+        <View style={styles.row}>
+          <View style={styles.sensitivityHeader}>
+            <Text style={styles.rowTitle}>AI Sensitivity</Text>
+            <Text style={styles.rowHint}>Borderline detection</Text>
+          </View>
+          <View style={styles.sensitivityControl}>
+            <NeuSegmented
+              compact
+              options={SENSITIVITY_OPTIONS}
+              value={sensitivity}
+              onChange={(next) => {
+                if (!busy) changeSensitivity(next);
+              }}
             />
           </View>
+        </View>
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="AI Visual Protection"
+          onPress={() => router.push('/apps')}
+          style={({ pressed }) => [
+            styles.row,
+            styles.rowDivider,
+            pressed && styles.pressed,
+          ]}>
           <View style={styles.grow}>
-            <Text style={styles.cardTitle}>AI Visual Protection</Text>
-            <Text style={styles.cardSubtitle}>
-              {watchedAppsCount} apps • {watchedDomainsCount} sites watched
+            <Text style={styles.rowTitle}>AI Visual Protection</Text>
+            <Text style={styles.rowSubtitle}>
+              {`${watchedAppsCount} app • ${watchedDomainsCount} sites watched`}
             </Text>
           </View>
-          <MaterialCommunityIcons name="chevron-right" size={20} color={Palette.textMuted} />
-        </NeuCard>
-      </Pressable>
-
-      <Text style={styles.sectionLabel}>BROWSER</Text>
-
-      <NeuCard style={styles.incognitoCard}>
-        <View style={styles.iconWell}>
-          <MaterialCommunityIcons name="eye-off-outline" size={22} color={Palette.amber} />
-        </View>
-        <View style={styles.grow}>
-          <Text style={styles.cardTitle}>Block Incognito & Private Tabs</Text>
-          <Text style={styles.cardSubtitle}>Prevent private browsing across all browsers</Text>
-        </View>
-        <NeuSwitch
-          label="Block Incognito & Private Tabs"
-          value={incognitoBlocking}
-          onValueChange={handleIncognitoToggle}
-          disabled={busy || !settings}
-        />
-      </NeuCard>
-
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel="Add or manage AI browser sites"
-        onPress={openBrowserSites}
-        style={({ pressed }) => [pressed && styles.pressed]}>
-        <NeuCard style={styles.rowCard}>
-          <View style={styles.grow}>
-            <Text style={styles.cardTitle}>Add / Manage AI Browser Sites</Text>
-            <Text style={styles.cardSubtitle}>
-              {watchedDomainsCount} websites watched by AI
-            </Text>
-          </View>
-          <View style={styles.addSiteButton}>
-            <Text style={styles.addSiteLabel}>Add Site</Text>
-            <MaterialCommunityIcons name="arrow-right" size={16} color={Palette.canvas} />
-          </View>
-        </NeuCard>
-      </Pressable>
-
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel="Protected browsers"
-        onPress={() => router.push('/browsers')}
-        style={({ pressed }) => [pressed && styles.pressed]}>
-        <NeuCard style={styles.rowCard}>
-          <Text style={styles.rowTitle}>Protected Browsers</Text>
-          <MaterialCommunityIcons name="chevron-right" size={20} color={Palette.textMuted} />
-        </NeuCard>
-      </Pressable>
-
-      <Text style={styles.sectionLabel}>PROTECTION</Text>
-
-      <Pressable
-        accessibilityRole="button"
-        onPress={() => router.navigate('/')}
-        style={({ pressed }) => [pressed && styles.pressed]}>
-        <NeuCard style={styles.rowCard}>
-          <Text style={styles.rowTitle}>Protection mode</Text>
           <View style={styles.rowRight}>
-            <StatusPill label={pill.label} tone={pill.tone} />
-            <MaterialCommunityIcons name="chevron-right" size={20} color={Palette.textMuted} />
+            <Text style={styles.valueAmber}>Manage</Text>
+            <MaterialCommunityIcons name="chevron-right" size={16} color={Palette.amber} />
           </View>
-        </NeuCard>
-      </Pressable>
+        </Pressable>
 
-      <Text style={styles.sectionLabel}>PERMISSIONS</Text>
-      <NeuCard style={styles.permissionsCard}>
-        <View style={styles.permissionRow}>
-          <View style={styles.iconWell}>
-            <MaterialCommunityIcons name="shield-check" size={24} color={Palette.amber} />
-          </View>
+        <View style={[styles.row, styles.rowDivider]}>
           <View style={styles.grow}>
-            <View style={styles.permissionTitleRow}>
-              <Text style={styles.cardTitle}>Permissions</Text>
-              {allGranted ? <StatusPill label="✓ Granted" tone="success" /> : null}
-            </View>
-            <Text style={styles.cardSubtitle}>
-              {grantedCount} of {PERMISSION_COUNT} required permissions granted
-            </Text>
+            <Text style={styles.rowTitle}>Block Incognito & Private</Text>
+            <Text style={styles.rowSubtitle}>Across all browsers</Text>
           </View>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={allGranted ? 'View permissions' : 'Fix permissions'}
-            onPress={() => router.push('/onboarding')}
-            style={({ pressed }) => [
-              allGranted ? styles.viewButton : styles.fixButton,
-              pressed && styles.pressed,
-            ]}>
-            <Text style={allGranted ? styles.viewLabel : styles.fixLabel}>
-              {allGranted ? 'View' : 'Fix'}
-            </Text>
-          </Pressable>
-        </View>
-        <View style={styles.track}>
-          <View
-            style={[styles.fill, { width: `${(grantedCount / PERMISSION_COUNT) * 100}%` }]}
+          <NeuSwitch
+            label="Block Incognito & Private"
+            value={incognitoBlocking}
+            onValueChange={handleIncognitoToggle}
+            disabled={busy || !settings}
           />
         </View>
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Protected browsers"
+          onPress={() => router.push('/browsers')}
+          style={({ pressed }) => [
+            styles.row,
+            styles.rowDivider,
+            pressed && styles.pressed,
+          ]}>
+          <Text style={styles.rowTitle}>Protected Browsers</Text>
+          <View style={styles.rowRight}>
+            <Text style={styles.valueGreen}>{`${installedBrowserCount} Protected`}</Text>
+            <MaterialCommunityIcons name="chevron-right" size={16} color={Palette.success} />
+          </View>
+        </Pressable>
       </NeuCard>
 
       <Text style={styles.sectionLabel}>ALERTS</Text>
-      <NeuCard style={styles.alertsCard}>
-        <View style={styles.grow}>
-          <Text style={styles.alertTitle}>Block alerts</Text>
-          <Text style={styles.cardSubtitle}>Tell me when something is blocked</Text>
+      <NeuCard padded={false} style={styles.group}>
+        <View style={styles.row}>
+          <View style={styles.grow}>
+            <Text style={styles.rowTitle}>Block Alerts</Text>
+            <Text style={styles.rowSubtitle}>Instant tamper & block alerts</Text>
+          </View>
+          <NeuSwitch
+            label="Block Alerts"
+            value={blockAlertsEnabled}
+            onValueChange={(next) => {
+              if (!busy) toggleBlockAlerts(next);
+            }}
+          />
         </View>
-        <NeuSwitch
-          label="Block alerts"
-          value={blockAlertsEnabled}
-          onValueChange={(next) => {
-            if (!busy) toggleBlockAlerts(next);
-          }}
-        />
       </NeuCard>
 
-      <Text style={styles.sectionLabel}>PRIVACY</Text>
-      <View style={styles.privacyCard}>
-        <View style={styles.iconWell}>
-          <MaterialCommunityIcons name="lock" size={24} color={Palette.amber} />
+      <Text style={styles.sectionLabel}>PRIVACY & ARCHITECTURE</Text>
+      <NeuCard padded={false} style={styles.group}>
+        <View style={styles.row}>
+          <Text style={styles.rowTitle}>On-Device Privacy</Text>
+          <Text style={styles.valueGreen}>100% Zero-Telemetry</Text>
         </View>
-        <View style={styles.grow}>
-          <Text style={styles.cardTitle}>Everything stays on this phone</Text>
-          <Text style={styles.cardSubtitle}>Habit never saves or sends what it sees.</Text>
-        </View>
-      </View>
 
-      <Text style={styles.sectionLabel}>ABOUT</Text>
-      <Pressable
-        accessibilityRole="button"
-        onPress={() => router.push('/known-limits')}
-        style={({ pressed }) => [pressed && styles.pressed]}>
-        <NeuCard style={styles.rowCard}>
-          <Text style={styles.rowTitle}>Known limits</Text>
-          <MaterialCommunityIcons name="chevron-right" size={20} color={Palette.textMuted} />
-        </NeuCard>
-      </Pressable>
-
-      <NeuCard style={styles.rowCard}>
-        <View style={styles.versionRow}>
-          <Text style={styles.rowTitle}>Version</Text>
-          <Text style={styles.version}>{version}</Text>
-        </View>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Known limits"
+          onPress={() => router.push('/known-limits')}
+          style={({ pressed }) => [
+            styles.row,
+            styles.rowDivider,
+            pressed && styles.pressed,
+          ]}>
+          <Text style={styles.rowTitle}>Known Limits</Text>
+          <MaterialCommunityIcons name="chevron-right" size={18} color={Palette.textMuted} />
+        </Pressable>
       </NeuCard>
     </TabScreen>
   );
 }
 
 const styles = StyleSheet.create({
-  header: { paddingTop: Space.sm },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Space.sm,
+    paddingTop: Space.sm,
+  },
   title: {
     fontFamily: FontNames.interBold,
     fontSize: 24,
+    lineHeight: 30,
     color: Palette.textPrimary,
+  },
+  version: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 12,
+    lineHeight: 16,
+    color: Palette.amber,
   },
   sectionLabel: {
     ...Typography.monoLabelSm,
     color: Palette.textSecondary,
-    marginTop: Space.sm,
     marginBottom: -4,
   },
-  rowCard: {
+  group: {
+    borderRadius: Radii.control,
+    overflow: 'hidden',
+  },
+  row: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: Space.gutter,
-    paddingVertical: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
   },
-  rowRight: { flexDirection: 'row', alignItems: 'center', gap: Space.sm },
+  rowDivider: {
+    borderTopWidth: 1,
+    borderTopColor: DIVIDER,
+  },
   rowTitle: {
     ...Typography.bodyLg,
     fontFamily: FontNames.interSemiBold,
     color: Palette.textPrimary,
   },
-  sensitivityCard: {
-    width: '100%',
-    alignSelf: 'stretch',
-    gap: Space.xs,
-    paddingVertical: 18,
-  },
-  incognitoCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Space.gutter,
-    paddingVertical: 16,
-  },
-  addSiteButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    height: 36,
-    borderRadius: Radii.pill,
-    backgroundColor: Palette.amber,
-    paddingHorizontal: 14,
-    boxShadow: Shadows.amberGlow,
-  },
-  addSiteLabel: {
-    ...Typography.bodyMd,
-    fontFamily: FontNames.interBold,
-    color: Palette.canvas,
-  },
-  cardTitle: {
-    ...Typography.headlineMd,
-    fontSize: 16,
-    lineHeight: 21,
-    color: Palette.textPrimary,
-  },
-  cardSubtitle: {
-    ...Typography.bodyMd,
-    color: Palette.textSecondary,
-  },
-  sensitivityControl: { width: '100%', marginTop: Space.gutter },
-  note: {
-    ...Typography.bodySm,
-    width: '100%',
-    flexShrink: 1,
+  rowSubtitle: {
+    ...Typography.monoCode,
+    fontSize: 10,
+    lineHeight: 14,
     color: Palette.textMuted,
-    marginTop: Space.sm,
+    marginTop: 2,
   },
-  permissionsCard: { gap: Space.md },
-  row: { flexDirection: 'row', alignItems: 'center', gap: Space.gutter },
-  permissionRow: { flexDirection: 'row', alignItems: 'center', gap: Space.gutter },
-  permissionTitleRow: {
+  rowHint: {
+    ...Typography.bodySm,
+    color: Palette.textMuted,
+  },
+  rowRight: {
     flexDirection: 'row',
     alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: Space.sm,
+    gap: 2,
+    flexShrink: 0,
   },
-  iconWell: {
-    width: 44,
-    height: 44,
-    borderRadius: Radii.tile,
-    backgroundColor: Palette.amberHighlight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  grow: { flex: 1, gap: 2 },
-  fixButton: {
-    minWidth: 52,
-    height: 36,
-    borderRadius: Radii.pill,
-    backgroundColor: Palette.amber,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 16,
-    boxShadow: Shadows.amberGlow,
-  },
-  fixLabel: {
-    ...Typography.bodyMd,
+  valueAmber: {
     fontFamily: FontNames.interBold,
-    color: Palette.canvas,
+    fontSize: 13,
+    lineHeight: 18,
+    color: Palette.amber,
   },
-  viewButton: {
-    minWidth: 52,
-    height: 36,
-    borderRadius: Radii.pill,
-    backgroundColor: Palette.surfaceHigh,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 16,
-    borderWidth: 1,
-    borderColor: Palette.glassBorder,
+  valueGreen: {
+    fontFamily: FontNames.monoBold,
+    fontSize: 11,
+    lineHeight: 15,
+    color: Palette.success,
   },
-  viewLabel: {
-    ...Typography.bodyMd,
-    fontFamily: FontNames.interSemiBold,
-    color: Palette.textSecondary,
-  },
-  track: {
-    height: 8,
-    borderRadius: Radii.pill,
-    backgroundColor: Palette.well,
-    overflow: 'hidden',
-  },
-  fill: {
-    height: '100%',
-    borderRadius: Radii.pill,
-    backgroundColor: Palette.amber,
-  },
-  pressed: { opacity: 0.75 },
-
-  alertsCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Space.gutter,
-    paddingVertical: 16,
-  },
-  alertTitle: {
-    ...Typography.bodyLg,
-    fontFamily: FontNames.interBold,
-    color: Palette.textPrimary,
-  },
-
-  privacyCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Space.gutter,
-    padding: 20,
-    borderRadius: Radii.card,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.12)',
-  },
-
-  versionRow: {
+  grow: { flex: 1, minWidth: 0 },
+  sensitivityHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    gap: Space.gutter,
+    gap: Space.sm,
   },
-  version: {
-    fontFamily: FontNames.monoBold,
-    fontSize: 14,
-    lineHeight: 20,
-    color: Palette.textSecondary,
-  },
+  sensitivityControl: { marginTop: Space.sm },
+  pressed: { opacity: 0.7 },
 });
