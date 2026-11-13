@@ -1,9 +1,17 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { AppState, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import {
+  AppState,
+  Image,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 
-import { AppTile, FrostedBanner, NeuCard, NeuSwitch, NeuWell } from '@/components/neumorphic';
+import { FrostedBanner, NeuCard, NeuSwitch, NeuWell } from '@/components/neumorphic';
 import { TabScreen } from '@/components/tab-screen';
 import { FontNames, Palette, Radii, Shadows, Space, Typography } from '@/constants/theme';
 import { useAiMonitoring } from '@/hooks/use-ai-monitoring';
@@ -182,8 +190,8 @@ export default function AppsScreen() {
   );
 
   const filters: { id: Filter; label: string }[] = [
-    { id: 'all', label: 'ALL' },
-    { id: 'selected', label: `SELECTED (${watched.length})` },
+    { id: 'all', label: `ALL (${apps.length})` },
+    { id: 'selected', label: `SEL (${watched.length})` },
   ];
 
   const renderRow = (app: InstalledApp) => (
@@ -200,11 +208,6 @@ export default function AppsScreen() {
 
   return (
     <TabScreen>
-      <View style={styles.header}>
-        <Text style={styles.title}>AI Monitoring</Text>
-        <Text style={styles.subtitle}>Real-time on-device visual screen protection</Text>
-      </View>
-
       {isNativeAvailable && !overlayAllowed && (
         <FrostedBanner
           icon="shield-alert-outline"
@@ -219,13 +222,11 @@ export default function AppsScreen() {
 
       <NeuCard style={styles.masterCard}>
         <View style={styles.iconWell}>
-          <MaterialCommunityIcons name="star-four-points-outline" size={22} color={Palette.amber} />
+          <MaterialCommunityIcons name="shield-outline" size={20} color={Palette.amber} />
         </View>
         <View style={styles.grow}>
           <Text style={styles.cardTitle}>AI Visual Protection</Text>
-          <Text style={styles.cardSubtitle}>
-            {watched.length} apps • {domains.length} browser sites
-          </Text>
+          <Text style={styles.cardSubtitle}>Real-time on-device screen scan</Text>
         </View>
         <NeuSwitch
           value={enabled}
@@ -235,48 +236,44 @@ export default function AppsScreen() {
         />
       </NeuCard>
 
-      <View style={styles.divider} />
-
-      <View style={styles.modes}>
-        <ModeBox
+      <View style={styles.segments}>
+        <SegmentPill
           active={mode === 'apps'}
-          icon="apps"
-          title="Apps"
-          badge={`${watched.length} selected`}
+          icon="view-grid-outline"
+          label={`Apps (${watched.length} active)`}
           onPress={() => setMode('apps')}
         />
-        <ModeBox
+        <SegmentPill
           active={mode === 'browser'}
-          icon="globe-model"
-          title="Browser"
-          badge={`${domains.length} sites`}
+          icon="web"
+          label={`Browser (${domains.length} sites)`}
           onPress={() => setMode('browser')}
         />
       </View>
 
       {mode === 'apps' ? (
         <>
-          <FrostedBanner
-            icon="circle-outline"
-            title="Habit scans these apps only while they are open."
-            body="Nothing leaves your phone."
-          />
-
-          <NeuWell padded={false} style={styles.search}>
-            <MaterialCommunityIcons name="magnify" size={20} color={Palette.textMuted} />
-            <TextInput
-              value={query}
-              onChangeText={setQuery}
-              placeholder="Search apps"
-              placeholderTextColor={Palette.textMuted}
-              selectionColor={Palette.amber}
-              style={styles.searchInput}
-              autoCorrect={false}
-              autoCapitalize="none"
-            />
+          <NeuWell padded={false} style={styles.privacyBar}>
+            <MaterialCommunityIcons name="lock" size={12} color={Palette.textSecondary} />
+            <Text style={styles.privacyText} numberOfLines={1}>
+              Scans only while open • Nothing leaves phone
+            </Text>
           </NeuWell>
 
-          <View style={styles.filters}>
+          <View style={styles.searchRow}>
+            <NeuWell padded={false} style={styles.search}>
+              <MaterialCommunityIcons name="magnify" size={17} color={Palette.textMuted} />
+              <TextInput
+                value={query}
+                onChangeText={setQuery}
+                placeholder={`Search ${apps.length} apps…`}
+                placeholderTextColor={Palette.textMuted}
+                selectionColor={Palette.amber}
+                style={styles.searchInput}
+                autoCorrect={false}
+                autoCapitalize="none"
+              />
+            </NeuWell>
             {filters.map((item) => {
               const active = item.id === filter;
               return (
@@ -287,7 +284,7 @@ export default function AppsScreen() {
                   onPress={() => setFilter(item.id)}
                   style={({ pressed }) => [
                     styles.filterChip,
-                    active ? styles.filterChipActive : styles.filterChipIdle,
+                    active && styles.filterChipActive,
                     pressed && styles.pressed,
                   ]}>
                   <Text style={[styles.filterLabel, active && styles.filterLabelActive]}>
@@ -297,10 +294,6 @@ export default function AppsScreen() {
               );
             })}
           </View>
-
-          <Text style={styles.count}>
-            {watched.length} of {apps.length} apps selected
-          </Text>
 
           {!canListInstalledApps && (
             <Text style={styles.empty}>
@@ -322,14 +315,25 @@ export default function AppsScreen() {
 
           {canListInstalledApps && !loading && filter === 'all' && selectedApps.length > 0 && (
             <View style={styles.group}>
-              <Text style={styles.sectionLabel}>SELECTED</Text>
+              <View style={styles.sectionRow}>
+                <Text style={styles.sectionLabel}>
+                  {`SELECTED APPS (${selectedApps.length})`}
+                </Text>
+                <Text style={styles.sectionCount}>
+                  {`${selectedApps.length} PROTECTED`}
+                </Text>
+              </View>
               <View style={styles.list}>{selectedApps.map(renderRow)}</View>
             </View>
           )}
 
           {canListInstalledApps && !loading && filter === 'all' && unselectedApps.length > 0 && (
             <View style={styles.group}>
-              <Text style={styles.sectionLabel}>ALL APPS</Text>
+              <View style={styles.sectionRow}>
+                <Text style={styles.sectionLabel}>
+                  {`ALL APPS (${unselectedApps.length} REMAINING)`}
+                </Text>
+              </View>
               <View style={styles.list}>{unselectedApps.map(renderRow)}</View>
             </View>
           )}
@@ -339,7 +343,14 @@ export default function AppsScreen() {
             filter === 'selected' &&
             selectedApps.length > 0 && (
               <View style={styles.group}>
-                <Text style={styles.sectionLabel}>SELECTED</Text>
+                <View style={styles.sectionRow}>
+                  <Text style={styles.sectionLabel}>
+                    {`SELECTED APPS (${selectedApps.length})`}
+                  </Text>
+                  <Text style={styles.sectionCount}>
+                    {`${selectedApps.length} PROTECTED`}
+                  </Text>
+                </View>
                 <View style={styles.list}>{selectedApps.map(renderRow)}</View>
               </View>
             )}
@@ -360,15 +371,14 @@ export default function AppsScreen() {
             <View style={styles.iconWell}>
               <MaterialCommunityIcons
                 name="eye-off-outline"
-                size={22}
+                size={20}
                 color={Palette.amber}
               />
             </View>
             <View style={styles.grow}>
               <Text style={styles.cardTitle}>Block Incognito & Private Tabs</Text>
-              <Text style={styles.cardSubtitle}>
-                Blocks Incognito, Private, Secret & InPrivate tabs across Chrome, Brave,
-                Firefox, Edge, Mi & Samsung browsers
+              <Text style={styles.cardSubtitle} numberOfLines={2}>
+                Blocks Incognito, Private, Secret & InPrivate tabs in every watched browser
               </Text>
             </View>
             <NeuSwitch
@@ -504,44 +514,39 @@ export default function AppsScreen() {
           </View>
         </>
       )}
-
-      <Text style={styles.footer}>
-        AI monitoring is on-device only. Habit never sends screenshots or screen text anywhere.
-      </Text>
     </TabScreen>
   );
 }
 
-interface ModeBoxProps {
+interface SegmentPillProps {
   active: boolean;
   icon: keyof typeof MaterialCommunityIcons.glyphMap;
-  title: string;
-  badge: string;
+  label: string;
   onPress: () => void;
 }
 
-/** One of the two side-by-side mode boxes: Apps or Browser. */
-function ModeBox({ active, icon, title, badge, onPress }: ModeBoxProps) {
+/** One 40 dp segment of the compact Apps / Browser switcher. */
+function SegmentPill({ active, icon, label, onPress }: SegmentPillProps) {
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={title}
       accessibilityState={{ selected: active }}
       onPress={onPress}
       style={({ pressed }) => [
-        styles.modeBox,
-        active ? styles.modeBoxActive : styles.modeBoxIdle,
+        styles.segment,
+        active ? styles.segmentActive : styles.segmentIdle,
         pressed && styles.pressed,
       ]}>
-      <View style={[styles.modeIconTile, active && styles.modeIconTileActive]}>
-        <MaterialCommunityIcons
-          name={icon}
-          size={20}
-          color={active ? Palette.amber : Palette.textSecondary}
-        />
-      </View>
-      <Text style={[styles.modeTitle, active && styles.modeTitleActive]}>{title}</Text>
-      <Text style={[styles.modeBadge, active && styles.modeBadgeActive]}>{badge}</Text>
+      <MaterialCommunityIcons
+        name={icon}
+        size={14}
+        color={active ? Palette.amber : Palette.textSecondary}
+      />
+      <Text
+        style={[styles.segmentLabel, active && styles.segmentLabelActive]}
+        numberOfLines={1}>
+        {label}
+      </Text>
     </Pressable>
   );
 }
@@ -552,12 +557,8 @@ interface AppRowProps {
   onPress: () => void;
 }
 
+/** 60 dp installed-app row: real icon, label, monospace package, checkbox. */
 function AppRow({ app, selected, onPress }: AppRowProps) {
-  const category = app.isSystemApp ? 'System app' : 'Installed app';
-  const subtitle = app.isBrowser
-    ? `${app.packageName} · ${category} · Browser`
-    : `${app.packageName} · ${category}`;
-
   return (
     <Pressable
       accessibilityRole="checkbox"
@@ -569,13 +570,13 @@ function AppRow({ app, selected, onPress }: AppRowProps) {
         selected && styles.rowSelected,
         pressed && styles.pressed,
       ]}>
-      <AppTile name={app.label} iconUri={app.iconUri} selected={selected} />
+      <AppIcon label={app.label} iconUri={app.iconUri} />
       <View style={styles.grow}>
         <Text style={styles.rowTitle} numberOfLines={1}>
           {app.label}
         </Text>
         <Text style={styles.rowSubtitle} numberOfLines={1}>
-          {subtitle}
+          {app.packageName}
         </Text>
       </View>
       <View style={[styles.checkbox, selected && styles.checkboxOn]}>
@@ -585,26 +586,39 @@ function AppRow({ app, selected, onPress }: AppRowProps) {
   );
 }
 
+/** 38 dp real launcher icon, falling back to the app's first letter. */
+function AppIcon({ label, iconUri }: { label: string; iconUri?: string }) {
+  const [failed, setFailed] = useState(false);
+  if (!iconUri || failed) {
+    return (
+      <View style={[styles.appIcon, styles.appIconFallback]}>
+        <Text style={styles.appIconLetter}>{label.trim().charAt(0).toUpperCase() || '?'}</Text>
+      </View>
+    );
+  }
+  return (
+    <Image
+      source={{ uri: iconUri }}
+      style={styles.appIcon}
+      resizeMode="cover"
+      onError={() => setFailed(true)}
+      accessibilityIgnoresInvertColors
+    />
+  );
+}
+
 const styles = StyleSheet.create({
-  header: { gap: 2, paddingTop: Space.sm },
-  title: {
-    ...Typography.displayMd,
-    color: Palette.textPrimary,
-  },
-  subtitle: {
-    ...Typography.bodyLg,
-    color: Palette.textSecondary,
-  },
   masterCard: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: Space.gutter,
     paddingVertical: 14,
+    paddingHorizontal: 16,
   },
   iconWell: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     backgroundColor: Palette.amberHighlight,
     alignItems: 'center',
     justifyContent: 'center',
@@ -620,55 +634,168 @@ const styles = StyleSheet.create({
     ...Typography.bodyMd,
     color: Palette.textSecondary,
   },
-  divider: {
-    height: 1,
-    backgroundColor: Palette.glassBorder,
-    marginVertical: Space.xs,
-  },
-  modes: {
+  segments: {
     flexDirection: 'row',
-    gap: Space.gutter,
+    gap: Space.sm,
   },
-  modeBox: {
+  segment: {
     flex: 1,
-    gap: 6,
-    padding: 14,
-    borderRadius: Radii.card,
-    borderWidth: 1.5,
-    backgroundColor: Palette.raised,
-  },
-  modeBoxActive: {
-    borderColor: Palette.amber,
-    boxShadow: Shadows.raised,
-  },
-  modeBoxIdle: {
-    borderColor: 'transparent',
-    boxShadow: Shadows.raisedSmall,
-  },
-  modeIconTile: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+    minWidth: 0,
+    height: 40,
+    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 6,
+    borderRadius: Radii.pill,
+    paddingHorizontal: 8,
+    borderWidth: 1.5,
+  },
+  segmentActive: {
+    backgroundColor: Palette.amberHighlight,
+    borderColor: Palette.amber,
+  },
+  segmentIdle: {
+    backgroundColor: Palette.surface,
+    borderColor: 'transparent',
+  },
+  segmentLabel: {
+    ...Typography.bodyMd,
+    fontFamily: FontNames.interSemiBold,
+    fontSize: 12,
+    color: Palette.textSecondary,
+  },
+  segmentLabelActive: {
+    fontFamily: FontNames.interBold,
+    color: Palette.amber,
+  },
+  privacyBar: {
+    height: 30,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 12,
+    borderRadius: Radii.pill,
+  },
+  privacyText: {
+    ...Typography.bodySm,
+    fontSize: 11,
+    color: Palette.textSecondary,
+  },
+  searchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.sm,
+  },
+  search: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 12,
+    height: 40,
+    borderRadius: Radii.pill,
+  },
+  searchInput: {
+    flex: 1,
+    ...Typography.bodyMd,
+    color: Palette.textPrimary,
+    paddingVertical: 0,
+  },
+  filterChip: {
+    height: 40,
+    justifyContent: 'center',
+    borderRadius: Radii.pill,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderColor: 'transparent',
+    backgroundColor: Palette.surface,
+  },
+  filterChipActive: {
+    backgroundColor: Palette.amberHighlight,
+    borderColor: Palette.amber,
+  },
+  filterLabel: {
+    ...Typography.monoLabelSm,
+    fontSize: 9,
+    letterSpacing: 0.4,
+    color: Palette.textSecondary,
+  },
+  filterLabelActive: { color: Palette.amber },
+  group: { gap: Space.sm },
+  sectionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Space.sm,
+  },
+  sectionLabel: {
+    ...Typography.monoLabelSm,
+    fontSize: 10,
+    color: Palette.textSecondary,
+  },
+  sectionCount: {
+    ...Typography.monoLabelSm,
+    fontSize: 10,
+    color: Palette.amber,
+  },
+  list: { gap: 6 },
+  row: {
+    height: 60,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.gutter,
+    backgroundColor: Palette.raised,
+    borderRadius: Radii.control,
+    paddingHorizontal: 12,
+    boxShadow: Shadows.raisedSmall,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  rowSelected: {
+    borderColor: Palette.amber,
+  },
+  appIcon: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
     backgroundColor: Palette.well,
   },
-  modeIconTileActive: {
-    backgroundColor: Palette.amberHighlight,
+  appIconFallback: {
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  modeTitle: {
-    ...Typography.headlineMd,
+  appIconLetter: {
+    fontFamily: FontNames.monoBold,
     fontSize: 15,
     lineHeight: 20,
     color: Palette.textPrimary,
   },
-  modeTitleActive: { color: Palette.amber },
-  modeBadge: {
-    ...Typography.bodyMd,
-    color: Palette.textSecondary,
-    fontSize: 11,
+  rowTitle: {
+    ...Typography.headlineMd,
+    fontSize: 14,
+    lineHeight: 19,
+    color: Palette.textPrimary,
   },
-  modeBadgeActive: { color: Palette.amber },
+  rowSubtitle: {
+    ...Typography.monoCode,
+    fontSize: 10,
+    lineHeight: 14,
+    color: Palette.textMuted,
+  },
+  checkbox: {
+    width: 24,
+    height: 24,
+    borderRadius: 8,
+    backgroundColor: Palette.well,
+    boxShadow: Shadows.sunkenSmall,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkboxOn: {
+    backgroundColor: Palette.amber,
+    boxShadow: Shadows.amberHalo,
+  },
   incognitoCard: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -754,101 +881,6 @@ const styles = StyleSheet.create({
     color: Palette.amber,
     fontSize: 12,
   },
-  search: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Space.sm,
-    paddingHorizontal: 14,
-    height: 44,
-    borderRadius: Radii.input,
-  },
-  searchInput: {
-    flex: 1,
-    ...Typography.bodyLg,
-    color: Palette.textPrimary,
-    paddingVertical: 0,
-  },
-  filters: {
-    flexDirection: 'row',
-    gap: Space.sm,
-  },
-  filterChip: {
-    borderRadius: Radii.pill,
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    height: 32,
-  },
-  filterChipIdle: {
-    backgroundColor: Palette.raised,
-    boxShadow: Shadows.raisedSmall,
-  },
-  filterChipActive: {
-    backgroundColor: Palette.amberHighlight,
-    borderWidth: 1,
-    borderColor: 'rgba(251, 191, 36, 0.4)',
-  },
-  filterLabel: {
-    ...Typography.monoLabelSm,
-    color: Palette.textSecondary,
-    fontSize: 10,
-    fontFamily: 'Space Mono',
-  },
-  filterLabelActive: { color: Palette.amber, fontSize: 10, fontFamily: 'Space Mono' },
-  count: {
-    ...Typography.bodyMd,
-    color: Palette.textSecondary,
-    marginTop: -4,
-    fontSize: 10,
-    fontFamily: 'Space Mono',
-  },
-  group: { gap: Space.sm },
-  sectionLabel: {
-    ...Typography.monoLabelSm,
-    color: Palette.textSecondary,
-    fontSize: 10,
-    fontFamily: 'Space Mono',
-    textTransform: 'uppercase',
-  },
-  list: { gap: Space.sm },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Space.gutter,
-    backgroundColor: Palette.surface,
-    borderRadius: Radii.control,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    boxShadow: Shadows.raisedSmall,
-    borderWidth: 1,
-    borderColor: 'transparent',
-  },
-  rowSelected: {
-    borderColor: Palette.amber,
-  },
-  rowTitle: {
-    ...Typography.headlineMd,
-    fontSize: 15,
-    lineHeight: 20,
-    color: Palette.textPrimary,
-  },
-  rowSubtitle: {
-    ...Typography.bodyMd,
-    color: Palette.textSecondary,
-    fontSize: 11,
-  },
-  checkbox: {
-    width: 24,
-    height: 24,
-    borderRadius: 8,
-    backgroundColor: Palette.well,
-    boxShadow: Shadows.sunkenSmall,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  checkboxOn: {
-    backgroundColor: Palette.amber,
-    boxShadow: Shadows.amberHalo,
-  },
   siteRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -903,12 +935,6 @@ const styles = StyleSheet.create({
     color: Palette.textMuted,
     textAlign: 'center',
     paddingVertical: Space.xl,
-  },
-  footer: {
-    ...Typography.bodySm,
-    color: Palette.textMuted,
-    textAlign: 'center',
-    paddingHorizontal: Space.md,
   },
   pressed: { opacity: 0.75 },
 });
