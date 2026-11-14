@@ -203,7 +203,6 @@ object HabitStore {
   private const val KEY_STATE = "state"
   private const val KEY_ATTEMPTS = "attempts"
   private const val KEY_DOMAINS = "domains"
-  private const val KEY_KEYWORDS = "keywords"
   private const val KEY_UNLOCK = "unlock"
   private const val KEY_AI = "ai"
   private const val KEY_RESTRICTED_SETTINGS = "restricted_settings"
@@ -246,7 +245,6 @@ object HabitStore {
   @Volatile private var cachedState: ProtectionState? = null
   @Volatile private var cachedUnlock: UnlockState? = null
   @Volatile private var cachedDomains: List<String>? = null
-  @Volatile private var cachedKeywords: List<String>? = null
   @Volatile private var cachedAi: AiSettings? = null
   @Volatile private var cachedRestrictedVisited: Boolean? = null
   @Volatile private var cachedDayClock: DayClock? = null
@@ -1058,20 +1056,17 @@ object HabitStore {
 
   // region lists
 
-  fun publishLists(context: Context, domainsJson: String, keywordsJson: String): Boolean {
+  fun publishDomains(context: Context, domainsJson: String): Boolean {
     return try {
       JSONArray(domainsJson)
-      JSONArray(keywordsJson)
       synchronized(lock) {
         write(context, KEY_DOMAINS, domainsJson)
-        write(context, KEY_KEYWORDS, keywordsJson)
         cachedDomains = null
-        cachedKeywords = null
       }
-      AdultFilter.update(domains(context), keywords(context))
+      AdultFilter.update(domains(context))
       true
     } catch (error: Throwable) {
-      Log.w(TAG, "publishLists failed: ${error.message}")
+      Log.w(TAG, "publishDomains failed: ${error.message}")
       false
     }
   }
@@ -1080,13 +1075,6 @@ object HabitStore {
     cachedDomains?.let { return it }
     val parsed = parseStringArray(read(context, KEY_DOMAINS))
     cachedDomains = parsed
-    return parsed
-  }
-
-  fun keywords(context: Context): List<String> {
-    cachedKeywords?.let { return it }
-    val parsed = parseStringArray(read(context, KEY_KEYWORDS))
-    cachedKeywords = parsed
     return parsed
   }
 
@@ -1104,7 +1092,7 @@ object HabitStore {
   }
 
   fun ensureFilter(context: Context) {
-    AdultFilter.update(domains(context), keywords(context))
+    AdultFilter.update(domains(context))
   }
 
   // endregion

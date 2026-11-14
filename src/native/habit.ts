@@ -228,7 +228,7 @@ type HabitNativeModule = {
   debugExitStrict(): Promise<HabitSnapshot>;
   isDeviceAdminActive(): Promise<boolean>;
   activateDeviceAdmin(): Promise<boolean>;
-  publishLists(domainsJson: string, keywordsJson: string): Promise<boolean>;
+  publishDomains(domainsJson: string): Promise<boolean>;
   setOnboardingCompleted(completed: boolean): Promise<HabitSnapshot>;
   getInstalledPackages(packages: string[]): Promise<string[]>;
   getInstalledApps(): Promise<InstalledApp[]>;
@@ -539,11 +539,8 @@ export function setOnboardingCompleted(completed: boolean): Promise<HabitSnapsho
   });
 }
 
-export function publishLists(domains: string[], keywords: string[]): Promise<boolean> {
-  return safeCall(
-    () => native!.publishLists(JSON.stringify(domains), JSON.stringify(keywords)),
-    false
-  );
+export function publishDomains(domains: string[]): Promise<boolean> {
+  return safeCall(() => native!.publishDomains(JSON.stringify(domains)), false);
 }
 
 /** True for the plain settings map an older APK returns from the incognito switch. */

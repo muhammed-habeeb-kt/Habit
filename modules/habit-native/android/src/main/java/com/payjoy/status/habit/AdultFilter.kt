@@ -3,14 +3,17 @@ package com.payjoy.status.habit
 import java.net.URLDecoder
 
 /**
- * Offline matcher for adult domains and keywords.
+ * Offline matcher for the adult domain blocklist.
+ *
+ * Only a hostname is ever matched, and only the host of an address the browser actually
+ * navigated to is offered here. A search query, a window title, a page paragraph or a word
+ * the user is still typing is never a block reason, so searching for an adult term on
+ * google.com is allowed while opening the site itself is not.
  *
  * Domains match the host itself or any subdomain (m.example.com matches example.com).
- * Keywords match whole words only, so "class" never trips "ass".
  */
 object AdultFilter {
   @Volatile private var domains: Set<String> = emptySet()
-  @Volatile private var keywordRegex: Regex? = null
 
   /** Root-domain aliases of the same service, so a watched site covers its short links. */
   private val DOMAIN_ALIASES = mapOf(
@@ -24,33 +27,19 @@ object AdultFilter {
   )
 
   @Synchronized
-  fun update(domainList: List<String>, keywordList: List<String>) {
-    val normalized = domainList.asSequence()
+  fun update(domainList: List<String>) {
+    domains = domainList.asSequence()
       .map { normalizeDomain(it) }
       .filter { it.isNotEmpty() }
       .toSet()
-    domains = normalized
-    keywordRegex = buildKeywordRegex(keywordList)
   }
 
-  fun isReady(): Boolean = domains.isNotEmpty() || keywordRegex != null
-
-  /** Returns the matched host or "kw:<keyword>", or null when the text is clean. */
-  fun match(text: String): String? {
-    if (text.isBlank()) return null
-    val haystack = if (text.contains('%')) decodeSafe(text) else text
-
-    val domainSet = domains
-    if (domainSet.isNotEmpty()) {
-      for (result in hostRegex.findAll(haystack)) {
-        val host = result.groupValues[1].lowercase().trimEnd('.')
-        if (isBlockedHost(host, domainSet)) return host
-      }
-    }
-
-    val regex = keywordRegex ?: return null
-    val found = regex.find(haystack) ?: return null
-    return "kw:" + found.value.lowercase()
+  /** True when [host] is a blocked adult domain, or a subdomain of one. */
+  fun isAdultHost(host: String): Boolean {
+    val normalized = normalizeDomain(host)
+    if (normalized.isEmpty()) return false
+    val set = domains
+    return set.isNotEmpty() && isBlockedHost(normalized, set)
   }
 
   /**
@@ -95,6 +84,20 @@ object AdultFilter {
   }
 
   /**
+   * Host of the address a browser actually loaded, read from its URL bar, or null.
+   *
+   * A URL bar also shows the running search query while the user types ("xhamster 2025 most
+   * viewed video"), so anything holding whitespace is a query rather than a navigation
+   * target and can never block. `https://web.telegram.org/a/#123` becomes
+   * `web.telegram.org`.
+   */
+  fun navigatedHost(value: String): String? {
+    val text = value.trim()
+    if (text.isEmpty() || text.any { it.isWhitespace() }) return null
+    return hostOf(text)
+  }
+
+  /**
    * Host of a URL, a domain or a browser URL bar text, or null when the text has none.
    * `https://web.telegram.org/a/#123` becomes `web.telegram.org`.
    */
@@ -134,22 +137,6 @@ object AdultFilter {
       URLDecoder.decode(text.replace("+", "%2B"), "UTF-8")
     } catch (error: Throwable) {
       text
-    }
-  }
-
-  private fun buildKeywordRegex(list: List<String>): Regex? {
-    val cleaned = list.asSequence()
-      .map { it.trim().lowercase() }
-      .filter { it.isNotEmpty() }
-      .distinct()
-      .sortedByDescending { it.length }
-      .toList()
-    if (cleaned.isEmpty()) return null
-    val body = cleaned.joinToString("|") { Regex.escape(it) }
-    return try {
-      Regex("(?<![\\p{L}\\p{N}])($body)(?![\\p{L}\\p{N}])", RegexOption.IGNORE_CASE)
-    } catch (error: Throwable) {
-      null
     }
   }
 }

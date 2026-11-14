@@ -66,7 +66,6 @@ export function FloatingTabBar({ state, descriptors, navigation }: BottomTabBarP
                 />
                 <Text
                   style={[styles.label, focused && styles.labelActive]}
-                  numberOfLines={1}
                   maxFontSizeMultiplier={1}
                   allowFontScaling={false}>
                   {visual.label}
@@ -115,11 +114,16 @@ const styles = StyleSheet.create({
     height: 1,
     backgroundColor: 'rgba(255, 255, 255, 0.10)',
   },
+  /**
+   * Every tab owns an equal third of the dock and stretches its pill to that width, so a
+   * label always has the whole segment to sit in: neither the inactive nor the active tab
+   * can be squeezed into an ellipsis by a neighbour's padding.
+   */
   tab: {
     flex: 1,
     minWidth: 0,
     height: '100%',
-    alignItems: 'center',
+    alignItems: 'stretch',
     justifyContent: 'center',
   },
   pill: {
@@ -127,9 +131,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 6,
-    maxWidth: '100%',
     height: 40,
-    paddingHorizontal: 10,
+    paddingHorizontal: 6,
     borderRadius: Radii.pill,
   },
   pillActive: {
@@ -137,7 +140,6 @@ const styles = StyleSheet.create({
     boxShadow: Shadows.amberGlow,
   },
   label: {
-    flexShrink: 0,
     fontFamily: FontNames.interMedium,
     fontSize: 11,
     lineHeight: 15,

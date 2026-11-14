@@ -156,16 +156,16 @@ class HabitAccessibilityService : AccessibilityService() {
     }
 
     // Incognito / Private / Secret / InPrivate tabs have no readable URL and must never
-    // render at all, so this runs before any URL text scan and blocks on the very event
-    // that opens the tab. Node reads only: no screenshot, no model, no stored page text.
+    // render at all, so this runs before any URL text scan and blocks as soon as the tab is
+    // really open. Node reads plus one screenshot probe: no model, no stored page text.
     //
     // The watchdog is armed on every event — a no-op while it already runs — because a
     // tab switch inside the same browser activity can leave the guard with no further
     // event of its own, and a browser can return to the front without one either.
     ensureIncognitoWatch()
     if (isBrowserPackage(pkg)) {
-      // Check this very event too: a tap on "New incognito tab" must be blocked before the
-      // tab exists.
+      // A tab or window change asks the FLAG_SECURE probe for one immediate look instead of
+      // waiting for the next watchdog tick.
       if (scanIncognitoTabs(safeEvent, pkg)) return
     }
 
@@ -198,7 +198,7 @@ class HabitAccessibilityService : AccessibilityService() {
         HabitGuard.hideOverlay()
         return
       }
-      scanPage(this, pkg, safeEvent)
+      scanPage(pkg, safeEvent)
     } catch (error: Throwable) {
       Log.w(TAG, "scan failed: ${error.message}")
     }
@@ -322,27 +322,23 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   /**
-   * True when the browser is in, or is entering, a private session.
+   * True when the browser actually has a private tab open in front.
    *
-   * Only the browser's own native chrome is inspected, because a normal tab can display any
-   * words at all. Recursion stops dead at every WebView / GeckoView node — its native
-   * siblings are still walked, so a toolbar or tab strip next to a page is read — which
-   * means webpage text, search results and commit titles are never read for Incognito
-   * detection.
+   * Two strict signals only, because every softer one fires on a normal browsing session:
+   * Chrome's New Tab Page shows an "Incognito" shortcut chip under the search bar and
+   * Brave's ⋮ menu lists "New Private tab", so a menu item, a button label or the bare word
+   * "incognito" anywhere in the chrome proves nothing.
    *
-   * Detection is deliberately browser-agnostic, so a newly installed browser is covered
-   * without a code change. Three universal signals:
-   *  1. a `TYPE_VIEW_CLICKED` node outside every WebView whose label matches the private
-   *     browsing vocabulary (incognito / InPrivate / private tab / secret mode / fire
-   *     window / ghost mode / …);
-   *  2. a visible native private-mode view id (`incognito_ntp`, `private_tab`, `secret_mode`,
-   *     `fire_icon`, …), with toggle / tab buttons only when selected or checked;
-   *  3. a visible native text or contentDescription outside every WebView matching the
-   *     same private-mode vocabulary (empty-tab sentences, tab-switcher rows, toolbars).
+   *  1. `FLAG_SECURE` window (`probeSecureBrowserWindow`): every Chromium browser marks a
+   *     private tab unreachable to `takeScreenshot`, so the refusal is the decisive signal
+   *     and it never happens on a home page or an open menu.
+   *  2. The full sentences only an already-open, empty private page renders, read from
+   *     native chrome outside every WebView (see [PRIVATE_PAGE_SENTENCES]). A page's own
+   *     content and the browser's menu rows can never produce one.
    *
    * Dedicated always-private browsers (Firefox Focus, Tor Browser) block on entry.
    *
-   * A continuous 1 s watchdog repeats layers 2 and 3 while a browser is in front, because
+   * A continuous 1 s watchdog repeats both signals while a browser is in front, because
    * Chrome switches between normal and Incognito tabs inside the same activity without
    * necessarily emitting an event the guard could react to.
    *
@@ -365,31 +361,20 @@ class HabitAccessibilityService : AccessibilityService() {
         return true
       }
 
-      if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED &&
-        isPrivateModeClick(event)
-      ) {
-        blockPrivateTab()
-        return true
-      }
-
-      // Layer 1: a private tab hides its page behind FLAG_SECURE. The watchdog drives the
+      // Signal 1: a private tab hides its page behind FLAG_SECURE. The watchdog drives the
       // probe on its own cadence, so a tick-driven node scan does not need to repeat it.
       if (probe) probeSecureBrowserWindow(pkg, event)
 
       val roots = browserRoots(pkg)
       if (roots.isEmpty()) return false
 
-      val scan = PrivateTabScan()
+      val budget = intArrayOf(INCOGNITO_NODE_BUDGET)
       for (root in roots) {
-        collectPrivateTabSignals(root, scan, 0, intArrayOf(INCOGNITO_NODE_BUDGET))
-      }
-      // Every hit was read from native chrome outside a WebView, so no page can produce
-      // one: a private view id or a private-mode label is decisive.
-      if (scan.viewIdHit || scan.labelHit) {
-        val signal = if (scan.viewIdHit) "private view id" else "private-mode label"
-        Log.i(TAG, "Incognito blocked in $pkg ($signal)")
-        blockPrivateTab()
-        return true
+        if (privatePageSentenceFound(root, 0, budget)) {
+          Log.i(TAG, "Incognito blocked in $pkg (private page text)")
+          blockPrivateTab()
+          return true
+        }
       }
       false
     } catch (error: Throwable) {
@@ -403,55 +388,51 @@ class HabitAccessibilityService : AccessibilityService() {
     HabitGuard.onIncognitoDetected(this)
   }
 
-  /** What one walk of a browser window found outside every WebView. */
-  private class PrivateTabScan {
-    var viewIdHit = false
-    var labelHit = false
-  }
-
   /**
-   * Menu label of the clicked node. The node itself, its direct child TextViews and the
-   * event text are all read, because a Chromium menu row is a container whose visible label
-   * often lives on a child. A verified native source may contain the label (a row can carry
-   * a hint); without a source node only an exact menu label counts, so a clicked page link
-   * can never be mistaken for a private-tab block.
+   * Signal 2: a full private-page sentence on a visible native chrome node.
+   *
+   * Recursion stops dead at every WebView / GeckoView node, so page text, search results
+   * and page titles are never read. Only the long sentences an already-open, empty private
+   * page renders are matched (see [PRIVATE_PAGE_SENTENCES]); a menu row, a shortcut chip or
+   * a button label can never produce one.
    */
-  private fun isPrivateModeClick(event: AccessibilityEvent): Boolean {
-    val node = try {
-      event.source
+  private fun privatePageSentenceFound(
+    node: AccessibilityNodeInfo?,
+    depth: Int,
+    budget: IntArray
+  ): Boolean {
+    if (node == null || budget[0] <= 0 || depth > INCOGNITO_MAX_DEPTH) return false
+    budget[0] -= 1
+    val className = try {
+      node.className?.toString() ?: ""
     } catch (error: Throwable) {
-      null
+      ""
     }
-    if (node == null) {
-      return eventTextLabels(event).any { label -> PRIVATE_MODE_EXACT.matches(label) }
-    }
+    // Stop at the page, keep walking its native siblings: a toolbar or tab strip next to
+    // the WebView is exactly where native chrome lives.
+    if (isWebViewClass(className)) return false
     val visible = try {
       node.isVisibleToUser
     } catch (error: Throwable) {
       false
     }
-    if (!visible) return false
-    if (insideWebView(node)) return false
+    // An intermediate container on HyperOS often reports itself as not visible while its
+    // children are exactly what the user sees, so an invisible node contributes no text but
+    // is still descended into. An editable field is the URL / search bar, never a sentence.
+    if (visible && !className.lowercase().contains("edittext")) {
+      val text = try {
+        node.text
+      } catch (error: Throwable) {
+        null
+      }
+      val description = try {
+        node.contentDescription
+      } catch (error: Throwable) {
+        null
+      }
+      if (privatePageSentenceIn(text) || privatePageSentenceIn(description)) return true
+    }
 
-    val labels = ArrayList<String>(6)
-    try {
-      nativeLabel(node.text)?.let { labels.add(it) }
-    } catch (error: Throwable) {
-      // stale node
-    }
-    try {
-      nativeLabel(node.contentDescription)?.let { labels.add(it) }
-    } catch (error: Throwable) {
-      // stale node
-    }
-    try {
-      event.text?.forEach { value -> nativeLabel(value)?.let { labels.add(it) } }
-    } catch (error: Throwable) {
-      // stale event
-    }
-    // A menu row is often a clickable container whose own text is empty while a child
-    // TextView carries the visible label, so the direct children are read too. They are
-    // native chrome rows (this node is outside every WebView) and still need an exact match.
     val childCount = try {
       node.childCount
     } catch (error: Throwable) {
@@ -462,49 +443,18 @@ class HabitAccessibilityService : AccessibilityService() {
         node.getChild(index)
       } catch (error: Throwable) {
         null
-      } ?: continue
-      try {
-        nativeLabel(child.text)?.let { labels.add(it) }
-      } catch (error: Throwable) {
-        // stale child
       }
-      try {
-        nativeLabel(child.contentDescription)?.let { labels.add(it) }
-      } catch (error: Throwable) {
-        // stale child
-      }
+      if (privatePageSentenceFound(child, depth + 1, budget)) return true
     }
-    labels.addAll(eventTextLabels(event))
-    // A menu row's text can carry the label plus a hint, while this node is still native
-    // chrome outside every WebView, so the universal token pattern is matched anywhere.
-    return labels.any { label -> isPrivateModeLabel(label) }
+    return false
   }
 
-  /** True for a short native chrome label that names a private browsing mode. */
-  private fun isPrivateModeLabel(label: String): Boolean {
-    if (label.isEmpty()) return false
-    // A URL or a search query in a toolbar can contain the word "incognito"; it is never
-    // a native menu label, so it must not block the page the user typed.
-    if (label.startsWith("http") || label.contains("://") || label.contains("/")) return false
-    return PRIVATE_MODE_TOKEN.containsMatchIn(label)
-  }
-
-  /** Short normalised labels carried by the event itself. */
-  private fun eventTextLabels(event: AccessibilityEvent): List<String> {
-    val labels = ArrayList<String>(3)
-    try {
-      event.text?.forEach { value ->
-        nativeLabel(value)?.let { labels.add(it) }
-      }
-    } catch (error: Throwable) {
-      // stale event
-    }
-    try {
-      nativeLabel(event.contentDescription)?.let { labels.add(it) }
-    } catch (error: Throwable) {
-      // stale event
-    }
-    return labels
+  /** True when one node label contains a whole private-page sentence, never a short word. */
+  private fun privatePageSentenceIn(raw: CharSequence?): Boolean {
+    val value = raw?.toString() ?: return false
+    if (value.isEmpty() || value.length > INCOGNITO_MAX_SENTENCE) return false
+    val normalised = normaliseLabel(value)
+    return PRIVATE_PAGE_SENTENCES.any { sentence -> normalised.contains(sentence) }
   }
 
   private fun normaliseLabel(value: String): String =
@@ -540,124 +490,12 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   /**
-   * Collects private-mode evidence from visible native views only. The first WebView ends
-   * that subtree: nothing rendered by a page is ever read or matched.
-   */
-  private fun collectPrivateTabSignals(
-    node: AccessibilityNodeInfo?,
-    scan: PrivateTabScan,
-    depth: Int,
-    budget: IntArray
-  ) {
-    if (node == null || scan.viewIdHit || budget[0] <= 0 || depth > INCOGNITO_MAX_DEPTH) return
-    budget[0] -= 1
-    val visible = try {
-      node.isVisibleToUser
-    } catch (error: Throwable) {
-      false
-    }
-    // An intermediate container on HyperOS often reports itself as not visible while its
-    // children are exactly what the user sees, so an invisible node never contributes a
-    // label but its children are still walked. Nothing inside a WebView is ever read.
-    val className = try {
-      node.className?.toString() ?: ""
-    } catch (error: Throwable) {
-      ""
-    }
-    if (isWebViewClass(className)) {
-      // Stop at the page, keep walking its native siblings: a toolbar, menu or tab strip
-      // next to the WebView is exactly where the private-mode chrome lives.
-      return
-    }
-
-    if (visible && incognitoViewIdHit(node)) {
-      scan.viewIdHit = true
-      return
-    }
-
-    // Text and contentDescription both count: Firefox puts its private-tab sentence in a
-    // description, and a Chromium tab-switcher row may only expose one of the two.
-    val textLabel = if (visible) {
-      try {
-        nativeLabel(node.text)
-      } catch (error: Throwable) {
-        null
-      }
-    } else null
-    val descriptionLabel = if (visible) {
-      try {
-        nativeLabel(node.contentDescription)
-      } catch (error: Throwable) {
-        null
-      }
-    } else null
-    // An editable field is the URL / search bar, never native chrome wording.
-    val editable = className.lowercase().contains("edittext")
-    if (!editable) {
-      for (label in arrayOf(textLabel, descriptionLabel)) {
-        if (label == null) continue
-        if (isPrivateModeLabel(label)) {
-          scan.labelHit = true
-          return
-        }
-      }
-    }
-
-    val childCount = try {
-      node.childCount
-    } catch (error: Throwable) {
-      0
-    }
-    for (index in 0 until childCount) {
-      val child = try {
-        node.getChild(index)
-      } catch (error: Throwable) {
-        null
-      }
-      collectPrivateTabSignals(child, scan, depth + 1, budget)
-    }
-  }
-
-  /**
-   * Native private-mode view ids, matched by vocabulary instead of one browser's resource
-   * names (`incognito_ntp`, `private_tab`, `secret_mode_badge`, `fire_icon`, …).
-   */
-  private fun incognitoViewIdHit(node: AccessibilityNodeInfo): Boolean {
-    val lower = try {
-      node.viewIdResourceName?.lowercase()
-    } catch (error: Throwable) {
-      null
-    } ?: return false
-    if (lower.isEmpty()) return false
-    if (!PRIVATE_VIEW_ID_TOKEN.containsMatchIn(lower)) return false
-
-    // A toggle or tabs button that is merely present proves nothing: it exists in normal
-    // browsing too. Only a selected / checked state means a private session is active.
-    val toggle = lower.contains("toggle") || lower.contains("button") || lower.contains("fire")
-    if (!toggle) return true
-    return try {
-      node.isSelected || node.isChecked
-    } catch (error: Throwable) {
-      false
-    }
-  }
-
-  /**
-   * Short native label from a node's text or contentDescription, normalised for matching.
-   * Anything longer is page content or a page title, never a browser chrome line.
-   */
-  private fun nativeLabel(raw: CharSequence?): String? {
-    val value = raw?.toString() ?: return null
-    if (value.isEmpty() || value.length > INCOGNITO_MAX_SENTENCE) return null
-    return normaliseLabel(value)
-  }
-
-  /**
    * Starts the continuous private-tab watchdog.
    *
    * This is what makes detection independent of accessibility events: Chrome can open,
    * close or switch an Incognito tab without a window-state change that the event handler
-   * would see, and a visible WebView in that activity must not mask the secure window. The
+   * would see, and a visible WebView in that activity must not mask the secure window. It
+   * also drives the FLAG_SECURE probe, which is the decisive signal. The
    * loop stays alive while protection and the switch are on, so a browser that comes back
    * without an event is picked up on the next tick instead of never.
    */
@@ -1016,20 +854,37 @@ class HabitAccessibilityService : AccessibilityService() {
    * Host currently in the browser's URL bar, or null while the toolbar is empty, hidden or
    * still loading. Only the URL bar is read; the window title is the page title, not a URL.
    *
-   * The active root is tried first, then every visible window of the browser, so a split /
-   * floating browser still reports the address of the page it shows.
+   * Used to arm the watched-website AI scanner, where a search page is a legitimate place
+   * to scan. The adult blocklist uses [currentNavigatedHost] instead, which refuses a query.
    */
-  private fun currentBrowserHost(pkg: String): String? {
+  private fun currentBrowserHost(pkg: String): String? =
+    browserUrlBarTexts(pkg).firstNotNullOfOrNull { text -> AdultFilter.hostOf(text) }
+
+  /**
+   * Host of the page the browser actually navigated to, or null while the toolbar shows a
+   * search query, an empty field or nothing at all. Only this value may decide an adult
+   * block: a query the user is typing or searching with is never a navigation target.
+   */
+  private fun currentNavigatedHost(pkg: String): String? =
+    browserUrlBarTexts(pkg).firstNotNullOfOrNull { text -> AdultFilter.navigatedHost(text) }
+
+  /**
+   * URL bar texts of every window of [pkg], the active root first.
+   *
+   * AccessibilityWindowInfo exposes no visibility flag; a readable root is the only public
+   * signal, so a window that cannot be rooted is skipped. A split or floating browser still
+   * reports the address of the page it shows.
+   */
+  private fun browserUrlBarTexts(pkg: String): List<String> {
+    val texts = ArrayList<String>(2)
     val active = try {
       rootInActiveWindow
     } catch (error: Throwable) {
       null
     }
-    browserHostFor(active, pkg)?.let { return it }
+    urlBarTextOf(active, pkg)?.let { texts.add(it) }
     try {
       windows?.forEach { window ->
-        // AccessibilityWindowInfo exposes no visibility flag; a readable root is the only
-        // public signal, so a window that cannot be rooted is skipped.
         val root = try {
           window.root
         } catch (error: Throwable) {
@@ -1041,12 +896,45 @@ class HabitAccessibilityService : AccessibilityService() {
           null
         } ?: return@forEach
         if (rootPackage != pkg) return@forEach
-        browserHostFor(root, pkg)?.let { return it }
+        urlBarTextOf(root, pkg)?.let { text -> if (text !in texts) texts.add(text) }
       }
     } catch (error: Throwable) {
       Log.w(TAG, "browser window list unavailable: ${error.message}")
     }
-    return null
+    return texts
+  }
+
+  /**
+   * True while the browser's own URL / search bar holds the input focus, i.e. the user is
+   * typing an address or a query. Nothing is blocked in that state: the bar holds a
+   * fragment of text ("xhamster" on the way to a search or a domain) rather than a page.
+   */
+  private fun browserUrlBarFocused(pkg: String): Boolean {
+    for (root in browserRoots(pkg)) {
+      for (viewId in urlBarIds(pkg)) {
+        val focused = try {
+          root.findAccessibilityNodeInfosByViewId(viewId)?.any { node -> node.isFocused }
+        } catch (error: Throwable) {
+          null
+        }
+        if (focused == true) return true
+      }
+      // Browsers without a known URL-bar id: any focused text field in the browser's own
+      // chrome is that browser's address / search bar; a field inside a page is in a WebView.
+      val focused = try {
+        root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      val className = try {
+        focused.className?.toString() ?: ""
+      } catch (error: Throwable) {
+        ""
+      }
+      if (!className.lowercase().contains("edittext")) continue
+      if (!insideWebView(focused)) return true
+    }
+    return false
   }
 
   /**
@@ -1084,19 +972,23 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   /** URL-bar host of one browser window root (the active one, or a split/floating one). */
-  private fun browserHostFor(root: AccessibilityNodeInfo?, pkg: String): String? {
+  private fun browserHostFor(root: AccessibilityNodeInfo?, pkg: String): String? =
+    urlBarTextOf(root, pkg)?.let { text -> AdultFilter.hostOf(text) }
+
+  /** Visible text of one browser window's URL bar, or null while it is empty or hidden. */
+  private fun urlBarTextOf(root: AccessibilityNodeInfo?, pkg: String): String? {
     if (root == null) return null
     if (root.packageName?.toString() != pkg) return null
 
     for (viewId in urlBarIds(pkg)) {
-      val host = try {
+      val text = try {
         root.findAccessibilityNodeInfosByViewId(viewId)?.firstNotNullOfOrNull { node ->
-          node.text?.toString()?.let { AdultFilter.hostOf(it) }
+          node.text?.toString()?.takeIf { value -> value.isNotBlank() }
         }
       } catch (error: Throwable) {
         null
       }
-      if (host != null) return host
+      if (text != null) return text
     }
     return null
   }
@@ -1568,65 +1460,32 @@ class HabitAccessibilityService : AccessibilityService() {
     super.onDestroy()
   }
 
-  /** Text currently visible in the active window, used by the block flow. */
-  fun currentPageText(): String {
-    val builder = StringBuilder()
-    val root = try {
-      rootInActiveWindow
-    } catch (error: Throwable) {
-      null
-    } ?: return ""
-    collectText(root, builder, 0, intArrayOf(NODE_BUDGET))
-    return builder.toString()
+  /**
+   * Adult-domain check for the browser page in front.
+   *
+   * Only the URL bar of a page that actually loaded is read, and only while it is neither
+   * focused nor changing. Nothing else is ever matched: not the event text, not the window
+   * title, not the page's own words. Typing "xhamster" into Chrome's bar, finishing
+   * "xhamster.com" before pressing enter, or searching "xhamster 2025 most viewed video"
+   * on google.com therefore never blocks; opening the adult domain itself does.
+   */
+  private fun scanPage(pkg: String, event: AccessibilityEvent) {
+    if (event.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) return
+    if (browserUrlBarFocused(pkg)) return
+    val host = currentNavigatedHost(pkg) ?: return
+    if (!AdultFilter.isAdultHost(host)) return
+    HabitGuard.onBlockedHost(this, host)
   }
 
-  private fun scanPage(service: AccessibilityService, pkg: String, event: AccessibilityEvent) {
-    val builder = StringBuilder()
-    event.text?.forEach { value -> if (!value.isNullOrEmpty()) builder.append(value).append(' ') }
-
-    val root = try {
-      rootInActiveWindow
-    } catch (error: Throwable) {
-      null
-    }
-
-    if (root != null) {
-      try {
-        root.window?.title?.let { title -> if (title.isNotEmpty()) builder.append(title).append(' ') }
-      } catch (error: Throwable) {
-        // window info can disappear mid-traversal
-      }
-
-      for (viewId in urlBarIds(pkg)) {
-        try {
-          root.findAccessibilityNodeInfosByViewId(viewId)?.forEach { node ->
-            node.text?.let { text -> builder.append(text).append(' ') }
-          }
-        } catch (error: Throwable) {
-          // ignore stale nodes
-        }
-      }
-
-      collectText(root, builder, 0, intArrayOf(NODE_BUDGET))
-    }
-
-    HabitGuard.onPageText(this, builder.toString())
-  }
-
-  private fun collectText(
-    node: AccessibilityNodeInfo?,
-    builder: StringBuilder,
-    depth: Int,
-    budget: IntArray
-  ) {
-    if (node == null || depth > MAX_DEPTH || budget[0] <= 0 || builder.length > MAX_TEXT_LENGTH) return
-    budget[0] -= 1
-    node.text?.let { if (it.isNotEmpty()) builder.append(it).append(' ') }
-    node.contentDescription?.let { if (it.isNotEmpty()) builder.append(it).append(' ') }
-    val childCount = node.childCount
-    for (index in 0 until childCount) {
-      collectText(node.getChild(index), builder, depth + 1, budget)
-    }
+  /**
+   * True while the browser in front still shows an adult domain in its URL bar. Used by the
+   * block flow to fall back to Home when Back did not leave the page.
+   */
+  fun stillOnAdultHost(): Boolean {
+    val pkg = foregroundPackage() ?: return false
+    if (!isBrowserPackage(pkg)) return false
+    val host = currentNavigatedHost(pkg) ?: return false
+    return AdultFilter.isAdultHost(host)
   }
 
   private fun urlBarIds(pkg: String): List<String> = when (pkg) {
@@ -1708,28 +1567,20 @@ class HabitAccessibilityService : AccessibilityService() {
     )
 
     /**
-     * Universal private-browsing vocabulary. Every browser names the same concept with one
-     * of these words, so no per-browser sentence list is needed: Incognito (Chrome, Brave,
-     * Opera), InPrivate (Edge), Private tab / window (Firefox, Safari-like), Secret mode
-     * (Samsung Internet), Fire Window (DuckDuckGo), Ghost / Stealth mode and the Chromium
-     * tab-switcher rows all match. Only ever applied to native chrome outside a WebView.
+     * The full sentences an already-open, empty private page renders, lowercased and with
+     * straight apostrophes. Matched only against native chrome outside every WebView, so a
+     * page's own words are never read, while a menu item, a shortcut chip or a button label
+     * ("Incognito" under Chrome's search bar, "New Private tab" in Brave's ⋮ menu) can
+     * never be mistaken for one.
      */
-    private val PRIVATE_MODE_TOKEN = Regex(
-      "(?i)\\b(incognito|inprivate|private\\s*(?:tab|tabs|mode|browsing|window)|" +
-        "secret\\s*mode|fire\\s*window|ghost\\s*mode|stealth\\s*mode|burn\\s*tabs|" +
-        "clear\\s*tabs\\s*and\\s*data|browsing\\s*privately)\\b"
-    )
-
-    /** A whole click label (no source node): a menu row such as "New Incognito tab". */
-    private val PRIVATE_MODE_EXACT = Regex(
-      "(?i)(new|open|turn\\s+on|start|switch\\s+to)\\s+" +
-        "(incognito|inprivate|private|secret|fire|ghost|stealth)" +
-        "(\\s+(tab|tabs|window|mode|browsing))?"
-    )
-
-    /** Native resource ids used by private modes across browsers. */
-    private val PRIVATE_VIEW_ID_TOKEN = Regex(
-      "incognito|private_tab|private_browsing|secret_mode|inprivate|fire_icon|fireiconview"
+    private val PRIVATE_PAGE_SENTENCES = listOf(
+      "you've gone incognito",
+      "now you can browse privately",
+      "brave doesn't remember what you do in a private tab",
+      "this is a private tab",
+      "firefox clears your search and browsing history from private tabs",
+      "you're browsing inprivate",
+      "welcome to secret mode"
     )
 
     /**
@@ -1747,9 +1598,6 @@ class HabitAccessibilityService : AccessibilityService() {
       AccessibilityEvent.TYPE_WINDOWS_CHANGED,
       AccessibilityEvent.TYPE_VIEW_CLICKED
     )
-    private const val MAX_DEPTH = 10
-    private const val NODE_BUDGET = 220
-    private const val MAX_TEXT_LENGTH = 5000
     /** The continuous Settings poll: ten full scans per second while Settings is in front. */
     private const val TAMPER_POLL_MS = 100L
     /** Re-checks after every Settings event; HyperOS animates a fragment for ~250 ms. */

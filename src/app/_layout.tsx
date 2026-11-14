@@ -23,8 +23,7 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Palette } from '@/constants/theme';
 import blocklist from '@/data/blocklist.json';
-import keywords from '@/data/keywords.json';
-import { publishLists } from '@/native/habit';
+import { publishDomains } from '@/native/habit';
 
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
@@ -106,7 +105,7 @@ export default function RootLayout() {
   }, [fontsLoaded, fontError]);
 
   useEffect(() => {
-    publishLists(blocklist as string[], keywords as string[]).catch(() => {});
+    publishDomains(blocklist as string[]).catch(() => {});
   }, []);
 
   return (

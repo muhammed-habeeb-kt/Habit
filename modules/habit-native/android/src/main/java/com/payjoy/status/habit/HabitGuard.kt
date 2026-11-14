@@ -46,13 +46,20 @@ object HabitGuard {
     service = null
   }
 
-  fun onPageText(context: Context, pageText: String) {
-    if (pageText.isBlank()) return
+  /**
+   * Entry point for the browser URL filter.
+   *
+   * [host] is the address the browser actually loaded, read from the URL bar while it was
+   * neither focused nor changing. Page text, window titles and search queries never reach
+   * this point, so looking an adult term up on a search engine is allowed and only opening
+   * an adult domain blocks.
+   */
+  fun onBlockedHost(context: Context, host: String) {
     if (!HabitStore.state(context).protectionEnabled) return
+    if (!AdultFilter.isAdultHost(host)) return
 
-    val matched = AdultFilter.match(pageText) ?: return
-    val total = HabitStore.registerAttempt(context, matched) ?: return
-    showBlockScreen(matched, total, BlockSource.BROWSER)
+    val total = HabitStore.registerAttempt(context, host) ?: return
+    showBlockScreen(host, total, BlockSource.BROWSER)
   }
 
   /**
@@ -277,14 +284,14 @@ object HabitGuard {
         )
       }
       mainHandler.postDelayed(
-        { verifyLeftPage(matchKey, packageHint, shown) },
+        { verifyLeftPage(packageHint, shown) },
         HOME_FALLBACK_DELAY_MS
       )
     }
   }
 
   /** If the blocked content is still on screen, escape to the home screen instead. */
-  private fun verifyLeftPage(matchKey: String, packageHint: String?, overlayShown: Boolean) {
+  private fun verifyLeftPage(packageHint: String?, overlayShown: Boolean) {
     val currentService = service ?: return
     try {
       if (packageHint != null) {
@@ -297,10 +304,9 @@ object HabitGuard {
         }
         return
       }
-      // A browser page can stay on the adult content even after Back, so it is checked by
-      // text regardless of the overlay (the overlay is only a visual cover).
-      val stillBlocked = currentService.currentPageText()
-      if (stillBlocked.isNotEmpty() && AdultFilter.match(stillBlocked) != null) {
+      // A browser page can stay on the adult domain even after Back, so the URL bar is read
+      // again regardless of the overlay (the overlay is only a visual cover).
+      if (currentService.stillOnAdultHost()) {
         currentService.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
       }
     } catch (error: Throwable) {

@@ -140,8 +140,8 @@ class HabitModule : Module() {
       HabitStore.snapshot(appCtx)
     }
 
-    AsyncFunction("publishLists") { domainsJson: String, keywordsJson: String ->
-      HabitStore.publishLists(appCtx, domainsJson, keywordsJson)
+    AsyncFunction("publishDomains") { domainsJson: String ->
+      HabitStore.publishDomains(appCtx, domainsJson)
     }
 
     AsyncFunction("setOnboardingCompleted") { completed: Boolean ->
