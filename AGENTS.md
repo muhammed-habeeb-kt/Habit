@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-14 (Part 26: full-width dock tabs, URL-only browser blocking, two-signal private-tab guard)_
+_Last updated: 2026-11-14 (Part 27: event-driven FLAG_SECURE private-tab probe, full-width dock labels)_
 
 ## Product
 
@@ -385,52 +385,41 @@ end protection. No screenshot, no model, nothing captured or stored.
 ### Incognito / private tab blocker (Part 14)
 
 The one browsing mode the URL filter cannot see: a private tab has no readable URL, so a
-signed-out page would render untouched. Two strict signals close it: a throttled
-`FLAG_SECURE` screenshot probe and the full sentences an already-open empty private page
-renders. Nothing is stored beyond the existing attempt counter, and webpage text is never
-read.
+signed-out page would render untouched. One signal closes it, and it is not text: a private
+tab lives in a `FLAG_SECURE` window, so a `takeScreenshot` probe is refused. Nothing is
+stored beyond the existing attempt counter, and no page text, node label, view id or menu
+item is ever read.
 
 1. **Storage + bridge** — `AiSettings.incognitoBlockingEnabled` (default `true`) is stored
    encrypted under `KEY_AI`. `HabitStore.setIncognitoBlockingEnabled` allows ON in every mode
    and refuses OFF while `isMonitoringLocked` (protection ON in Strict/Aggressive), so JS can
    never lower the lock. It is in `getSnapshot()` under `ai` and as a top-level
    `incognitoBlockingEnabled`, in `src/native/habit.ts` and in `useAiMonitoring`.
-2. **Detection** — `HabitAccessibilityService.scanIncognitoTabs` runs on every event of a
-   watched browser, once from `onServiceConnected`, and from a **continuous 1 s watchdog**
-   that stays armed whenever protection is ON and the switch is on (it parks cheaply when
-   no browser is in front instead of stopping, so a browser that returns without an event
-   is still covered). The browser in front is resolved from the focused window and the
-   latest browser event, so a private window that refuses its accessibility root is still
-   probed. Only native browser chrome is inspected; **recursion stops dead at every WebView /
-   GeckoView node while its native siblings are still walked**, so page text, search
-   results and commit titles are never read, and only visible nodes are visited:
-   - **Signal 1, `FLAG_SECURE` screenshot probe** (`probeSecureBrowserWindow`): Chromium
-     browsers mark an Incognito / Private tab secure, so `takeScreenshot` (API 30+) is
-     refused. Two refusals mean secure content and block the tab: 6
-     (`ERROR_TAKE_SCREENSHOT_SECURE_WINDOW`, API 34+) and 2
-     (`ERROR_TAKE_SCREENSHOT_NO_ACCESSIBILITY_ACCESS`, which HyperOS / MIUI and other
-     vendor builds return for a secure window). A frame whose central half is more than 98%
-     pure black (`R`, `G`, `B` all under 4, sampled every 4 px) blocks as well. Probes run
-     on every watchdog tick (at most once per 1 s) and immediately on window-state /
-     windows-changed / click events. No frame is stored; the bitmap and hardware buffer are
-     closed immediately. A normal New Tab Page and an open ⋮ menu are never secure, so
-     neither can block;
-   - **Signal 2, full private-page sentences** (`privatePageSentenceFound`): only the long
-     sentences an already-open empty private page renders — `you've gone incognito`,
-     `now you can browse privately`, `brave doesn't remember what you do in a private
-     tab`, `this is a private tab`, `firefox clears your search and browsing history from
-     private tabs`, `you're browsing inprivate` and `welcome to secret mode` — matched
-     against a visible node's text / contentDescription outside every WebView. There is
-     deliberately no menu-item, view-id, button-label or short-token matching and no broad
-     substring (`incognito`, `private tab`, `secret mode`, …) anywhere: Chrome's
-     `Incognito` shortcut chip on its home page and Brave's `New Private tab` menu row are
-     normal browsing and must never block. An invisible intermediate container never
-     contributes a label but is still descended into, because HyperOS reports containers as
-     invisible while their children are what the user sees.
-3. **Block** — `HabitGuard.onIncognitoDetected` (1.5 s cooldown) records one attempt, then
+2. **Detection — event-driven, zero polling** — `HabitAccessibilityService.handlePrivateTabEvent`
+   only reacts to two browser events: a `TYPE_WINDOW_STATE_CHANGED` (one probe immediately)
+   and a `TYPE_VIEW_CLICKED` on browser chrome outside every WebView (one probe 450 ms
+   later, so the tab it opened finishes rendering). Reading or scrolling a normal page
+   sends no probe at all. `probeSecureBrowserWindow` sends a single `takeScreenshot` and
+   stops: `onSuccess` closes the hardware buffer in `finally` and waits for the next event;
+   the only failure that blocks is `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW` (Android 14+, 6)
+   or its vendor equivalent (HyperOS / MIUI return the same refusal as 2). There is no
+   bitmap, no pixel analysis and no node walk.
+3. **Rate-limit-safe queuing** — Android allows one screenshot per second. An event inside
+   that window is not dropped: the probe is queued on the `incognitoHandler` for
+   `lastScreenshotAt + 1150 ms`, so a fast ⋮ → “New Private tab” tap is never missed. An
+   `ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT` (3) failure also retries once, 1100 ms later.
+   A newer request replaces an older queued one, so a burst of events cannot pile probes up.
+   After a block, one follow-up probe 1200 ms later confirms the user really left private
+   mode.
+4. **Browser scope** — every installed browser comes from `PackageManager` (cached,
+   refreshed on package changes, `<queries>` intent declared). Firefox Focus and Tor
+   Browser have no normal mode, so entering them blocks. A probe only runs while the browser
+   is still the app in front (the event latch covers a secure window that refuses its
+   root), so another app's `FLAG_SECURE` window can never be judged as Habit's.
+5. **Block** — `HabitGuard.onIncognitoDetected` (1.5 s cooldown) records one attempt, then
    fires BACK + HOME and shows `BlockOverlay` with `• INCOGNITO BLOCKED` and “Incognito &
    private tabs are blocked by Habit.”
-4. **UI** — the AI tab’s Browser box starts with a raised 24 dp `NeuCard` (44 dp amber
+6. **UI** — the AI tab’s Browser box starts with a raised 24 dp `NeuCard` (44 dp amber
    eye-off tile, switch) whose OFF tap routes to `/unlock` when locked. `/apps?tab=browser`
    is applied on focus and cleared, so the link works every time. Settings now opens with an
    **AI** section (sensitivity, AI Visual Protection counts) and a **BROWSER** section
@@ -512,10 +501,10 @@ longer trusts `rootInActiveWindow` alone.
   with one or two tiles) and Habit's own monotonic clock: no wall-clock timer, no RTC alarm,
   boot-session-aware remaining values and a monotonic 24-hour day counter.
 - [x] Part 14 — Incognito / private tab blocker: `incognitoBlockingEnabled` in encrypted
-  storage with a native Strict/Aggressive lock on turning it off, click and window-text
-  detection for Incognito / Private / Secret / InPrivate tabs in every watched browser
-  (node reads only), BACK + HOME plus a `• INCOGNITO BLOCKED` block screen, the AI tab’s
-  incognito card, `?tab=browser` routing, and the new AI / BROWSER sections on Settings.
+  storage with a native Strict/Aggressive lock on turning it off, private-tab detection in
+  every watched browser (now the `FLAG_SECURE` refusal only, Part 27), BACK + HOME plus a
+  `• INCOGNITO BLOCKED` block screen, the AI tab’s incognito card, `?tab=browser` routing,
+  and the new AI / BROWSER sections on Settings.
 - [x] Part 16 — Clean streak counter: `StreakState` in encrypted storage (`currentMs`,
   `bestMs`, monotonic anchor + boot session), accrued by `HabitUnlock.tick` only while
   protection is ON with no OFF window, reset by every counted block and by protection
@@ -605,6 +594,17 @@ longer trusts `rootInActiveWindow` alone.
   detection is two strict signals only — the `FLAG_SECURE` refusal and the full empty
   private-page sentences — with every click/menu-label/view-id/short-token check deleted, so
   Chrome's `Incognito` home chip and Brave's `New Private tab` menu row never block.
+- [x] Part 27 — The private-tab guard is now pure event-driven `FLAG_SECURE`: every text,
+  node, view-id and empty-page-sentence check is deleted, so only the screenshot refusal
+  (error 6, or error 2 on HyperOS / MIUI) can block. One probe is sent on a browser
+  `TYPE_WINDOW_STATE_CHANGED` and one 450 ms after a `TYPE_VIEW_CLICKED` on chrome outside
+  a WebView; the continuous 1 s watchdog and the pure-black bitmap analysis are gone, so a
+  normal page costs no probes while it is read or scrolled. A probe that lands inside
+  Android's 1 s screenshot limit is queued for `lastScreenshotAt + 1150 ms` (and an error 3
+  retries once), so a fast ⋮ → “New Private tab” tap is never missed; a follow-up probe
+  1200 ms after a block confirms the user left private mode. The dock gives every tab a
+  zero-basis `flexGrow` third, a stretched pill, a 15 dp icon and a 10.5 pt label, so
+  `Home`, `AI` and `Settings` always render in full.
 
 ## Build & run (Termux, no PC)
 
@@ -694,6 +694,11 @@ need to be toggled off and on.
 Part 26 changes Kotlin, the native bridge (`publishLists` became `publishDomains`) and the
 floating tab bar, so the development APK must be rebuilt. The manifest and the accessibility
 XML are unchanged, so the service does not need to be toggled off and on.
+
+Part 27 changes Kotlin only (the event-driven `FLAG_SECURE` probe) plus the dock layout, so
+the development APK must be rebuilt. The accessibility XML already declares
+`typeViewClicked` and `canTakeScreenshot`, and the manifest is unchanged, so the service
+does not need to be toggled off and on.
 
 Part 25 changes Kotlin, the Expo config plugin (a browser `VIEW` intent in `<queries>`) and
 the Aggressive UI, so the development APK must be rebuilt. The accessibility XML is
