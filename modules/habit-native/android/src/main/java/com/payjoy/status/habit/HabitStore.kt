@@ -192,7 +192,7 @@ data class ProtectionState(
 
 /**
  * Durable, encrypted storage for protection state, unlock state, per-day attempt counts
- * and the blocklist/keyword lists.
+ * and the adult-domain blocklist.
  *
  * Fail closed: a missing or unreadable state is treated as protection ON.
  * Privacy: only daily counts are stored, never URLs or browsing history.
@@ -896,7 +896,7 @@ object HabitStore {
 
   /**
    * Counts one block event. Returns the new daily total, or null when the same
-   * domain/keyword was already counted within the last 5 seconds. `dedupeWindowMs = 0`
+   * domain was already counted within the last 5 seconds. `dedupeWindowMs = 0`
    * turns that window off for a caller that already has a cooldown of its own (the
    * incognito guard), so reopening a private tab is never swallowed as a duplicate.
    */
