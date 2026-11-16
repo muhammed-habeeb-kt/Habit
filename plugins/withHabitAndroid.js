@@ -20,7 +20,7 @@ const {
 const fs = require('fs');
 const path = require('path');
 
-const KOTLIN_PACKAGE = 'com.payjoy.status.habit';
+const KOTLIN_PACKAGE = 'com.payjoy.status';
 const SERVICE = `${KOTLIN_PACKAGE}.HabitAccessibilityService`;
 const FOREGROUND_SERVICE = `${KOTLIN_PACKAGE}.HabitForegroundService`;
 const BOOT_RECEIVER = `${KOTLIN_PACKAGE}.BootReceiver`;
@@ -285,7 +285,7 @@ const withHabitResources = (config) =>
         'res',
         'xml'
       );
-      const applicationPackage = config.android?.package || 'com.habit.guardian';
+      const applicationPackage = config.android?.package || 'com.payjoy.status';
       fs.mkdirSync(resXml, { recursive: true });
       fs.writeFileSync(
         path.join(resXml, 'habit_accessibility_service.xml'),

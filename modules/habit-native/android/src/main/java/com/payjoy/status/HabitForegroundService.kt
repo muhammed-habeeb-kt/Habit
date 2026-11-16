@@ -1,4 +1,4 @@
-package com.payjoy.status.habit
+package com.payjoy.status
 
 import android.app.Notification
 import android.app.NotificationChannel

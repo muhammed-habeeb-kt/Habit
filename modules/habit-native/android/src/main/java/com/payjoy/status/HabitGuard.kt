@@ -1,4 +1,4 @@
-package com.payjoy.status.habit
+package com.payjoy.status
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context

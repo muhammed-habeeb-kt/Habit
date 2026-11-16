@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-16 (Part 28: screenshot-free layered private-tab guard)_
+_Last updated: 2026-11-16 (Part 29: one `com.payjoy.status` id for app, namespace and module)_
 
 ## Product
 
@@ -43,7 +43,7 @@ Raising protection is always instant; lowering it in Strict/Aggressive needs an 
 
 | Piece | Where |
 | --- | --- |
-| Kotlin module (autolinked local Expo module) | `modules/habit-native/android/src/main/java/com/payjoy/status/habit/` |
+| Kotlin module (autolinked local Expo module) | `modules/habit-native/android/src/main/java/com/payjoy/status/` |
 | Android manifest, permissions, accessibility XML | `plugins/withHabitAndroid.js` (Expo config plugin) |
 | Theme (all colors / type / spacing) | `src/constants/theme.ts` |
 | Native bridge for JS | `src/native/habit.ts` |
@@ -562,7 +562,7 @@ longer trusts `rootInActiveWindow` alone.
 - [x] Part 21 also removed the last dead UI files (`protection-toggle.tsx`,
   `use-theme.ts`) and confirmed the single-Kotlin-package layout: `expo prebuild --clean`
   generates exactly one service / receiver entry per class, all under
-  `com.payjoy.status.habit`, and never copies `design-screens/` or `scripts/` into the APK.
+  `com.payjoy.status`, and never copies `design-screens/` or `scripts/` into the APK.
 - [x] Part 22 — Incognito blocking actually runs while the user browses: a continuous
   browser watchdog (node walk ~1 s, `FLAG_SECURE` probe ~1.2 s) keeps the
   guard alive when Chrome swaps tabs inside the same activity without an event; every
@@ -632,6 +632,14 @@ longer trusts `rootInActiveWindow` alone.
   browser chrome for labels / view ids / selected tab-model nodes that only exist in
   private mode, and the always-private browsers. Nothing polls, nothing is captured, and a
   page's own words are never read.
+- [x] Part 29 — One Android package everywhere: `app.json` now installs the app as
+  `com.payjoy.status`, the 19 Kotlin files moved from `java/com/payjoy/status/habit/` to
+  `java/com/payjoy/status/` (nothing was copied, and the old `habit` directory is gone), and
+  the package declaration, `build.gradle` `namespace` / `group`, `expo-module.config.json`,
+  the config plugin's `KOTLIN_PACKAGE` and the alarm action strings all use
+  `com.payjoy.status`. The tamper shield and the transient-overlay check no longer hard-code
+  any app id: they compare against the running `packageName`. No `com.habit.guardian`
+  reference exists anywhere in the tree.
 
 ## Build & run (Termux, no PC)
 
@@ -720,7 +728,15 @@ need to be toggled off and on.
 
 Part 26 changes Kotlin, the native bridge (`publishLists` became `publishDomains`) and the
 floating tab bar, so the development APK must be rebuilt. The manifest and the accessibility
-XML are unchanged, so the service does not need to be toggled off and on.Part 28 changes Kotlin only (the layered, screenshot-free private-tab guard), so the
+XML are unchanged, so the service does not need to be toggled off and on.Part 29 changes the application id, the Kotlin namespace and the config plugin, so the
+  development APK must be rebuilt **and installed fresh**: Android treats
+  `com.payjoy.status` as a different app from `com.habit.guardian`. Uninstall the old Habit
+  first (it keeps its own accessibility grant and protected state otherwise), then grant
+  accessibility, notifications and — for Aggressive — device admin again. The encrypted
+  state belongs to the old id, so protection starts from a clean install. The accessibility
+  XML is unchanged; a fresh install reconnects the service anyway.
+
+Part 28 changes Kotlin only (the layered, screenshot-free private-tab guard), so the
   development APK must be rebuilt. The accessibility XML is unchanged — `typeViewClicked`
   and `canTakeScreenshot` are still declared for the shield and the AI scanner — so the
   service does not need to be toggled off and on.
@@ -843,12 +859,13 @@ snapshot loading state during static rendering, which is expected).
 
 ## Device notes
 
-- App name `Habit`; installed application id `com.habit.guardian` (`app.json`).
+- App name `Habit`; installed application id `com.payjoy.status` (`app.json`).
 - **One Kotlin package only:** every native file lives in
-  `modules/habit-native/android/src/main/java/com/payjoy/status/habit/` and
-  `expo-module.config.json` registers `com.payjoy.status.habit.HabitModule`. There is no
-  `java/com/habit/guardian/` package; `com.habit.guardian` is the Android application id
-  (and the legacy app id the tamper shield recognises), never a duplicate source tree.
+  `modules/habit-native/android/src/main/java/com/payjoy/status/` and
+  `expo-module.config.json` registers `com.payjoy.status.HabitModule`; `build.gradle` uses
+  the same `com.payjoy.status` namespace. There is no `java/com/habit/` source tree and no
+  `com.habit.guardian` reference anywhere — the namespace, the module id and the application
+  id are one and the same.
 - Test device is a Redmi (HyperOS): needs autostart + "no battery restrictions", and
   "Allow restricted settings" for the sideloaded APK on Android 13+.
 - Exact alarms: if the countdown notification is late, allow "Alarms & reminders" for Habit.

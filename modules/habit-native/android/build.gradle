@@ -3,11 +3,11 @@ plugins {
   id 'expo-module-gradle-plugin'
 }
 
-group = 'com.payjoy.status.habit'
+group = 'com.payjoy.status'
 version = '1.0.0'
 
 android {
-  namespace "com.payjoy.status.habit"
+  namespace "com.payjoy.status"
 
   defaultConfig {
     versionCode 1

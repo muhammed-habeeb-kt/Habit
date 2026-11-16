@@ -1,4 +1,4 @@
-package com.payjoy.status.habit
+package com.payjoy.status
 
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment

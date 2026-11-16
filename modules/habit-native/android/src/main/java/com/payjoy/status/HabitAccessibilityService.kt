@@ -1,4 +1,4 @@
-package com.payjoy.status.habit
+package com.payjoy.status
 
 import android.accessibilityservice.AccessibilityService
 import android.content.BroadcastReceiver
@@ -843,7 +843,6 @@ class HabitAccessibilityService : AccessibilityService() {
   private fun isTransientOverlay(pkg: String): Boolean =
     pkg == packageName ||
       pkg == SYSTEM_UI_PACKAGE ||
-      pkg in HABIT_PACKAGES ||
       pkg in TRANSIENT_OVERLAY_PACKAGES ||
       pkg.contains("inputmethod", ignoreCase = true) ||
       pkg.contains("keyboard", ignoreCase = true) ||
@@ -1090,10 +1089,9 @@ class HabitAccessibilityService : AccessibilityService() {
       // front does not always repeat the app name, while the App info page behind it does.
       // The flag is kept for a short moment so a dialog that fully covers the page still
       // counts as Habit's, but it can never leak into another app's settings.
+      val ownPackage = packageName
       val mentionsHabit = texts.any { text ->
-        text.contains("habit") ||
-          text.contains("com.payjoy.status") ||
-          text.contains("com.habit.guardian")
+        text.contains("habit") || text.contains(ownPackage)
       }
       val now = SystemClock.elapsedRealtime()
       if (mentionsHabit) {
@@ -1431,12 +1429,6 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val PRIVATE_CHILD_LIMIT = 200
     /** Whitespace collapsed by [normalizeLabel]. */
     private val WHITESPACE = Regex("\\s+")
-
-    /** Habit's current package and the legacy package the shield already recognises. */
-    private val HABIT_PACKAGES = setOf(
-      "com.payjoy.status",
-      "com.habit.guardian"
-    )
 
     /**
      * Overlay packages that are never treated as a different foreground app: the system UI

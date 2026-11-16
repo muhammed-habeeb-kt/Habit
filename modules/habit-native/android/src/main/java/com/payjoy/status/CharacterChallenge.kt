@@ -1,4 +1,4 @@
-package com.payjoy.status.habit
+package com.payjoy.status
 
 import java.security.SecureRandom
 import java.util.UUID

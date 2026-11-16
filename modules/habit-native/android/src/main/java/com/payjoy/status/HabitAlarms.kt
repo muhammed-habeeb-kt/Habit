@@ -1,4 +1,4 @@
-package com.payjoy.status.habit
+package com.payjoy.status
 
 import android.app.AlarmManager
 import android.app.PendingIntent
@@ -15,10 +15,10 @@ import android.util.Log
 object HabitAlarms {
   private const val TAG = "HabitAlarms"
   private const val UNLOCK_REQUEST_CODE = 4400
-  private const val ACTION_UNLOCK_TICK = "com.payjoy.status.habit.ACTION_UNLOCK_TICK"
+  private const val ACTION_UNLOCK_TICK = "com.payjoy.status.ACTION_UNLOCK_TICK"
 
   private const val WATCHDOG_REQUEST_CODE = 4500
-  const val ACTION_WATCHDOG = "com.payjoy.status.habit.ACTION_WATCHDOG"
+  const val ACTION_WATCHDOG = "com.payjoy.status.ACTION_WATCHDOG"
 
   fun schedule(context: Context, delayMs: Long) {
     scheduleInternal(context, delayMs, ACTION_UNLOCK_TICK, UNLOCK_REQUEST_CODE)
