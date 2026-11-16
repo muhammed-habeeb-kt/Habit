@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-14 (Part 27: event-driven FLAG_SECURE private-tab probe, full-width dock labels)_
+_Last updated: 2026-11-16 (Part 28: screenshot-free layered private-tab guard)_
 
 ## Product
 
@@ -382,40 +382,51 @@ end protection. No screenshot, no model, nothing captured or stored.
 8. **Event type** — the accessibility XML declares `typeViewClicked` (Part 12). After
    installing an APK with that change the service must be switched off and on once.
 
-### Incognito / private tab blocker (Part 14)
+### Incognito / private tab blocker (Part 14, rewritten in Part 28)
 
 The one browsing mode the URL filter cannot see: a private tab has no readable URL, so a
-signed-out page would render untouched. One signal closes it, and it is not text: a private
-tab lives in a `FLAG_SECURE` window, so a `takeScreenshot` probe is refused. Nothing is
-stored beyond the existing attempt counter, and no page text, node label, view id or menu
-item is ever read.
+signed-out page would render untouched. Detection now reads the accessibility node tree
+only — no screenshot, no pixel check, no polling — in three layers, so a normal session is
+never touched: an open `⋮` menu, Chrome’s home “Incognito” chip while it is merely visible,
+a normal home page and a page that happens to contain the word all do nothing. Nothing is
+stored beyond the existing attempt counter, and text inside a WebView is never read.
 
 1. **Storage + bridge** — `AiSettings.incognitoBlockingEnabled` (default `true`) is stored
    encrypted under `KEY_AI`. `HabitStore.setIncognitoBlockingEnabled` allows ON in every mode
    and refuses OFF while `isMonitoringLocked` (protection ON in Strict/Aggressive), so JS can
    never lower the lock. It is in `getSnapshot()` under `ai` and as a top-level
    `incognitoBlockingEnabled`, in `src/native/habit.ts` and in `useAiMonitoring`.
-2. **Detection — event-driven, zero polling** — `HabitAccessibilityService.handlePrivateTabEvent`
-   only reacts to two browser events: a `TYPE_WINDOW_STATE_CHANGED` (one probe immediately)
-   and a `TYPE_VIEW_CLICKED` on browser chrome outside every WebView (one probe 450 ms
-   later, so the tab it opened finishes rendering). Reading or scrolling a normal page
-   sends no probe at all. `probeSecureBrowserWindow` sends a single `takeScreenshot` and
-   stops: `onSuccess` closes the hardware buffer in `finally` and waits for the next event;
-   the only failure that blocks is `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW` (Android 14+, 6)
-   or its vendor equivalent (HyperOS / MIUI return the same refusal as 2). There is no
-   bitmap, no pixel analysis and no node walk.
-3. **Rate-limit-safe queuing** — Android allows one screenshot per second. An event inside
-   that window is not dropped: the probe is queued on the `incognitoHandler` for
-   `lastScreenshotAt + 1150 ms`, so a fast ⋮ → “New Private tab” tap is never missed. An
-   `ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT` (3) failure also retries once, 1100 ms later.
-   A newer request replaces an older queued one, so a burst of events cannot pile probes up.
-   After a block, one follow-up probe 1200 ms later confirms the user really left private
-   mode.
-4. **Browser scope** — every installed browser comes from `PackageManager` (cached,
+2. **Layer 1 — a tap that opens private mode** — `HabitAccessibilityService.handlePrivateModeClick`
+   runs on `TYPE_VIEW_CLICKED` in a browser. It always reads `event.text` and
+   `event.contentDescription` first, because Chrome / Brave deliver a click from a row
+   inside their `⋮` popup menu with `event.source == null`; a source node, when present,
+   only proves the tap was browser chrome (a tap inside a WebView returns immediately) and
+   adds its own text, contentDescription and up to 24 direct children. Labels are
+   normalized (lowercase, collapsed whitespace, trailing `…` / `.` / `›` removed) and
+   exact-matched against `PRIVATE_ACTION_LABELS`: `new incognito tab`, `new private tab`,
+   `new secret tab`, `new inprivate tab`, `open in incognito tab`, `open in private tab`,
+   `turn on secret mode`, `start incognito`, `new fire window`, `incognito`,
+   `incognito tabs`, `private`, `private tabs`. A match blocks on the spot, so the private
+   tab never opens; the bare words are safe here precisely because a menu that is merely
+   open produces no click.
+3. **Layer 2 — private mode already on screen** — `scanPrivateModeWindows` walks every
+   browser window root plus `rootInActiveWindow` once on `TYPE_WINDOW_STATE_CHANGED`,
+   `TYPE_WINDOWS_CHANGED` and after a chrome click, with a 2 000-node / depth-60 /
+   200-children runaway guard. It stops at every WebView / GeckoView (page text is never
+   read) and only reads `isVisibleToUser` nodes. Three signals: `PRIVATE_STATE_LABELS`
+   (`close all incognito tabs`, `close all private tabs`, `turn off secret mode`,
+   `private browsing`, `inprivate tabs`, `you’ve gone incognito` / `you've gone incognito`,
+   `now you can browse privately`, `this is a private tab`, Brave’s “doesn’t remember what
+   you do in a private tab” in both apostrophes, `welcome to secret mode`,
+   `you're browsing inprivate`); `PRIVATE_VIEW_IDS` (`:id/incognito_ntp`,
+   `:id/incognito_ntp_content`, `:id/incognito_badge`, `:id/location_bar_incognito_badge`,
+   `:id/secret_mode_badge`); and a tab-model selector (`:id/incognito_toggle_button`, or a
+   contentDescription exactly `incognito tabs` / `private tabs`) counted only while
+   `isSelected` or `isChecked`, so a visible but inactive switcher button is not a hit. The
+   bare words `incognito` and `private` are deliberately absent from this list.
+4. **Layer 3, browser scope** — every installed browser comes from `PackageManager` (cached,
    refreshed on package changes, `<queries>` intent declared). Firefox Focus and Tor
-   Browser have no normal mode, so entering them blocks. A probe only runs while the browser
-   is still the app in front (the event latch covers a secure window that refuses its
-   root), so another app's `FLAG_SECURE` window can never be judged as Habit's.
+   Browser have no normal mode, so entering them blocks immediately.
 5. **Block** — `HabitGuard.onIncognitoDetected` (1.5 s cooldown) records one attempt, then
    fires BACK + HOME and shows `BlockOverlay` with `• INCOGNITO BLOCKED` and “Incognito &
    private tabs are blocked by Habit.”
@@ -425,6 +436,13 @@ item is ever read.
    **AI** section (sensitivity, AI Visual Protection counts) and a **BROWSER** section
    (incognito switch, watched-site count plus the amber “Add Site →” that opens
    `?tab=browser`, and Protected Browsers opening `/browsers`).
+7. **Honest limit** — a Chrome private page carries no unique chrome label once its tab is
+   open, so the guard prevents entry instead of policing a session that already existed
+   before the service connected (a restored private session, a browser quick action).
+   Browsers that label their private chrome (Firefox, Samsung, Edge, Brave’s switcher) are
+   still caught by Layer 2. The one accepted false-positive ceiling is a *normal* tab whose
+   title is exactly “Private browsing” shown in the tab switcher; it can never fire while
+   the user is browsing a page.
 
 ### Split-screen & floating windows (Part 15)
 
@@ -502,7 +520,7 @@ longer trusts `rootInActiveWindow` alone.
   boot-session-aware remaining values and a monotonic 24-hour day counter.
 - [x] Part 14 — Incognito / private tab blocker: `incognitoBlockingEnabled` in encrypted
   storage with a native Strict/Aggressive lock on turning it off, private-tab detection in
-  every watched browser (now the `FLAG_SECURE` refusal only, Part 27), BACK + HOME plus a
+  every watched browser (rewritten without screenshots in Part 28), BACK + HOME plus a
   `• INCOGNITO BLOCKED` block screen, the AI tab’s incognito card, `?tab=browser` routing,
   and the new AI / BROWSER sections on Settings.
 - [x] Part 16 — Clean streak counter: `StreakState` in encrypted storage (`currentMs`,
@@ -605,6 +623,15 @@ longer trusts `rootInActiveWindow` alone.
   1200 ms after a block confirms the user left private mode. The dock gives every tab a
   zero-basis `flexGrow` third, a stretched pill, a 15 dp icon and a 10.5 pt label, so
   `Home`, `AI` and `Settings` always render in full.
+- [x] Part 28 — Screenshot-free private-tab guard: the `FLAG_SECURE` probe, its handler,
+  its constants and every screenshot call are deleted from `HabitAccessibilityService` after
+  the probe proved unreliable on HyperOS (no refusal on a real private tab, error 2 shared
+  with a missing capability). Detection is now three node-tree layers — a normalized tap on
+  a private-mode entry point (reading `event.text` / `contentDescription` even when
+  `event.source` is null, which is what a `⋮` popup row delivers), one capped walk of
+  browser chrome for labels / view ids / selected tab-model nodes that only exist in
+  private mode, and the always-private browsers. Nothing polls, nothing is captured, and a
+  page's own words are never read.
 
 ## Build & run (Termux, no PC)
 
@@ -693,10 +720,13 @@ need to be toggled off and on.
 
 Part 26 changes Kotlin, the native bridge (`publishLists` became `publishDomains`) and the
 floating tab bar, so the development APK must be rebuilt. The manifest and the accessibility
-XML are unchanged, so the service does not need to be toggled off and on.
+XML are unchanged, so the service does not need to be toggled off and on.Part 28 changes Kotlin only (the layered, screenshot-free private-tab guard), so the
+  development APK must be rebuilt. The accessibility XML is unchanged — `typeViewClicked`
+  and `canTakeScreenshot` are still declared for the shield and the AI scanner — so the
+  service does not need to be toggled off and on.
 
 Part 27 changes Kotlin only (the event-driven `FLAG_SECURE` probe) plus the dock layout, so
-the development APK must be rebuilt. The accessibility XML already declares
+  the development APK must be rebuilt. The accessibility XML already declares
 `typeViewClicked` and `canTakeScreenshot`, and the manifest is unchanged, so the service
 does not need to be toggled off and on.
 

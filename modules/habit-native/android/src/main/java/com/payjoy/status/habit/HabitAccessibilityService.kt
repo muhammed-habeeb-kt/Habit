@@ -12,11 +12,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
-import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -26,18 +24,11 @@ import androidx.core.content.ContextCompat
  * Watches browser windows and blocks adult pages.
  *
  * Only the URL bar of a page that actually loaded is read for the adult filter, and a
- * private tab is caught from the FLAG_SECURE refusal of a screenshot probe. Nothing is
- * stored except a per-day counter.
+ * private tab is caught from browser chrome labels and native view ids — never from a
+ * screenshot. Nothing is stored except a per-day counter.
  */
 class HabitAccessibilityService : AccessibilityService() {
   private var lastScanAt = 0L
-  /**
-   * When the last `takeScreenshot` was sent. Android refuses a second call within 1000 ms,
-   * so a private-tab probe queues against this instead of being dropped.
-   */
-  private var lastScreenshotAt = 0L
-  /** Identifies the newest queued probe, so an older one can never run after it. */
-  private var probeGeneration = 0
   /**
    * Every browser installed on the phone, discovered through PackageManager instead of a
    * hardcoded list, so Brave, DuckDuckGo, Vivaldi, Kiwi, UC, Tor and anything else that
@@ -46,13 +37,6 @@ class HabitAccessibilityService : AccessibilityService() {
    */
   @Volatile private var discoveredBrowsers: Set<String> = emptySet()
   private var browserPackageReceiver: BroadcastReceiver? = null
-  /**
-   * Probes for private tabs. They are one-shot and event driven: a browser window change
-   * asks for one immediately and a tap on browser chrome asks for one 450 ms later, so the
-   * tab that was just opened has time to render. Nothing runs while the user reads or
-   * scrolls a normal page.
-   */
-  private val incognitoHandler = Handler(Looper.getMainLooper())
   /**
    * The browser the user was last seen in. A private window is FLAG_SECURE and can refuse
    * its accessibility root, so `service.windows` / `rootInActiveWindow` may both look empty
@@ -106,7 +90,7 @@ class HabitAccessibilityService : AccessibilityService() {
       // gets no event at all, so the watch is armed from the window in front.
       if (foregroundPackage()?.let { isSettingsPackage(it) } == true) armTamperWatch()
       // Same idea for private tabs: a browser that was already showing a private page when
-      // the service connected emits no fresh event, so it is probed once here.
+      // the service connected emits no fresh event, so its chrome is inspected once here.
       refreshBrowserPackages()
       registerBrowserPackageReceiver()
       noteBrowserFront(foregroundPackage() ?: "")
@@ -150,10 +134,9 @@ class HabitAccessibilityService : AccessibilityService() {
     }
 
     // Incognito / Private / Secret / InPrivate tabs have no readable URL and must never
-    // render at all, so this runs before the URL scan and blocks as soon as the tab is
-    // really open. The only signal is the FLAG_SECURE refusal of one screenshot probe:
-    // no text, node label, view id or menu item is read, so a normal home page or an open
-    // ⋮ menu can never trigger a block.
+    // render at all, so this runs before the URL scan. A tap that opens private mode and
+    // browser chrome that only exists inside one are the two signals: an open ⋮ menu, a
+    // normal home page and a page that merely contains the word are never matched.
     if (isBrowserPackage(pkg) && handlePrivateTabEvent(safeEvent, pkg)) return
 
     // A scroll, a typed word or an app switch means a new frame can be in view, so the
@@ -309,38 +292,26 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   /**
-   * Private-tab guard: a private / Incognito tab renders inside a FLAG_SECURE window, so
-   * `takeScreenshot` refuses the frame with the secure-window error.
+   * Incognito / private-tab guard, three layers, all read from the accessibility node tree.
    *
-   * That refusal is the ONLY signal. No text, node label, view id or menu item is ever
-   * read, so Chrome's home "Incognito" chip, Brave's "New Private tab" menu row and a page
-   * that merely mentions the word can never block a normal browsing session.
+   * Layer 1 — a real tap on a private-mode entry point in browser chrome (`⋮` ->
+   * "New Incognito tab", Brave's "New private tab", Samsung's secret-mode toggle, the
+   * Incognito chip on Chrome's home screen). The `⋮` menu merely being open is not a tap on
+   * a row, and a page is never inspected for labels, so normal browsing is untouched.
    *
-   * Probes are one-shot and event driven: a browser window change asks for one immediately
-   * and a tap on browser chrome (never inside the page's WebView) asks for one 450 ms
-   * later, so the tab that was just opened has time to render. Nothing runs while the user
-   * reads or scrolls.
+   * Layer 2 — browser chrome that only exists while private mode is already on: the native
+   * empty private-tab sentences, "close all incognito tabs", "turn off secret mode", and
+   * the native private view ids / selected private tab-model node.
+   *
+   * Layer 3 — browsers with no normal mode at all (Firefox Focus, Tor Browser).
+   *
+   * No screenshot, no pixel check and no polling: everything below runs from events Android
+   * already delivers to this service.
    *
    * This matters because a signed-out private tab shows no URL to the adult filter: the
    * normal page scan sees an empty toolbar and lets it through.
    */
   private fun handlePrivateTabEvent(event: AccessibilityEvent, pkg: String): Boolean {
-    // Scrolling and page changes are not browser chrome: they cost no probe at all.
-    val clicked = event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
-    if (!clicked && event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-      return false
-    }
-    if (clicked) {
-      // A tap inside the page is not browser chrome, and a page can never open a private
-      // tab by itself. Only the menu / tab-strip control the user tapped is inspected.
-      val source = try {
-        event.source
-      } catch (error: Throwable) {
-        null
-      } ?: return false
-      if (insideWebView(source)) return false
-    }
-
     if (!incognitoGuardNeeded()) return false
 
     // Firefox Focus and Tor Browser have no normal mode: every screen in them is private.
@@ -349,47 +320,235 @@ class HabitAccessibilityService : AccessibilityService() {
       return true
     }
 
-    scheduleSecureProbe(
-      pkg,
-      if (clicked) PROBE_AFTER_CLICK_MS else 0L,
-      allowRetry = true
-    )
+    return when (event.eventType) {
+      AccessibilityEvent.TYPE_VIEW_CLICKED ->
+        handlePrivateModeClick(event, pkg) || scanPrivateModeWindows(pkg)
+      AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+      AccessibilityEvent.TYPE_WINDOWS_CHANGED -> scanPrivateModeWindows(pkg)
+      else -> false
+    }
+  }
+
+  /**
+   * Layer 1: did this tap ask for private mode?
+   *
+   * Chrome and Brave show their toolbar menu in a popup window, and the click that arrives
+   * from a row inside it frequently carries no source node at all, so the event's own text
+   * and contentDescription are always read first. A source node, when there is one, only
+   * proves the tap was browser chrome: a tap inside the page (a link, a form, a video) is
+   * never inspected for labels.
+   */
+  private fun handlePrivateModeClick(event: AccessibilityEvent, pkg: String): Boolean {
+    val source = try {
+      event.source
+    } catch (error: Throwable) {
+      null
+    }
+    // A tap inside the page can never open a private tab.
+    if (source != null && insideWebView(source)) return false
+
+    val labels = ArrayList<CharSequence>(8)
+    collectEventLabels(event, labels)
+    source?.let { collectNodeLabels(it, labels) }
+
+    for (label in labels) {
+      if (matchesPrivateActionLabel(label)) {
+        Log.i(TAG, "Private-mode tap in $pkg")
+        blockPrivateTab()
+        return true
+      }
+    }
     return false
   }
 
-  /** One probe for the browser already in front (service connect / switch turned on). */
+  /** The clicked event's own labels; these exist even when its source node does not. */
+  private fun collectEventLabels(event: AccessibilityEvent, out: MutableList<CharSequence>) {
+    try {
+      val texts = event.text
+      if (texts != null) {
+        for (item in texts) {
+          if (item != null && item.isNotEmpty()) out.add(item)
+        }
+      }
+    } catch (error: Throwable) {
+      // Event text is best effort only.
+    }
+    try {
+      event.contentDescription?.let { if (it.isNotEmpty()) out.add(it) }
+    } catch (error: Throwable) {
+      // The event description is best effort only.
+    }
+  }
+
+  /** A tapped node's own labels plus its direct children's (a menu row holds the text). */
+  private fun collectNodeLabels(node: AccessibilityNodeInfo, out: MutableList<CharSequence>) {
+    try {
+      node.text?.let { if (it.isNotEmpty()) out.add(it) }
+      node.contentDescription?.let { if (it.isNotEmpty()) out.add(it) }
+    } catch (error: Throwable) {
+      // Node labels are best effort only.
+    }
+    val children = try {
+      node.childCount
+    } catch (error: Throwable) {
+      0
+    }
+    for (index in 0 until minOf(children, CLICK_CHILD_LIMIT)) {
+      val child = try {
+        node.getChild(index)
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      try {
+        child.text?.let { if (it.isNotEmpty()) out.add(it) }
+        child.contentDescription?.let { if (it.isNotEmpty()) out.add(it) }
+      } catch (error: Throwable) {
+        // A recycled child is simply skipped.
+      }
+    }
+  }
+
+  /**
+   * Layer 2: is private mode on screen right now?
+   *
+   * One capped walk over the browser's own windows, stopping at every WebView / GeckoView so
+   * page text is never read. Only labels and native view ids that exist solely while private
+   * mode is on are matched, which is why Chrome's home "Incognito" chip and Brave's "New
+   * private tab" menu row cannot trigger it.
+   */
+  private fun scanPrivateModeWindows(pkg: String): Boolean {
+    val roots = browserRoots(pkg)
+    if (roots.isEmpty()) return false
+    val budget = intArrayOf(PRIVATE_WALK_LIMIT)
+    for (root in roots) {
+      if (walkPrivateModeWindow(root, 0, budget)) {
+        Log.i(TAG, "Private mode on screen in $pkg")
+        blockPrivateTab()
+        return true
+      }
+      if (budget[0] <= 0) break
+    }
+    return false
+  }
+
+  private fun walkPrivateModeWindow(
+    node: AccessibilityNodeInfo,
+    depth: Int,
+    budget: IntArray
+  ): Boolean {
+    if (budget[0] <= 0 || depth > PRIVATE_WALK_DEPTH) return false
+    budget[0] -= 1
+
+    val className = try {
+      node.className?.toString() ?: ""
+    } catch (error: Throwable) {
+      ""
+    }
+    // Page content is never read: private-mode labels live in browser chrome only.
+    if (isWebViewClass(className)) return false
+
+    val visible = try {
+      node.isVisibleToUser
+    } catch (error: Throwable) {
+      false
+    }
+    if (visible) {
+      val labelMatches = try {
+        matchesPrivateStateLabel(node.text) || matchesPrivateStateLabel(node.contentDescription)
+      } catch (error: Throwable) {
+        false
+      }
+      if (labelMatches) return true
+
+      val viewId = try {
+        node.viewIdResourceName
+      } catch (error: Throwable) {
+        null
+      }
+      if (viewId != null && isPrivateViewId(viewId)) return true
+
+      // A tab-model selector only counts while it reports the private state, so a visible
+      // but unselected "Incognito tabs" button on a normal tab switcher is not a hit.
+      val selected = try {
+        node.isSelected || node.isChecked
+      } catch (error: Throwable) {
+        false
+      }
+      if (selected) {
+        if (viewId != null && isPrivateTabSelector(viewId)) return true
+        val description = normalizeLabel(
+          try {
+            node.contentDescription
+          } catch (error: Throwable) {
+            null
+          }
+        )
+        if (description == "incognito tabs" || description == "private tabs") return true
+      }
+    }
+
+    val children = try {
+      node.childCount
+    } catch (error: Throwable) {
+      0
+    }
+    for (index in 0 until minOf(children, PRIVATE_CHILD_LIMIT)) {
+      val child = try {
+        node.getChild(index)
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      if (walkPrivateModeWindow(child, depth + 1, budget)) return true
+    }
+    return false
+  }
+
+  private fun matchesPrivateActionLabel(raw: CharSequence?): Boolean =
+    normalizeLabel(raw)?.let { it in PRIVATE_ACTION_LABELS } == true
+
+  private fun matchesPrivateStateLabel(raw: CharSequence?): Boolean =
+    normalizeLabel(raw)?.let { it in PRIVATE_STATE_LABELS } == true
+
+  /**
+   * Lowercase, collapsed whitespace, no trailing ellipsis or arrow, so a menu row rendered
+   * as "New private tab…" still matches its label.
+   */
+  private fun normalizeLabel(raw: CharSequence?): String? {
+    if (raw == null) return null
+    val cleaned = raw.toString()
+      .replace('\u00A0', ' ')
+      .trim()
+      .trimEnd('…', '.', '›', '>', ':')
+      .trim()
+      .lowercase()
+    if (cleaned.isEmpty()) return null
+    return cleaned.replace(WHITESPACE, " ")
+  }
+
+  /** A native view that only exists while the browser is in private mode. */
+  private fun isPrivateViewId(viewId: String): Boolean {
+    val lower = viewId.lowercase()
+    return PRIVATE_VIEW_IDS.any { suffix -> lower.endsWith(":id/$suffix") }
+  }
+
+  private fun isPrivateTabSelector(viewId: String): Boolean {
+    val lower = viewId.lowercase()
+    return PRIVATE_TAB_SELECTOR_IDS.any { suffix -> lower.endsWith(":id/$suffix") }
+  }
+
+  /** One state scan for the browser already in front (service connect / switch turned on). */
   private fun handleBrowserFront(pkg: String) {
     if (!incognitoGuardNeeded()) return
     if (pkg in ALWAYS_PRIVATE_BROWSERS) {
       blockPrivateTab()
       return
     }
-    scheduleSecureProbe(pkg, 0L, allowRetry = true)
+    scanPrivateModeWindows(pkg)
   }
 
   private fun blockPrivateTab() {
     AiVisualScanner.stop()
     HabitGuard.onIncognitoDetected(this)
-  }
-
-  /**
-   * Queues exactly one probe, and never drops it to Android's screenshot interval.
-   *
-   * Android allows one `takeScreenshot` per second. An event inside that window is not
-   * ignored: the probe is queued for `lastScreenshotAt + 1150 ms`, which is what keeps a
-   * fast ⋮ -> "New Private tab" tap from being lost. A newer request replaces an older
-   * queued one, so a burst of events cannot pile probes up.
-   */
-  private fun scheduleSecureProbe(pkg: String, delayMs: Long, allowRetry: Boolean) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-    val generation = ++probeGeneration
-    val now = SystemClock.elapsedRealtime()
-    val earliest = lastScreenshotAt + SCREENSHOT_MIN_GAP_MS
-    val wait = maxOf(delayMs, earliest - now).coerceAtLeast(0L)
-    incognitoHandler.postDelayed({
-      if (generation != probeGeneration) return@postDelayed
-      probeSecureBrowserWindow(pkg, allowRetry)
-    }, wait)
   }
 
   /** True when [start] or any ancestor is a webpage view, never native browser chrome. */
@@ -552,89 +711,6 @@ class HabitAccessibilityService : AccessibilityService() {
     }
     if (eventPackage.isEmpty() || isTransientOverlay(eventPackage)) return
     lastBrowserFrontPackage = null
-  }
-
-  private fun screenInteractive(): Boolean = try {
-    (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive ?: true
-  } catch (error: Throwable) {
-    true
-  }
-
-  /**
-   * The whole private-tab signal: one screenshot request for a browser that is really in
-   * front.
-   *
-   * `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW` (Android 14) and its vendor equivalent
-   * [SCREENSHOT_SECURE_WINDOW_VENDOR] (HyperOS / MIUI return the same refusal as error 2)
-   * mean the window is FLAG_SECURE, and a normal browser page never is. Every other failure
-   * only logs, and a success closes the frame and waits for the next event, so a page that
-   * is being read costs zero probes.
-   */
-  private fun probeSecureBrowserWindow(pkg: String, allowRetry: Boolean) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-    if (!incognitoGuardNeeded() || !isBrowserPackage(pkg)) return
-    // The screenshot covers the whole display, so a probe may only run while the browser is
-    // still the app in front: another app's secure window must never be judged as Habit's.
-    if (!browserIsInFront(pkg)) return
-    if (!screenInteractive()) return
-
-    val now = SystemClock.elapsedRealtime()
-    if (now - lastScreenshotAt < SCREENSHOT_MIN_GAP_MS) {
-      scheduleSecureProbe(pkg, SCREENSHOT_MIN_GAP_MS - (now - lastScreenshotAt), allowRetry)
-      return
-    }
-    lastScreenshotAt = now
-
-    try {
-      takeScreenshot(
-        Display.DEFAULT_DISPLAY,
-        ContextCompat.getMainExecutor(this),
-        object : TakeScreenshotCallback {
-          override fun onSuccess(screenshot: ScreenshotResult) {
-            // A normal page is never FLAG_SECURE. Release the frame and stop: only the next
-            // click or window change asks for another probe.
-            try {
-              screenshot.hardwareBuffer.close()
-            } catch (error: Throwable) {
-              // already closed
-            }
-          }
-
-          override fun onFailure(errorCode: Int) {
-            if (errorCode == ERROR_TAKE_SCREENSHOT_SECURE_WINDOW ||
-              errorCode == SCREENSHOT_SECURE_WINDOW_VENDOR
-            ) {
-              Log.i(TAG, "Secure window in $pkg (probe code $errorCode) — private tab")
-              blockPrivateTab()
-              // One follow-up look in case Back + Home did not leave the private tab.
-              scheduleSecureProbe(pkg, FOLLOW_UP_PROBE_MS, allowRetry = false)
-              return
-            }
-            if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT && allowRetry) {
-              // The AI scanner or a previous probe won the race: retry once, queued past
-              // the interval instead of being lost.
-              scheduleSecureProbe(pkg, PROBE_RETRY_MS, allowRetry = false)
-              return
-            }
-            Log.w(TAG, "Screenshot probe failed for $pkg with code $errorCode")
-          }
-        }
-      )
-    } catch (error: Throwable) {
-      Log.w(TAG, "Secure probe unavailable: ${error.message}")
-    }
-  }
-
-  /**
-   * True when [pkg] is the browser on screen. `rootInActiveWindow` is trusted when it is
-   * readable; a FLAG_SECURE window can hide its root, so the event latch and any readable
-   * window of that package keep the probe pointed at the browser instead of dropping it.
-   */
-  private fun browserIsInFront(pkg: String): Boolean {
-    val front = foregroundPackage()
-    if (front != null) return front == pkg
-    if (lastBrowserFrontPackage == pkg) return true
-    return browserRoots(pkg).isNotEmpty()
   }
 
   /** Every window root that belongs to the browser currently in front. */
@@ -1266,7 +1342,6 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   override fun onUnbind(intent: Intent?): Boolean {
-    incognitoHandler.removeCallbacksAndMessages(null)
     stopTamperWatch()
     unregisterBrowserPackageReceiver()
     AiVisualScanner.stop()
@@ -1275,7 +1350,6 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   override fun onDestroy() {
-    incognitoHandler.removeCallbacksAndMessages(null)
     stopTamperWatch()
     unregisterBrowserPackageReceiver()
     AiVisualScanner.release()
@@ -1349,20 +1423,14 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val BROWSER_ROUTE_INTERVAL_MS = 500L
     /** Ancestors walked above a tapped node to tell page content from browser chrome. */
     private const val WEBVIEW_ANCESTOR_DEPTH = 30
-    /** A click is probed only after this delay so the tab it opened finishes rendering. */
-    private const val PROBE_AFTER_CLICK_MS = 450L
-    /** Android refuses two takeScreenshot calls inside 1000 ms; queue instead of dropping. */
-    private const val SCREENSHOT_MIN_GAP_MS = 1_150L
-    /** One retry when a probe loses the race with another screenshot (error 3). */
-    private const val PROBE_RETRY_MS = 1_100L
-    /** Second look after a block, in case Back + Home did not leave the private tab. */
-    private const val FOLLOW_UP_PROBE_MS = 1_200L
-    /**
-     * `takeScreenshot` refused the frame because the window is secure. Android 14+ reports
-     * ERROR_TAKE_SCREENSHOT_SECURE_WINDOW (6); HyperOS / MIUI and other vendor builds report
-     * the same refusal as error 2.
-     */
-    private const val SCREENSHOT_SECURE_WINDOW_VENDOR = 2
+    /** Direct children read from a tapped node, so a menu row's own text is seen. */
+    private const val CLICK_CHILD_LIMIT = 24
+    /** Runaway guards for the private-mode walk: browser chrome is small, pages are pruned. */
+    private const val PRIVATE_WALK_LIMIT = 2_000
+    private const val PRIVATE_WALK_DEPTH = 60
+    private const val PRIVATE_CHILD_LIMIT = 200
+    /** Whitespace collapsed by [normalizeLabel]. */
+    private val WHITESPACE = Regex("\\s+")
 
     /** Habit's current package and the legacy package the shield already recognises. */
     private val HABIT_PACKAGES = setOf(
@@ -1394,6 +1462,60 @@ class HabitAccessibilityService : AccessibilityService() {
       "org.mozilla.focus",
       "org.torproject.torbrowser"
     )
+
+    /**
+     * Layer 1 vocabulary: controls that open private mode. Only a real tap on one of these
+     * blocks, which is why a `⋮` menu that merely lists "New private tab" stays harmless.
+     */
+    private val PRIVATE_ACTION_LABELS = setOf(
+      "new incognito tab",
+      "new private tab",
+      "new secret tab",
+      "new inprivate tab",
+      "open in incognito tab",
+      "open in private tab",
+      "turn on secret mode",
+      "start incognito",
+      "new fire window",
+      "incognito",
+      "incognito tabs",
+      "private",
+      "private tabs"
+    )
+
+    /**
+     * Layer 2 vocabulary: labels that only ever render while private mode is already on.
+     * The bare words "incognito" and "private" are deliberately absent, so Chrome's home
+     * shortcut chip and Brave's menu row can never block a normal session.
+     */
+    private val PRIVATE_STATE_LABELS = setOf(
+      "close all incognito tabs",
+      "close all private tabs",
+      "turn off secret mode",
+      "private browsing",
+      "inprivate tabs",
+      "you’ve gone incognito",
+      "you've gone incognito",
+      "now you can browse privately",
+      "this is a private tab",
+      "brave doesn’t remember what you do in a private tab",
+      "brave doesn't remember what you do in a private tab",
+      "welcome to secret mode",
+      "you're browsing inprivate",
+      "you’re browsing inprivate"
+    )
+
+    /** Native private-mode views: these ids are never part of a normal browser page. */
+    private val PRIVATE_VIEW_IDS = setOf(
+      "incognito_ntp",
+      "incognito_ntp_content",
+      "incognito_badge",
+      "location_bar_incognito_badge",
+      "secret_mode_badge"
+    )
+
+    /** Tab-model selectors that report the private state through isSelected / isChecked. */
+    private val PRIVATE_TAB_SELECTOR_IDS = setOf("incognito_toggle_button")
 
     /** The continuous Settings poll: ten full scans per second while Settings is in front. */
     private const val TAMPER_POLL_MS = 100L
