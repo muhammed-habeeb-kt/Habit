@@ -803,13 +803,24 @@ class HabitAccessibilityService : AccessibilityService() {
       if (!incognitoGuardNeeded()) return
       val pkg = browserFrontPackage() ?: return
       if (pkg in ALWAYS_PRIVATE_BROWSERS) {
-        blockPrivateTab()
+        // The latch can outlive the browser by one event; a kick-out may only happen while
+        // that browser really owns the screen, never in whatever app the user opened next.
+        if (browserOnScreen(pkg)) blockPrivateTab()
         return
       }
       scanPrivateModeWindows(pkg)
     } catch (error: Throwable) {
       Log.w(TAG, "Incognito poll failed: ${error.message}")
     }
+  }
+
+  /** True when [pkg] owns the focused window, or a real window of its own, right now. */
+  private fun browserOnScreen(pkg: String): Boolean {
+    val front = foregroundPackage()
+    if (front == pkg) return true
+    // Another app is focused and its window is readable: the latch is stale, not a hit.
+    if (front != null) return false
+    return browserRoots(pkg).isNotEmpty()
   }
 
   /** Protection and the incognito switch are both required before any work is done. */

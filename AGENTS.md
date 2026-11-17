@@ -439,8 +439,10 @@ never read.
    Since Part 35 the cascade's own refusals are part of the layer: `onScreenshotRefused`
    turns the secure-window code of a browser frame into the same block, and the foreground
    ticker runs `pollIncognitoGuard` once a second — a screenshot-free walk of the browser in
-   front for the private ids and sentences — so a tab swapped inside the same activity with
-   no accessibility event still cannot survive a second.
+  front for the private ids and sentences — so a tab swapped inside the same activity with
+  no accessibility event still cannot survive a second. A browser with no normal mode only
+  blocks while it really owns the screen, so a stale front-browser latch can never kick the
+  user out of the app they opened next.
 4. **Layer 3, browser scope** — every installed browser comes from `PackageManager` (cached,
    refreshed on package changes, `<queries>` intent declared). Firefox Focus and Tor
    Browser have no normal mode, so entering them blocks immediately.
