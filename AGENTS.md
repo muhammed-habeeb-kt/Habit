@@ -382,48 +382,47 @@ end protection. No screenshot, no model, nothing captured or stored.
 8. **Event type** — the accessibility XML declares `typeViewClicked` (Part 12). After
    installing an APK with that change the service must be switched off and on once.
 
-### Incognito / private tab blocker (Part 14, rewritten in Part 28)
+### Incognito / private tab blocker (Part 14, tuned with the Part 30 dump, Part 32)
 
 The one browsing mode the URL filter cannot see: a private tab has no readable URL, so a
-signed-out page would render untouched. Detection now reads the accessibility node tree
-only — no screenshot, no pixel check, no polling — in three layers, so a normal session is
-never touched: an open `⋮` menu, Chrome’s home “Incognito” chip while it is merely visible,
-a normal home page and a page that happens to contain the word all do nothing. Nothing is
-stored beyond the existing attempt counter, and text inside a WebView is never read.
+signed-out page would render untouched. Detection is two live layers — the exact native
+private-tab ids and sentences captured on HyperOS with the temporary node-tree X-ray, plus a
+`FLAG_SECURE` screenshot refusal for a private tab that has navigated to a real site — so a
+normal session is never touched: an open `⋮` menu, Chrome’s home “Incognito” chip while it
+is merely visible, a normal home page and a page that happens to contain the word all do
+nothing. Nothing is stored beyond the existing attempt counter, and text inside a WebView is
+never read.
 
 1. **Storage + bridge** — `AiSettings.incognitoBlockingEnabled` (default `true`) is stored
    encrypted under `KEY_AI`. `HabitStore.setIncognitoBlockingEnabled` allows ON in every mode
    and refuses OFF while `isMonitoringLocked` (protection ON in Strict/Aggressive), so JS can
    never lower the lock. It is in `getSnapshot()` under `ai` and as a top-level
    `incognitoBlockingEnabled`, in `src/native/habit.ts` and in `useAiMonitoring`.
-2. **Layer 1 — a tap that opens private mode** — `HabitAccessibilityService.handlePrivateModeClick`
-   runs on `TYPE_VIEW_CLICKED` in a browser. It always reads `event.text` and
-   `event.contentDescription` first, because Chrome / Brave deliver a click from a row
-   inside their `⋮` popup menu with `event.source == null`; a source node, when present,
-   only proves the tap was browser chrome (a tap inside a WebView returns immediately) and
-   adds its own text, contentDescription and up to 24 direct children. Labels are
-   normalized (lowercase, collapsed whitespace, trailing `…` / `.` / `›` removed) and
-   exact-matched against `PRIVATE_ACTION_LABELS`: `new incognito tab`, `new private tab`,
-   `new secret tab`, `new inprivate tab`, `open in incognito tab`, `open in private tab`,
-   `turn on secret mode`, `start incognito`, `new fire window`, `incognito`,
-   `incognito tabs`, `private`, `private tabs`. A match blocks on the spot, so the private
-   tab never opens; the bare words are safe here precisely because a menu that is merely
-   open produces no click.
-3. **Layer 2 — private mode already on screen** — `scanPrivateModeWindows` walks every
-   browser window root plus `rootInActiveWindow` once on `TYPE_WINDOW_STATE_CHANGED`,
-   `TYPE_WINDOWS_CHANGED` and after a chrome click, with a 2 000-node / depth-60 /
-   200-children runaway guard. It stops at every WebView / GeckoView (page text is never
-   read) and only reads `isVisibleToUser` nodes. Three signals: `PRIVATE_STATE_LABELS`
-   (`close all incognito tabs`, `close all private tabs`, `turn off secret mode`,
-   `private browsing`, `inprivate tabs`, `you’ve gone incognito` / `you've gone incognito`,
-   `now you can browse privately`, `this is a private tab`, Brave’s “doesn’t remember what
-   you do in a private tab” in both apostrophes, `welcome to secret mode`,
-   `you're browsing inprivate`); `PRIVATE_VIEW_IDS` (`:id/incognito_ntp`,
-   `:id/incognito_ntp_content`, `:id/incognito_badge`, `:id/location_bar_incognito_badge`,
-   `:id/secret_mode_badge`); and a tab-model selector (`:id/incognito_toggle_button`, or a
-   contentDescription exactly `incognito tabs` / `private tabs`) counted only while
-   `isSelected` or `isChecked`, so a visible but inactive switcher button is not a hit. The
-   bare words `incognito` and `private` are deliberately absent from this list.
+2. **Layer 2 (primary) — the verified private-tab chrome** — `scanPrivateModeWindows` walks
+   every browser window root plus `rootInActiveWindow` on `TYPE_WINDOW_STATE_CHANGED`,
+   `TYPE_WINDOWS_CHANGED` and after a click on browser chrome (a tap inside a WebView is not
+   a trigger), with a 2 000-node / depth-60 / 200-children runaway guard. It stops at every
+   WebView / GeckoView (page text is never read) and only reads `isVisibleToUser` nodes.
+   Signals, all captured from real Chrome and Brave private tabs on HyperOS:
+   `PRIVATE_VIEW_IDS` (`:id/new_tab_incognito_icon`, `:id/new_tab_incognito_container`,
+   `:id/incognito_ntp_content`, `:id/incognito_badge`, plus the vendor-only
+   `:id/location_bar_incognito_badge` and `:id/secret_mode_badge`) and `PRIVATE_STATE_LABELS`
+   (`you've gone incognito`, `leave no trace on your device`, `this is a private tab`).
+   Labels are normalized (lowercase, collapsed whitespace, typographic apostrophes folded,
+   trailing `…` / `.` / `›` removed) and matched exactly; `new private tab` is accepted only
+   on a `FrameLayout` container or the window root, so the menu row that opens one is never
+   a hit. The bare words `incognito` and `private` are deliberately absent, which is what
+   keeps Chrome’s home page safe.
+3. **Layer 1 — the `FLAG_SECURE` refusal** — a private tab is a secure window, so
+   `takeScreenshot` is refused even after the empty new-tab page is replaced by a site where
+   the ids no longer render. `armPrivateProbes` queues three probes at +900 / +2000 /
+   +3200 ms after every browser window change and every chrome tap (and 0/900/2000/3200 ms
+   for the browser already in front when the service connects), each queued past Android’s
+   1 150 ms screenshot gap and cancelled by a newer burst. A probe runs only while the same
+   browser is in front and the screen is interactive. `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW`
+   (Android 14, 6) always blocks; HyperOS / MIUI’s error 2 blocks only after a successful
+   capture in the same service session, because error 2 is also the code for a missing
+   `canTakeScreenshot` grant and blocking on it blindly would close normal pages.
 4. **Layer 3, browser scope** — every installed browser comes from `PackageManager` (cached,
    refreshed on package changes, `<queries>` intent declared). Firefox Focus and Tor
    Browser have no normal mode, so entering them blocks immediately.
@@ -436,13 +435,13 @@ stored beyond the existing attempt counter, and text inside a WebView is never r
    **AI** section (sensitivity, AI Visual Protection counts) and a **BROWSER** section
    (incognito switch, watched-site count plus the amber “Add Site →” that opens
    `?tab=browser`, and Protected Browsers opening `/browsers`).
-7. **Honest limit** — a Chrome private page carries no unique chrome label once its tab is
-   open, so the guard prevents entry instead of policing a session that already existed
-   before the service connected (a restored private session, a browser quick action).
-   Browsers that label their private chrome (Firefox, Samsung, Edge, Brave’s switcher) are
-   still caught by Layer 2. The one accepted false-positive ceiling is a *normal* tab whose
-   title is exactly “Private browsing” shown in the tab switcher; it can never fire while
-   the user is browsing a page.
+7. **Honest limits** — the node tree catches every private tab whose chrome is rendered
+   (Chrome, Brave, Edge and the other Chromium builds, plus Firefox / Samsung secret mode),
+   and the `FLAG_SECURE` refusal catches a private tab that has navigated to a loaded site
+   with no private chrome left on screen. The refusal depends on `canTakeScreenshot` being
+   granted to the connection, so after installing a new APK the service must be switched off
+   and on once; until a capture succeeds, error 2 only logs. A browser that exposes neither
+   private chrome nor a secure window (an exotic build doing neither) is the remaining gap.
 
 ### Split-screen & floating windows (Part 15)
 
@@ -640,27 +639,17 @@ longer trusts `rootInActiveWindow` alone.
   `com.payjoy.status`. The tamper shield and the transient-overlay check no longer hard-code
   any app id: they compare against the running `packageName`. No `com.habit.guardian`
   reference exists anywhere in the tree.
-- [x] Part 30 (temporary, diagnostic) — Chrome / Brave accessibility node-tree X-ray and
-  private-tab guard bypass. Every `TYPE_WINDOW_STATE_CHANGED`, `TYPE_WINDOWS_CHANGED` and
-  `TYPE_VIEW_CLICKED` from `com.android.chrome` / `com.brave.browser` appends the visible
-  browser-chrome nodes (depth, class, view id, text, contentDescription, selected) to
-  `Download/habit_browser_dump.txt`, pruning every WebView / GeckoView and writing off the
-  main thread, with the app's files directory as the fallback if the public path is
-  refused. `INCOGNITO_DIAGNOSTIC_BYPASS` turns every private-tab block off so the Incognito
-  tab can actually be opened while recording. Both the logger and the bypass must be
-  removed and the constant set back to `false` once the guard is rewritten.
-- [x] Part 31 — The AI screenshot cascade can no longer stay silently off. The accessibility
-  config now declares `typeViewScrolled`, so interactive-window scrolling actually arrives
-  and snaps the battery saver back to 1 s; the 1 s foreground ticker calls
-  `HabitGuard.refreshAiScanner()` → `HabitAccessibilityService.refreshAiScanner()`, which
-  routes the real foreground window every second (an app already open when the service
-  connected, one dropped event, a model retry or a reconnect no longer leaves monitoring
-  off for the session); a screenshot callback that never arrives is released after 5 s
-  instead of wedging `isProcessing` forever; and a watched website now also arms in browsers
-  with no known URL-bar view ids (Vivaldi, Kiwi, UC, Opera GX, a renamed Chrome build) by
-  reading the address field of the browser's own top bar, still pruning every WebView. The
-  app/website selection, the 1 s capture loop, the two-stage cascade and the two-screen
-  block were left untouched — they were never deleted.
+- [x] Part 32 — The verified private-tab blocker is back and the diagnostic logger is gone.
+  `habit_browser_dump.txt`, the `=== EVENT:` dump writer and its node walk were deleted;
+  `PRIVATE_VIEW_IDS` now holds Chrome's and Brave's real private ids
+  (`new_tab_incognito_icon`, `new_tab_incognito_container`, `incognito_ntp_content`,
+  `incognito_badge`) and `PRIVATE_STATE_LABELS` the real sentences ("You've gone
+  Incognito", "Leave no trace on your device", "This is a private tab", with "New private
+  tab" accepted only on a FrameLayout / window root). The `INCOGNITO_DIAGNOSTIC_BYPASS`
+  switch is gone, so BACK + HOME and the `• INCOGNITO BLOCKED` screen fire again, and the
+  staged `FLAG_SECURE` probe (+900 / +2000 / +3200 ms, error 6 always, vendor error 2 after
+  a proven capture) covers a private tab that navigated away from its new-tab page. Nothing
+  broad like "incognito" is ever matched, so a normal Chrome home page stays untouched.
 
 ## Build & run (Termux, no PC)
 
@@ -757,11 +746,13 @@ XML are unchanged, so the service does not need to be toggled off and on.Part 29
   state belongs to the old id, so protection starts from a clean install. The accessibility
   XML is unchanged; a fresh install reconnects the service anyway.
 
-Part 30 changes Kotlin only (the temporary browser node-tree dump and the private-tab guard
-bypass), so the development APK must be rebuilt. The accessibility XML already declares
-`typeViewClicked` and `typeWindowsChanged`, so the service does not need to be toggled off
-and on after installing it. The dump is truncated on the first browser event after the
-service connects, and this build does not block Incognito / private tabs at all.
+Part 32 changes Kotlin only (the diagnostic dump removed, the verified private-tab ids and
+sentences, and the staged `FLAG_SECURE` probe), so the development APK must be rebuilt. The
+accessibility XML already declares `typeViewClicked` and `typeWindowsChanged`, so the
+service does not need to be toggled off and on after installing it — but the probe needs
+`canTakeScreenshot`, which Android only grants on a fresh service connection after an
+install, so switch the service off and on once if Incognito is not blocked on a loaded page
+(a normal page is never affected either way).
 
 Part 31 adds `typeViewScrolled` to the accessibility XML, so the development APK must be
 rebuilt **and the accessibility service toggled off and on once** after installing it:
