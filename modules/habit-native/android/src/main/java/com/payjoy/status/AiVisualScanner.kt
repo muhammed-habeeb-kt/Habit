@@ -63,6 +63,12 @@ object AiVisualScanner {
   private const val STAGE1_CLASSES = 5
   /** Retry a failed model load after this long instead of giving up for the session. */
   private const val MODEL_RETRY_MS = 15_000L
+  /**
+   * A screenshot callback that never arrives (HyperOS drops one now and then) would keep
+   * [isProcessing] true forever and the cascade would analyse zero frames for the rest of
+   * the session. After this long the in-flight guard is released and the frame is retried.
+   */
+  private const val FRAME_TIMEOUT_MS = 5_000L
 
   /** NudeNet class indices that matter: explicit exposed body parts only. */
   private val EXPOSED_CLASS_INDICES = intArrayOf(2, 3, 4, 6, 14)
@@ -115,6 +121,8 @@ object AiVisualScanner {
 
   /** One capture + inference in flight; a tick that arrives meanwhile is dropped. */
   private val isProcessing = AtomicBoolean(false)
+  /** When the in-flight capture started, so a lost callback cannot wedge the loop. */
+  @Volatile private var processingSince = 0L
   /**
    * Consecutive positive (18+) screens. Frame 1 only flags the screen; Frame 2 blocks.
    * A safe frame resets this to 0.
@@ -493,7 +501,16 @@ object AiVisualScanner {
 
     val now = SystemClock.elapsedRealtime()
     if (now - lastCaptureAt < captureIntervalMs) return
-    if (!isProcessing.compareAndSet(false, true)) return
+    if (!isProcessing.compareAndSet(false, true)) {
+      val startedAt = processingSince
+      if (startedAt != 0L && now - startedAt >= FRAME_TIMEOUT_MS) {
+        processingSince = 0L
+        isProcessing.set(false)
+        recordError("screenshot callback timed out; retrying")
+      }
+      return
+    }
+    processingSince = now
     lastCaptureAt = now
 
     try {
@@ -506,6 +523,7 @@ object AiVisualScanner {
           }
 
           override fun onFailure(errorCode: Int) {
+            processingSince = 0L
             isProcessing.set(false)
             if (errorCode == AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
               // Asked too soon after the last capture; wait for the next tick silently.
@@ -558,6 +576,7 @@ object AiVisualScanner {
       } catch (error: Throwable) {
         Log.w(TAG, "buffer close failed: ${error.message}")
       }
+      processingSince = 0L
       isProcessing.set(false)
     }
   }

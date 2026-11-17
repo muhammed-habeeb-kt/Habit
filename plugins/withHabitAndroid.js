@@ -58,9 +58,12 @@ const ACCESSIBILITY_PERMISSION = 'android.permission.BIND_ACCESSIBILITY_SERVICE'
 // scan vs. watched-app screenshot cascade). keep-screen-on is off, interactive windows on.
 // `typeViewClicked` is what the tamper shield listens to: a tap on "Habit" in the
 // accessibility list, on "Force stop" or on "Clear data" arrives as a click.
+// `typeViewScrolled` is required by the AI screenshot cascade: a scroll is what proves the
+// user is interacting with a chat / feed, so it snaps the battery-saver interval back to 1 s
+// and re-runs the router. Without it Android never delivers a single scroll event.
 const accessibilityXml = (applicationPackage) => `<?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeWindowContentChanged|typeViewTextChanged|typeViewClicked"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeWindowContentChanged|typeViewTextChanged|typeViewClicked|typeViewScrolled"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
     android:canRetrieveWindowContent="true"

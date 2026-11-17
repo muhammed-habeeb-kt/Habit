@@ -31,6 +31,10 @@ class HabitForegroundService : Service() {
         HabitStore.init(this@HabitForegroundService)
         HabitUnlock.tick(this@HabitForegroundService)
         HabitWatchdog.check(this@HabitForegroundService)
+        // The AI loop normally arms from an accessibility event; this is the independent
+        // once-a-second path that re-arms it when an event was missed or the loop stopped
+        // while the watched app / website is still in front.
+        HabitGuard.refreshAiScanner()
         // Includes the live AI line, so the notification updates once a second while a
         // watched app is being scanned (frames, both scores, verdict or the exact error).
         val text = notificationText()

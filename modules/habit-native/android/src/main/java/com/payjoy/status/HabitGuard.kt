@@ -121,6 +121,19 @@ object HabitGuard {
     runOnMain { currentService.refreshIncognitoGuard() }
   }
 
+  /**
+   * Re-arms the AI screenshot cascade for the window in front right now.
+   *
+   * Called once a second by the foreground ticker. An accessibility event is the normal
+   * trigger, but a watched app that was already open when the service connected, one dropped
+   * event, a model retry or a service reconnect must never leave the scanner silently off
+   * for the whole session — this is the independent path that always recovers it.
+   */
+  fun refreshAiScanner() {
+    val currentService = service ?: return
+    runOnMain { currentService.refreshAiScanner() }
+  }
+
   /** Back + Home first, then the ``INCOGNITO BLOCKED`` screen over whatever is left. */
   private fun showIncognitoBlock(attemptsToday: Int) {
     AiVisualScanner.onOverlayShown()

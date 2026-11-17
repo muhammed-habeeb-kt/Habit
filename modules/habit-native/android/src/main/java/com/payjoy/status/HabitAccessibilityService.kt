@@ -199,6 +199,26 @@ class HabitAccessibilityService : AccessibilityService() {
   override fun onInterrupt() = Unit
 
   /**
+   * Routes the window in front once, bypassing the event throttle.
+   *
+   * The foreground ticker calls this every second, so the cascade is armed from the real
+   * window instead of only from an accessibility event. Nothing is ever stopped here (the
+   * router only stops on an explicit app switch, and no event type is passed), so a healthy
+   * loop is never interrupted by the watchdog.
+   */
+  fun refreshAiScanner() {
+    try {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+      val pkg = foregroundPackage() ?: lastBrowserFrontPackage ?: return
+      // Force the router past its per-package throttle: this runs once a second on purpose.
+      lastRoutedPackage = null
+      updateAiScanner(pkg)
+    } catch (error: Throwable) {
+      Log.w(TAG, "AI re-arm failed: ${error.message}")
+    }
+  }
+
+  /**
    * Routes the cascade: a selected app or watched website keeps the loop alive wherever it
    * is on screen — full screen, split screen or a floating window.
    *
@@ -1097,6 +1117,80 @@ class HabitAccessibilityService : AccessibilityService() {
       }
       if (text != null) return text
     }
+    // Every installed browser is guarded, but only the eight known packages have a resource
+    // id list and vendors rename those ids between releases. The address field is still the
+    // only editable node in the browser's own top bar, so it is found directly there — which
+    // is what lets a watched website arm the AI scanner in Vivaldi, Kiwi, UC, Opera GX or a
+    // renamed Chrome build instead of scanning nothing at all.
+    return genericUrlBarText(root)
+  }
+
+  /**
+   * Address field of a browser whose view ids are unknown, read from its top bar only.
+   *
+   * A bounded walk of the top [GENERIC_URL_TOP_RATIO] of the window for a visible non-WebView
+   * editable field whose text parses as a navigable host. Page content is pruned at every
+   * WebView / GeckoView, so a search box or a comment field on the page can never be read.
+   */
+  private fun genericUrlBarText(root: AccessibilityNodeInfo): String? {
+    val rootBounds = Rect()
+    try {
+      root.getBoundsInScreen(rootBounds)
+    } catch (error: Throwable) {
+      return null
+    }
+    if (rootBounds.height() <= 0) return null
+    val topLimit = rootBounds.top + (rootBounds.height() * GENERIC_URL_TOP_RATIO).toInt()
+    return findUrlBarText(root, topLimit, 0, intArrayOf(GENERIC_URL_NODE_BUDGET))
+  }
+
+  private fun findUrlBarText(
+    node: AccessibilityNodeInfo,
+    topLimit: Int,
+    depth: Int,
+    budget: IntArray
+  ): String? {
+    if (budget[0] <= 0 || depth > GENERIC_URL_MAX_DEPTH) return null
+    budget[0] -= 1
+
+    val className = try {
+      node.className?.toString() ?: ""
+    } catch (error: Throwable) {
+      ""
+    }
+    if (isWebViewClass(className)) return null
+
+    if (className.contains("EditText", ignoreCase = true)) {
+      val bounds = Rect()
+      val inTopBar = try {
+        node.getBoundsInScreen(bounds)
+        node.isVisibleToUser && bounds.top <= topLimit
+      } catch (error: Throwable) {
+        false
+      }
+      if (inTopBar) {
+        val text = try {
+          node.text?.toString()
+        } catch (error: Throwable) {
+          null
+        }
+        if (!text.isNullOrBlank() && AdultFilter.hostOf(text) != null) return text
+      }
+    }
+
+    val children = try {
+      node.childCount
+    } catch (error: Throwable) {
+      0
+    }
+    for (index in 0 until minOf(children, GENERIC_URL_CHILD_LIMIT)) {
+      val child = try {
+        node.getChild(index)
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      findUrlBarText(child, topLimit, depth + 1, budget)?.let { return it }
+    }
     return null
   }
 
@@ -1629,6 +1723,12 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val MIN_WATCHED_WINDOW_PX = 80
     /** Browsers re-read their URL bar on this cadence so a site change stops scanning fast. */
     private const val BROWSER_ROUTE_INTERVAL_MS = 500L
+    /** Runaway guards for the unknown-browser address-field walk (top bar only). */
+    private const val GENERIC_URL_NODE_BUDGET = 200
+    private const val GENERIC_URL_MAX_DEPTH = 25
+    private const val GENERIC_URL_CHILD_LIMIT = 40
+    /** Share of the window height that is browser chrome rather than page content. */
+    private const val GENERIC_URL_TOP_RATIO = 0.25f
     /** Ancestors walked above a tapped node to tell page content from browser chrome. */
     private const val WEBVIEW_ANCESTOR_DEPTH = 30
     /** Direct children read from a tapped node, so a menu row's own text is seen. */

@@ -649,6 +649,18 @@ longer trusts `rootInActiveWindow` alone.
   refused. `INCOGNITO_DIAGNOSTIC_BYPASS` turns every private-tab block off so the Incognito
   tab can actually be opened while recording. Both the logger and the bypass must be
   removed and the constant set back to `false` once the guard is rewritten.
+- [x] Part 31 — The AI screenshot cascade can no longer stay silently off. The accessibility
+  config now declares `typeViewScrolled`, so interactive-window scrolling actually arrives
+  and snaps the battery saver back to 1 s; the 1 s foreground ticker calls
+  `HabitGuard.refreshAiScanner()` → `HabitAccessibilityService.refreshAiScanner()`, which
+  routes the real foreground window every second (an app already open when the service
+  connected, one dropped event, a model retry or a reconnect no longer leaves monitoring
+  off for the session); a screenshot callback that never arrives is released after 5 s
+  instead of wedging `isProcessing` forever; and a watched website now also arms in browsers
+  with no known URL-bar view ids (Vivaldi, Kiwi, UC, Opera GX, a renamed Chrome build) by
+  reading the address field of the browser's own top bar, still pruning every WebView. The
+  app/website selection, the 1 s capture loop, the two-stage cascade and the two-screen
+  block were left untouched — they were never deleted.
 
 ## Build & run (Termux, no PC)
 
@@ -750,6 +762,14 @@ bypass), so the development APK must be rebuilt. The accessibility XML already d
 `typeViewClicked` and `typeWindowsChanged`, so the service does not need to be toggled off
 and on after installing it. The dump is truncated on the first browser event after the
 service connects, and this build does not block Incognito / private tabs at all.
+
+Part 31 adds `typeViewScrolled` to the accessibility XML, so the development APK must be
+rebuilt **and the accessibility service toggled off and on once** after installing it:
+Android keeps the old event types until the service reconnects. Everything else is Kotlin
+only. If the AI tab lists apps but the notification never shows a `Watching …` line, the
+cascade is not armed — check that the app is actually selected, that protection and the AI
+master switch are on, and whether the notification reports a model or screenshot error
+instead of staying silent.
 
 Part 28 changes Kotlin only (the layered, screenshot-free private-tab guard), so the
   development APK must be rebuilt. The accessibility XML is unchanged — `typeViewClicked`
