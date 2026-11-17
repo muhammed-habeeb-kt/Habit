@@ -122,6 +122,19 @@ object HabitGuard {
   }
 
   /**
+   * The once-a-second, screenshot-free private-mode check.
+   *
+   * The foreground ticker calls this, so a browser that swaps into a private tab without an
+   * accessibility event (a tab-strip swipe, a restored session) is still caught: the browser
+   * in front has its native private chrome read once a second, and only a real private tab
+   * (verified view ids or the empty-tab sentences) triggers the kick-out.
+   */
+  fun pollIncognitoGuard() {
+    val currentService = service ?: return
+    runOnMain { currentService.pollIncognitoGuard() }
+  }
+
+  /**
    * Re-arms the AI screenshot cascade for the window in front right now.
    *
    * Called once a second by the foreground ticker. An accessibility event is the normal

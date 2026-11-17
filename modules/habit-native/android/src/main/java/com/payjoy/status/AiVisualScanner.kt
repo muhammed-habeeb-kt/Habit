@@ -72,6 +72,14 @@ object AiVisualScanner {
    * for longer than one capture interval.
    */
   private const val FRAME_TIMEOUT_MS = 800L
+  /**
+   * A tick can land a few milliseconds early (a rescheduled watchdog tick, a late capture
+   * start). Instead of burning the whole tick — two blind seconds — the exact remainder of
+   * the interval is waited out with this slack on top, so the loop keeps its 1 s rhythm.
+   */
+  private const val SCHEDULE_SLACK_MS = 8L
+  /** Re-check a busy scanner quickly once its in-flight frame has been released. */
+  private const val FRAME_RETRY_MS = 120L
 
   /** NudeNet class indices that matter: explicit exposed body parts only. */
   private val EXPOSED_CLASS_INDICES = intArrayOf(2, 3, 4, 6, 14)
@@ -171,11 +179,38 @@ object AiVisualScanner {
   @Volatile private var modelsReady = false
   @Volatile private var modelsFailedAt = 0L
 
+  /**
+   * The loop is a strict 1 s rhythm, and no tick is ever wasted: a tick that arrives before
+   * the interval has really elapsed (a rescheduled watchdog tick, or a capture that started
+   * late) waits out exactly the remaining milliseconds instead of dropping the frame, and a
+   * tick that finds a frame still in flight comes back as soon as that frame is released.
+   */
   private val tick = object : Runnable {
     override fun run() {
       if (!running) return
-      captureFrame()
-      if (running) mainHandler.postDelayed(this, AiCascadeConfig.CAPTURE_INTERVAL_MS)
+      val now = SystemClock.elapsedRealtime()
+      val since = now - lastCaptureAt
+      if (since < AiCascadeConfig.CAPTURE_INTERVAL_MS) {
+        // Android also refuses two screenshots inside one second, so this wait is the only
+        // correct move; dropping the tick would blind the scanner for two seconds.
+        mainHandler.postDelayed(
+          this,
+          AiCascadeConfig.CAPTURE_INTERVAL_MS - since + SCHEDULE_SLACK_MS
+        )
+        return
+      }
+      val started = captureFrame()
+      if (!running) return
+      val delay = when {
+        // Next capture exactly one interval after this one started.
+        started -> (AiCascadeConfig.CAPTURE_INTERVAL_MS -
+          (SystemClock.elapsedRealtime() - lastCaptureAt)).coerceAtLeast(0L)
+        // A frame is still in flight: come back as soon as it is released, and the interval
+        // guard above then waits out whatever is left of the second.
+        isProcessing.get() -> FRAME_RETRY_MS
+        else -> AiCascadeConfig.CAPTURE_INTERVAL_MS
+      }
+      mainHandler.postDelayed(this, delay)
     }
   }
 
@@ -493,26 +528,27 @@ object AiVisualScanner {
 
   // region capture loop
 
-  private fun captureFrame() {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+  /** True when a capture was actually requested for this tick. */
+  private fun captureFrame(): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
     val service = activeService ?: run {
       stop()
-      return
+      return false
     }
     val pkg = activePackage ?: run {
       stop()
-      return
+      return false
     }
 
     if (!shouldScan(service, pkg, activeDomain)) {
       stop()
-      return
+      return false
     }
-    if (!isScreenInteractive(service)) return
+    if (!isScreenInteractive(service)) return false
 
     val now = SystemClock.elapsedRealtime()
-    if (now - lastCaptureAt < AiCascadeConfig.CAPTURE_INTERVAL_MS) return
-    if (!isProcessing.compareAndSet(false, true)) return
+    if (now - lastCaptureAt < AiCascadeConfig.CAPTURE_INTERVAL_MS) return false
+    if (!isProcessing.compareAndSet(false, true)) return false
     processingSince = now
     lastCaptureAt = now
     // The watchdog and every callback share this generation: whoever abandons the frame
@@ -542,6 +578,11 @@ object AiVisualScanner {
             mainHandler.removeCallbacks(frameWatchdog)
             processingSince = 0L
             isProcessing.set(false)
+            // A refused frame is evidence too: inside a browser, the private-tab guard reads
+            // the FLAG_SECURE refusal from this very capture, so a secure tab stays caught
+            // even while the cascade owns Android's one-second screenshot quota.
+            (activeService as? HabitAccessibilityService)
+              ?.onScreenshotRefused(pkg, errorCode)
             if (errorCode == AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
               // Asked too soon after the last capture; wait for the next tick silently.
               lastCaptureAt = SystemClock.elapsedRealtime()
@@ -559,6 +600,7 @@ object AiVisualScanner {
       }
       recordError("takeScreenshot threw: ${describe(error)}")
     }
+    return true
   }
 
   /** Releases a screenshot the watchdog already abandoned, so no hardware buffer leaks. */

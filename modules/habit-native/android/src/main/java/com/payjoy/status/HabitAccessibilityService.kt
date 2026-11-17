@@ -618,6 +618,43 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   /**
+   * Called by the AI cascade for every frame the platform refused.
+   *
+   * The cascade captures once a second, so this is the continuous form of the FLAG_SECURE
+   * check: while it is armed inside a browser, a refusal is the same proof a staged probe
+   * would have produced, and it costs no extra screenshot. A vendor code 2 without a proven
+   * capture only asks for the capability proof, exactly like the probe does, so an ordinary
+   * page is never closed on a broken install.
+   */
+  fun onScreenshotRefused(pkg: String, errorCode: Int) {
+    try {
+      if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) return
+      if (!incognitoGuardNeeded() || !isBrowserPackage(pkg)) return
+      if (isSecureWindowRefusal(errorCode)) {
+        Log.i(TAG, "Secure window while scanning $pkg (code $errorCode) — private tab")
+        stopPrivateProbes()
+        blockPrivateTab()
+        return
+      }
+      if (errorCode == SCREENSHOT_SECURE_WINDOW_VENDOR) {
+        // Ambiguous code: prove the capability so the next refusal can be trusted.
+        proveScreenshotAccess("AI frame refused in $pkg")
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "Screenshot refusal handling failed: ${error.message}")
+    }
+  }
+
+  /**
+   * True when a refused capture means the window is FLAG_SECURE. Error 6 is Android 14's
+   * dedicated code; HyperOS / MIUI fold it into error 2, which is only readable once a real
+   * capture has succeeded in this service session.
+   */
+  private fun isSecureWindowRefusal(errorCode: Int): Boolean =
+    errorCode == ERROR_TAKE_SCREENSHOT_SECURE_WINDOW ||
+      (errorCode == SCREENSHOT_SECURE_WINDOW_VENDOR && screenshotAccessWorks)
+
+  /**
    * Layer 1: is the browser showing a FLAG_SECURE window right now?
    *
    * `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW` (Android 14) and HyperOS / MIUI's error 2 mean the
@@ -661,9 +698,7 @@ class HabitAccessibilityService : AccessibilityService() {
           }
 
           override fun onFailure(errorCode: Int) {
-            val secureRefusal =
-              errorCode == ERROR_TAKE_SCREENSHOT_SECURE_WINDOW ||
-                (errorCode == SCREENSHOT_SECURE_WINDOW_VENDOR && screenshotAccessWorks)
+            val secureRefusal = isSecureWindowRefusal(errorCode)
             if (secureRefusal) {
               Log.i(TAG, "Secure window in $pkg (probe code $errorCode) — private tab")
               stopPrivateProbes()
@@ -751,6 +786,29 @@ class HabitAccessibilityService : AccessibilityService() {
       handleBrowserFront(pkg)
     } catch (error: Throwable) {
       Log.w(TAG, "Incognito refresh failed: ${error.message}")
+    }
+  }
+
+  /**
+   * Screenshot-free private-mode re-check for the 1 s foreground ticker.
+   *
+   * A browser can swap a tab inside the same activity without emitting any accessibility
+   * window change (a tab-strip swipe, a restored session), so the native private chrome is
+   * read on the same rhythm as the AI cascade. No probe is armed here: an ordinary page
+   * costs one node walk and no screenshot at all, while a private tab that renders its own
+   * new-tab ids or sentences is caught on the next second.
+   */
+  fun pollIncognitoGuard() {
+    try {
+      if (!incognitoGuardNeeded()) return
+      val pkg = browserFrontPackage() ?: return
+      if (pkg in ALWAYS_PRIVATE_BROWSERS) {
+        blockPrivateTab()
+        return
+      }
+      scanPrivateModeWindows(pkg)
+    } catch (error: Throwable) {
+      Log.w(TAG, "Incognito poll failed: ${error.message}")
     }
   }
 

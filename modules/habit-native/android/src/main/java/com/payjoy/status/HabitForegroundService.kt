@@ -35,6 +35,10 @@ class HabitForegroundService : Service() {
         // once-a-second path that re-arms it when an event was missed or the loop stopped
         // while the watched app / website is still in front.
         HabitGuard.refreshAiScanner()
+        // Independent private-tab check: a browser can swap tabs inside the same activity
+        // without any accessibility window change, and a private tab must never survive a
+        // second. Screenshot-free (native chrome only), so it costs one node walk.
+        HabitGuard.pollIncognitoGuard()
         // Includes the live AI line, so the notification updates once a second while a
         // watched app is being scanned (frames, both scores, verdict or the exact error).
         val text = notificationText()

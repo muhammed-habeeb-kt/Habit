@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-17 (Part 34: fixed 1 s full-screen AI scan, no pixel gate or slow-down)_
+_Last updated: 2026-11-17 (Part 35: no AI tick is ever skipped and FLAG_SECURE stays live)_
 
 ## Product
 
@@ -241,6 +241,12 @@ section lists the surface area and the rules the engine keeps.
    `AiCascadeConfig.kt`. Nothing is written to disk; buffers and bitmaps are closed or
    recycled in `finally`, and `isProcessing` is always released there so the next tick can
    never wedge on a stuck frame.
+
+   The tick itself is lossless (Part 35): a tick that lands a few milliseconds before the
+   interval has really elapsed waits out exactly the remainder (`+ 8 ms` slack) instead of
+   dropping the frame — previously that early tick cost a whole extra second — and a tick
+   that finds a frame still in flight retries 120 ms later instead of a full second, so the
+   next capture starts the moment the previous one is released.
 2. **Hook point** — `HabitAccessibilityService.updateAiScanner(pkg)` runs for every accepted
    event (window state changed, windows changed, content changed, text changed, scrolled),
    because a monitored app can become visible without a window-state change. The router
@@ -270,7 +276,10 @@ section lists the surface area and the rules the engine keeps.
    photo, a short clip or a still image is caught on the first frame that saw it.
 5. **Verdict** — `HabitGuard.onAiMatch(context, "<pkg>:ai-screenshot", appLabel)` keeps the
    5-second dedupe stable, shows `• AI • APP`, presses Back before the overlay takes focus,
-   and falls back to Home when the overlay was refused.
+   and falls back to Home when the overlay was refused. A refused capture is not swallowed
+   either: `onScreenshotRefused(pkg, code)` hands the FLAG_SECURE refusal of a browser frame
+   to the private-tab guard (Part 35), so the secure-window layer keeps running even while
+   the cascade owns Android's one-per-second screenshot quota.
 6. **Diagnostics** — `getAiScannerStatus` / `testAiModels` / `canDrawOverlays` on the bridge;
    live notification line (`Watching Telegram • Frame #12 • mob: 0.14 • nude: 0.02`,
    or `AI Model Error: <reason>` when a model cannot load), and
@@ -423,10 +432,15 @@ never read.
    (Android 14, 6) always blocks; HyperOS / MIUI’s error 2 blocks only after a successful
    capture in the same service session, because error 2 is also the code for a missing
    `canTakeScreenshot` grant and blocking on it blindly would close normal pages. Since
-   Part 34 that proof no longer waits for luck: `proveScreenshotAccess` captures once 800 ms
+   Part 34 that proof no longer waits for luck:   `proveScreenshotAccess` captures once 800 ms
    after the service connects (and retries from any non-browser app, at most 30 times), and
    every frame the AI cascade captures reports through `onScreenshotCaptured()`, so a code 2
    inside Chrome or Brave is a real private tab and BACK + HOME + `• INCOGNITO BLOCKED` fire.
+   Since Part 35 the cascade's own refusals are part of the layer: `onScreenshotRefused`
+   turns the secure-window code of a browser frame into the same block, and the foreground
+   ticker runs `pollIncognitoGuard` once a second — a screenshot-free walk of the browser in
+   front for the private ids and sentences — so a tab swapped inside the same activity with
+   no accessibility event still cannot survive a second.
 4. **Layer 3, browser scope** — every installed browser comes from `PackageManager` (cached,
    refreshed on package changes, `<queries>` intent declared). Firefox Focus and Tor
    Browser have no normal mode, so entering them blocks immediately.
@@ -666,6 +680,12 @@ longer trusts `rootInActiveWindow` alone.
   any frame they inherit. Crops kept a full-width layout; Part 34 then removed the last 8%
   trim. `INCOGNITO_DIAGNOSTIC_BYPASS` no longer exists — the verified private-tab guard and
   its `FLAG_SECURE` fallback stay as described in Part 32.
+- [x] Part 35 — No frame is ever lost and the secure-window layer is continuous. The AI tick
+  waits out the exact remainder of its interval instead of dropping an early tick (and
+  retries 120 ms after a busy frame) so the cascade is a true 1000 ms rhythm; a refused
+  browser capture feeds `onScreenshotRefused` into the private-tab guard; and the 1 s
+  foreground ticker polls the browser in front for native private chrome, with no screenshot
+  and no probe, so a tab swap that emits no event is caught.
 - [x] Part 34 — The brutal pipeline is back. The pixel-diff gate, the 2200 ms adaptive
   interval, `noteUserActivity()` and the 8% top trim are all deleted: every 1000 ms tick
   takes a screenshot and classifies three full-width squares that together cover the entire
@@ -776,6 +796,10 @@ Part 34 changes Kotlin only (the fixed 1 s full-screen loop, the instant stage-1
 unconditional in-flight release and the screenshot-capability proof), so the development
 APK must be rebuilt. The manifest and the accessibility XML are unchanged, so the service
 does not need to be toggled off and on after installing it.
+
+Part 35 changes Kotlin only (the lossless 1 s AI tick, the refused-capture hook and the
+once-a-second private-tab poll), so the development APK must be rebuilt. The manifest and the
+accessibility XML are unchanged, so the service does not need to be toggled off and on.
 
 Part 33 changes Kotlin only (single-frame blocking, the 800 ms frame watchdog and the
 capture generation), so the development APK must be rebuilt. The manifest and the
