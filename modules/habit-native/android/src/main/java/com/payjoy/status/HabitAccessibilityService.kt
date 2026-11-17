@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -19,6 +20,9 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import androidx.core.content.ContextCompat
+import java.io.File
+import java.io.FileOutputStream
+import java.util.concurrent.Executors
 
 /**
  * Watches browser windows and blocks adult pages.
@@ -69,6 +73,18 @@ class HabitAccessibilityService : AccessibilityService() {
    */
   @Volatile private var isHabitAppInfoContext = false
   private var habitAppInfoContextAt = 0L
+  //
+  // TEMPORARY (Part 30): the browser node-tree X-ray. Chrome and Brave change their private
+  // chrome between releases, so this build records exactly what Android reports on this
+  // device while an Incognito / Private tab is opened. All of it is deleted when the
+  // diagnostic build is replaced.
+  //
+  /** Keeps a large dump off the service's main thread; one write at a time, in order. */
+  private val browserDumpExecutor = Executors.newSingleThreadExecutor()
+  /** True once this service session has truncated the previous dump file. */
+  private var browserDumpSessionStarted = false
+  /** Logged once if the public Downloads file is refused, so the log is not spammed. */
+  private var browserDumpFallbackLogged = false
 
   override fun onServiceConnected() {
     super.onServiceConnected()
@@ -117,6 +133,12 @@ class HabitAccessibilityService : AccessibilityService() {
     // Remember (or forget) which browser is in front before anything else: a private
     // window can hide its accessibility root, and the watchdog still has to probe it.
     noteBrowserFront(pkg)
+
+    // TEMPORARY (Part 30): record Chrome's / Brave's whole native node tree for every
+    // window change and tap, so the real private-tab chrome can be captured on-device.
+    if (pkg in BROWSER_DUMP_PACKAGES && safeEvent.eventType in BROWSER_DUMP_EVENT_TYPES) {
+      logBrowserDump(safeEvent, pkg)
+    }
 
     // Tamper shield: Android Settings, the vendor security centre and the installers are
     // read on every event with no throttle at all, and the moment one of them is in front
@@ -288,6 +310,183 @@ class HabitAccessibilityService : AccessibilityService() {
       }
     } catch (error: Throwable) {
       Log.w(TAG, "AI scanner routing failed: ${error.message}")
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // TEMPORARY (Part 30): accessibility node-tree X-ray for Chrome and Brave.
+  //
+  // Every window change and every tap inside those two browsers appends a full native node
+  // dump to `Download/habit_browser_dump.txt`, stopping at WebView / GeckoView subtrees so
+  // page content never fills the file. This exists only to learn what this phone actually
+  // reports while a private tab is opened; it stores no URL, no page text and no history.
+  // Delete this block, the event hook and the companion constants once the guard is fixed.
+  // ---------------------------------------------------------------------------------------
+
+  /** Builds the dump on the event thread (node infos stay valid) and writes it off-thread. */
+  private fun logBrowserDump(event: AccessibilityEvent, pkg: String) {
+    val dump = try {
+      buildBrowserDump(event, pkg)
+    } catch (error: Throwable) {
+      "\n=== EVENT DUMP FAILED: ${error.message} ===\n"
+    }
+    try {
+      browserDumpExecutor.execute { writeBrowserDump(dump) }
+    } catch (error: Throwable) {
+      Log.w(TAG, "Browser dump queue refused: ${error.message}")
+    }
+  }
+
+  private fun buildBrowserDump(event: AccessibilityEvent, pkg: String): String {
+    val out = StringBuilder(8_192)
+    out.append("\n=== EVENT: ")
+      .append(AccessibilityEvent.eventTypeToString(event.eventType))
+      .append(" | Pkg: ").append(pkg)
+      .append(" | Class: ").append(event.className ?: "null")
+      .append(" ===\n")
+
+    val roots = browserRoots(pkg)
+    if (roots.isEmpty()) out.append("(no readable window root)\n")
+    val budget = intArrayOf(BROWSER_DUMP_NODE_BUDGET)
+    for (root in roots) {
+      out.append("--- WINDOW ---\n")
+      appendBrowserDumpNodes(root, 0, budget, out)
+      if (budget[0] <= 0) break
+    }
+    if (budget[0] <= 0) out.append("(node budget reached)\n")
+    return out.toString()
+  }
+
+  /**
+   * One depth-first pass of a window. Page content is pruned at every WebView / GeckoView,
+   * so only browser chrome is written. Invisible containers are still descended into
+   * (HyperOS reports some of them invisible), but only visible nodes are logged.
+   */
+  private fun appendBrowserDumpNodes(
+    node: AccessibilityNodeInfo,
+    depth: Int,
+    budget: IntArray,
+    out: StringBuilder
+  ) {
+    if (budget[0] <= 0 || depth > BROWSER_DUMP_MAX_DEPTH) return
+    budget[0] -= 1
+
+    val className = try {
+      node.className?.toString() ?: ""
+    } catch (error: Throwable) {
+      ""
+    }
+    if (isWebViewClass(className)) return
+
+    val visible = try {
+      node.isVisibleToUser
+    } catch (error: Throwable) {
+      false
+    }
+    if (visible) {
+      val viewId = try {
+        node.viewIdResourceName ?: ""
+      } catch (error: Throwable) {
+        ""
+      }
+      val text = try {
+        node.text
+      } catch (error: Throwable) {
+        null
+      }
+      val description = try {
+        node.contentDescription
+      } catch (error: Throwable) {
+        null
+      }
+      val selected = try {
+        node.isSelected
+      } catch (error: Throwable) {
+        false
+      }
+      out.append("Depth: ").append(depth)
+        .append(" | Class: [").append(className)
+        .append("] | ID: [").append(viewId)
+        .append("] | Text: [").append(dumpValue(text))
+        .append("] | Desc: [").append(dumpValue(description))
+        .append("] | Selected: [").append(selected)
+        .append("]\n")
+    }
+
+    val children = try {
+      node.childCount
+    } catch (error: Throwable) {
+      0
+    }
+    for (index in 0 until minOf(children, BROWSER_DUMP_CHILD_LIMIT)) {
+      val child = try {
+        node.getChild(index)
+      } catch (error: Throwable) {
+        null
+      } ?: continue
+      appendBrowserDumpNodes(child, depth + 1, budget, out)
+      if (budget[0] <= 0) return
+    }
+  }
+
+  /** One line per value: newlines collapsed, long page titles cut, null as an empty pair. */
+  private fun dumpValue(raw: CharSequence?): String {
+    if (raw == null) return ""
+    val flat = raw.toString().replace(WHITESPACE, " ").trim()
+    return if (flat.length > BROWSER_DUMP_VALUE_MAX) {
+      flat.substring(0, BROWSER_DUMP_VALUE_MAX) + "…"
+    } else {
+      flat
+    }
+  }
+
+  /**
+   * Appends to `Download/habit_browser_dump.txt`, truncating it on the first write of a
+   * service session so one log is one session. A refused public path (strict scoped
+   * storage) falls back to the app's own files directory instead of crashing, and the
+   * fallback path is logged once.
+   */
+  @Suppress("DEPRECATION")
+  private fun writeBrowserDump(text: String) {
+    val publicFile = File(
+      Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+      BROWSER_DUMP_FILE_NAME
+    )
+    val fallbackFile = File(filesDir, BROWSER_DUMP_FILE_NAME)
+    try {
+      if (!browserDumpSessionStarted) {
+        browserDumpSessionStarted = true
+        // Best effort only: an old dump owned by another install is left untouched.
+        try {
+          publicFile.delete()
+        } catch (error: Throwable) {
+          // Nothing to clean up.
+        }
+        val header = "=== HABIT BROWSER DUMP (${System.currentTimeMillis()}) ===\n"
+        writeDumpChunk(publicFile, header + text, append = false)
+      } else {
+        writeDumpChunk(publicFile, text, append = true)
+      }
+    } catch (error: Throwable) {
+      if (!browserDumpFallbackLogged) {
+        browserDumpFallbackLogged = true
+        Log.w(
+          TAG,
+          "Browser dump fell back to $fallbackFile: ${error.message}"
+        )
+      }
+      try {
+        writeDumpChunk(fallbackFile, text, append = true)
+      } catch (fallbackError: Throwable) {
+        Log.w(TAG, "Browser dump write failed: ${fallbackError.message}")
+      }
+    }
+  }
+
+  private fun writeDumpChunk(file: File, text: String, append: Boolean) {
+    FileOutputStream(file, append).use { stream ->
+      stream.write(text.toByteArray(Charsets.UTF_8))
+      stream.flush()
     }
   }
 
@@ -595,13 +794,23 @@ class HabitAccessibilityService : AccessibilityService() {
     }
   }
 
-  /** Protection and the incognito switch are both required before any work is done. */
-  private fun incognitoGuardNeeded(): Boolean = try {
-    HabitStore.state(this).protectionEnabled &&
-      HabitStore.aiSettings(this).incognitoBlockingEnabled
-  } catch (error: Throwable) {
-    Log.w(TAG, "Incognito state unreadable: ${error.message}")
-    false
+  /**
+   * Protection and the incognito switch are both required before any work is done.
+   *
+   * TEMPORARY (Part 30): the whole private-tab guard is off while the node-tree X-ray
+   * ships, because it has to be possible to actually open Chrome's / Brave's Incognito tab
+   * and record its chrome. Set [INCOGNITO_DIAGNOSTIC_BYPASS] back to false to restore every
+   * layer (the click guard, the chrome walk and the always-private browsers).
+   */
+  private fun incognitoGuardNeeded(): Boolean {
+    if (INCOGNITO_DIAGNOSTIC_BYPASS) return false
+    return try {
+      HabitStore.state(this).protectionEnabled &&
+        HabitStore.aiSettings(this).incognitoBlockingEnabled
+    } catch (error: Throwable) {
+      Log.w(TAG, "Incognito state unreadable: ${error.message}")
+      false
+    }
   }
 
   /**
@@ -1352,6 +1561,7 @@ class HabitAccessibilityService : AccessibilityService() {
     unregisterBrowserPackageReceiver()
     AiVisualScanner.release()
     HabitGuard.detach()
+    browserDumpExecutor.shutdown()
     super.onDestroy()
   }
 
@@ -1429,6 +1639,26 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val PRIVATE_CHILD_LIMIT = 200
     /** Whitespace collapsed by [normalizeLabel]. */
     private val WHITESPACE = Regex("\\s+")
+
+    /**
+     * TEMPORARY (Part 30): while true, no Incognito / private-tab block fires, so the user
+     * can open a private tab and the node-tree X-ray can record its chrome.
+     */
+    private const val INCOGNITO_DIAGNOSTIC_BYPASS = true
+    /** Browsers whose node tree is written to the dump file. */
+    private val BROWSER_DUMP_PACKAGES = setOf("com.android.chrome", "com.brave.browser")
+    private val BROWSER_DUMP_EVENT_TYPES = setOf(
+      AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+      AccessibilityEvent.TYPE_WINDOWS_CHANGED,
+      AccessibilityEvent.TYPE_VIEW_CLICKED
+    )
+    private const val BROWSER_DUMP_FILE_NAME = "habit_browser_dump.txt"
+    /** Runaway guards: the browser's own chrome is small once page content is pruned. */
+    private const val BROWSER_DUMP_NODE_BUDGET = 4_000
+    private const val BROWSER_DUMP_MAX_DEPTH = 60
+    private const val BROWSER_DUMP_CHILD_LIMIT = 200
+    /** Longest text / description kept per node, so one page title cannot fill a line. */
+    private const val BROWSER_DUMP_VALUE_MAX = 200
 
     /**
      * Overlay packages that are never treated as a different foreground app: the system UI

@@ -640,6 +640,15 @@ longer trusts `rootInActiveWindow` alone.
   `com.payjoy.status`. The tamper shield and the transient-overlay check no longer hard-code
   any app id: they compare against the running `packageName`. No `com.habit.guardian`
   reference exists anywhere in the tree.
+- [x] Part 30 (temporary, diagnostic) — Chrome / Brave accessibility node-tree X-ray and
+  private-tab guard bypass. Every `TYPE_WINDOW_STATE_CHANGED`, `TYPE_WINDOWS_CHANGED` and
+  `TYPE_VIEW_CLICKED` from `com.android.chrome` / `com.brave.browser` appends the visible
+  browser-chrome nodes (depth, class, view id, text, contentDescription, selected) to
+  `Download/habit_browser_dump.txt`, pruning every WebView / GeckoView and writing off the
+  main thread, with the app's files directory as the fallback if the public path is
+  refused. `INCOGNITO_DIAGNOSTIC_BYPASS` turns every private-tab block off so the Incognito
+  tab can actually be opened while recording. Both the logger and the bypass must be
+  removed and the constant set back to `false` once the guard is rewritten.
 
 ## Build & run (Termux, no PC)
 
@@ -735,6 +744,12 @@ XML are unchanged, so the service does not need to be toggled off and on.Part 29
   accessibility, notifications and — for Aggressive — device admin again. The encrypted
   state belongs to the old id, so protection starts from a clean install. The accessibility
   XML is unchanged; a fresh install reconnects the service anyway.
+
+Part 30 changes Kotlin only (the temporary browser node-tree dump and the private-tab guard
+bypass), so the development APK must be rebuilt. The accessibility XML already declares
+`typeViewClicked` and `typeWindowsChanged`, so the service does not need to be toggled off
+and on after installing it. The dump is truncated on the first browser event after the
+service connects, and this build does not block Incognito / private tabs at all.
 
 Part 28 changes Kotlin only (the layered, screenshot-free private-tab guard), so the
   development APK must be rebuilt. The accessibility XML is unchanged — `typeViewClicked`
