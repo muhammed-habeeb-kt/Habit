@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-16 (Part 29: one `com.payjoy.status` id for app, namespace and module)_
+_Last updated: 2026-11-17 (Part 33: instant single-frame AI blocking, 800 ms frame watchdog)_
 
 ## Product
 
@@ -262,11 +262,10 @@ section lists the surface area and the rules the engine keeps.
    `Porn + Hentai` `0.20`, `Sexy` `0.48` or NudeNet `s_nude_max` `0.20`; stage 2 (NudeNet
    320n, `FLOAT32 [N,3,H,W] -> [N,22,A]`) is additive only, runs on tiles that crossed the
    0.05 / porn 0.015 gate, and ignores only boxes smaller than 6% of the crop side. Blocking
-   is a 2-screen confirmation: a positive Frame 1 flags the screen and Frame 2 must be
-   positive too; a safe Frame 2 clears the flag. A clearly explicit frame (combined `0.65`,
-   porn `0.40` or nude `0.40`) blocks instantly on Frame 1. The pixel gate is bypassed while
-   a positive frame waits for Frame 2 and whenever the last stage-1 score was `>= 0.08`, so
-   a static image can never dodge confirmation.
+   is **single-frame and instant**: the first frame with any positive tile closes the app.
+   There is no confirmation frame, so a fast scroll past a photo or a short clip is never
+   missed. The pixel gate is bypassed whenever the last stage-1 score was `>= 0.08`, so a
+   static explicit image is re-scored on the next frame instead of being skipped.
 5. **Verdict** — `HabitGuard.onAiMatch(context, "<pkg>:ai-screenshot", appLabel)` keeps the
    5-second dedupe stable, shows `• AI • APP`, presses Back before the overlay takes focus,
    and falls back to Home when the overlay was refused.
@@ -650,6 +649,19 @@ longer trusts `rootInActiveWindow` alone.
   staged `FLAG_SECURE` probe (+900 / +2000 / +3200 ms, error 6 always, vendor error 2 after
   a proven capture) covers a private tab that navigated away from its new-tab page. Nothing
   broad like "incognito" is ever matched, so a normal Chrome home page stays untouched.
+- [x] Part 33 — Accuracy restored, no confirmation wait. The strict 2-screen rule and its
+  `consecutivePositiveFrames` counter are gone: one positive frame (combined `0.38`,
+  `Porn + Hentai` `0.20`, `Sexy` `0.48`, NudeNet `0.20`, with the skin / Hentai gates still
+  applied) blocks on the spot, so a scroll-past or a two-second clip can no longer be
+  cleared by the next frame. The HyperOS screenshot wedge is cut from 5 s to
+  `FRAME_TIMEOUT_MS = 800` via a main-thread `frameWatchdog` that abandons the frame on
+  time even in the relaxed 2.2 s interval, releases the in-flight lock, drops the pixels and
+  puts the loop back on the 1 s rhythm; a capture generation makes every late callback
+  stale, so it can neither be analysed out of order nor clear the next capture's lock, and
+  `start` / `stop` invalidate any frame they inherit. Crops were already wider than the
+  report's 8% / 10% ask (full width, top 8% only), and `INCOGNITO_DIAGNOSTIC_BYPASS` no
+  longer exists — the verified private-tab guard and its `FLAG_SECURE` fallback stay as
+  described in Part 32.
 
 ## Build & run (Termux, no PC)
 
@@ -745,6 +757,10 @@ XML are unchanged, so the service does not need to be toggled off and on.Part 29
   accessibility, notifications and — for Aggressive — device admin again. The encrypted
   state belongs to the old id, so protection starts from a clean install. The accessibility
   XML is unchanged; a fresh install reconnects the service anyway.
+
+Part 33 changes Kotlin only (single-frame blocking, the 800 ms frame watchdog and the
+capture generation), so the development APK must be rebuilt. The manifest and the
+accessibility XML are unchanged, so the service does not need to be toggled off and on.
 
 Part 32 changes Kotlin only (the diagnostic dump removed, the verified private-tab ids and
 sentences, and the staged `FLAG_SECURE` probe), so the development APK must be rebuilt. The

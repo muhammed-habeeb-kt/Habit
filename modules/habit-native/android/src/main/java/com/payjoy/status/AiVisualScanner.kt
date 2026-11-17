@@ -40,11 +40,11 @@ import kotlin.math.min
  *  - Stage 1 (TFLite MobileNetV2, 224x224, XNNPACK + fp16) scores three squares of the
  *    screen, and stage 2 (ONNX NudeNet 320n, 320x320) adds explicit-body detections on the
  *    tiles stage 1 found suspicious.
- *  - Blocking is a strict 2-screen confirmation: a positive Frame 1 only flags the screen,
- *    and only a positive Frame 2 closes the app. A safe Frame 2 clears the flag.
- *  - Stage 0 is free: a 16x16 pixel-diff gate skips both models when the screen is static,
- *    except while a positive frame is waiting for its confirmation, and a run of safe
- *    frames relaxes the capture interval.
+ *  - Blocking is instant: the first frame whose tiles reach the POSITIVE levels closes the
+ *    app, so a fast scroll or a two-second clip is never missed while a second frame would
+ *    have been confirming it.
+ *  - Stage 0 is free: a 16x16 pixel-diff gate skips both models when the screen is static
+ *    and the last frame was safe, and a run of safe frames relaxes the capture interval.
  *
  * Nothing is ever written to disk and every frame always blocks for real: the calibration
  * recorder is gone, so there is no dry-run switch left to suppress a block screen. Every
@@ -65,10 +65,12 @@ object AiVisualScanner {
   private const val MODEL_RETRY_MS = 15_000L
   /**
    * A screenshot callback that never arrives (HyperOS drops one now and then) would keep
-   * [isProcessing] true forever and the cascade would analyse zero frames for the rest of
-   * the session. After this long the in-flight guard is released and the frame is retried.
+   * [isProcessing] true and the cascade would analyse zero frames while it waits. After
+   * this long the frame is abandoned: its pixels are dropped, the in-flight guard is
+   * released and the next 1 s tick fires a fresh capture, so the scanner is never blind
+   * for longer than one capture interval.
    */
-  private const val FRAME_TIMEOUT_MS = 5_000L
+  private const val FRAME_TIMEOUT_MS = 800L
 
   /** NudeNet class indices that matter: explicit exposed body parts only. */
   private val EXPOSED_CLASS_INDICES = intArrayOf(2, 3, 4, 6, 14)
@@ -121,13 +123,15 @@ object AiVisualScanner {
 
   /** One capture + inference in flight; a tick that arrives meanwhile is dropped. */
   private val isProcessing = AtomicBoolean(false)
-  /** When the in-flight capture started, so a lost callback cannot wedge the loop. */
+  /** When the in-flight capture started, so the 800 ms watchdog can judge it. */
   @Volatile private var processingSince = 0L
   /**
-   * Consecutive positive (18+) screens. Frame 1 only flags the screen; Frame 2 blocks.
-   * A safe frame resets this to 0.
+   * Bumped for every capture and for every frame that is abandoned (the 800 ms watchdog
+   * fired, or the loop stopped). A callback with a stale generation releases its buffer and
+   * is otherwise ignored, so it can never analyse an outdated screen or clear the next
+   * capture's in-flight guard.
    */
-  private val consecutivePositiveFrames = AtomicInteger(0)
+  private val captureGeneration = AtomicInteger(0)
   /** Frames the static-screen gate skipped; diagnostics only, they cost no inference. */
   @Volatile private var skippedFrames = 0
 
@@ -189,6 +193,43 @@ object AiVisualScanner {
     }
   }
 
+  /**
+   * HyperOS drops a `takeScreenshot` callback now and then. The watchdog runs on the main
+   * thread 800 ms after every capture starts, so a dropped frame is abandoned on time even
+   * while the loop is in its relaxed 2.2 s interval, instead of waiting for the next tick.
+   */
+  private val frameWatchdog = object : Runnable {
+    override fun run() {
+      if (!isProcessing.get()) return
+      val startedAt = processingSince
+      if (startedAt == 0L) return
+      if (SystemClock.elapsedRealtime() - startedAt < FRAME_TIMEOUT_MS) return
+      abandonFrame("screenshot callback timed out after ${FRAME_TIMEOUT_MS} ms; retrying")
+    }
+  }
+
+  /**
+   * Gives up on the frame that is in flight right now: its late callback must not reach the
+   * models or clear the next capture's lock, so its generation is invalidated first, then
+   * the lock is released and the loop is put back on the fast 1 s rhythm so the next fresh
+   * screenshot is taken as soon as the interval allows.
+   */
+  private fun abandonFrame(reason: String) {
+    captureGeneration.incrementAndGet()
+    processingSince = 0L
+    isProcessing.set(false)
+    if (running) {
+      // A movie-watching loop must not stay relaxed after a dropped frame.
+      captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
+      safeStreak = 0
+      mainHandler.removeCallbacks(tick)
+      val wait = (AiCascadeConfig.CAPTURE_INTERVAL_MS -
+        (SystemClock.elapsedRealtime() - lastCaptureAt)).coerceAtLeast(0L)
+      mainHandler.postDelayed(tick, wait)
+    }
+    recordError(reason)
+  }
+
   val isRunning: Boolean
     get() = running
 
@@ -235,10 +276,15 @@ object AiVisualScanner {
     activeBounds = windowBounds?.let { Rect(it) }
     // A website block names the site (`• AI • TELEGRAM.ORG`); an app block names the app.
     appLabel = domain?.uppercase() ?: appLabelFor(service.applicationContext, packageName)
+    // A frame from an earlier loop (or one the watchdog abandoned) must never block the
+    // first capture of this one: its callback is stale, so it is invalidated here.
+    mainHandler.removeCallbacks(frameWatchdog)
+    captureGeneration.incrementAndGet()
+    processingSince = 0L
+    isProcessing.set(false)
     running = true
     frameCount = 0
     skippedFrames = 0
-    consecutivePositiveFrames.set(0)
     safeStreak = 0
     captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
     hasSafeGrid = false
@@ -251,11 +297,16 @@ object AiVisualScanner {
   fun stop() {
     running = false
     mainHandler.removeCallbacks(tick)
+    mainHandler.removeCallbacks(frameWatchdog)
+    // Any callback still in flight belongs to a frame nobody wants any more, and its
+    // generation guard means it will never release this lock itself.
+    captureGeneration.incrementAndGet()
+    processingSince = 0L
+    isProcessing.set(false)
     activeService = null
     activePackage = null
     activeDomain = null
     activeBounds = null
-    consecutivePositiveFrames.set(0)
     safeStreak = 0
     captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
     // The next app starts on a new screen, so its first frame is always analyzed.
@@ -501,17 +552,15 @@ object AiVisualScanner {
 
     val now = SystemClock.elapsedRealtime()
     if (now - lastCaptureAt < captureIntervalMs) return
-    if (!isProcessing.compareAndSet(false, true)) {
-      val startedAt = processingSince
-      if (startedAt != 0L && now - startedAt >= FRAME_TIMEOUT_MS) {
-        processingSince = 0L
-        isProcessing.set(false)
-        recordError("screenshot callback timed out; retrying")
-      }
-      return
-    }
+    if (!isProcessing.compareAndSet(false, true)) return
     processingSince = now
     lastCaptureAt = now
+    // The watchdog and every callback share this generation: whoever abandons the frame
+    // first invalidates the other's callback, so a dropped frame can never wedge the loop
+    // or be analysed out of order.
+    val generation = captureGeneration.incrementAndGet()
+    mainHandler.removeCallbacks(frameWatchdog)
+    mainHandler.postDelayed(frameWatchdog, FRAME_TIMEOUT_MS)
 
     try {
       service.takeScreenshot(
@@ -519,10 +568,18 @@ object AiVisualScanner {
         worker,
         object : AccessibilityService.TakeScreenshotCallback {
           override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
-            handleScreenshot(pkg, screenshot)
+            if (generation != captureGeneration.get()) {
+              // The watchdog already gave up on this frame: release its pixels, keep nothing.
+              closeScreenshot(screenshot)
+              return
+            }
+            mainHandler.removeCallbacks(frameWatchdog)
+            handleScreenshot(pkg, screenshot, generation)
           }
 
           override fun onFailure(errorCode: Int) {
+            if (generation != captureGeneration.get()) return
+            mainHandler.removeCallbacks(frameWatchdog)
             processingSince = 0L
             isProcessing.set(false)
             if (errorCode == AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
@@ -535,12 +592,29 @@ object AiVisualScanner {
         }
       )
     } catch (error: Throwable) {
-      isProcessing.set(false)
+      mainHandler.removeCallbacks(frameWatchdog)
+      if (generation == captureGeneration.get()) {
+        processingSince = 0L
+        isProcessing.set(false)
+      }
       recordError("takeScreenshot threw: ${describe(error)}")
     }
   }
 
-  private fun handleScreenshot(pkg: String, screenshot: AccessibilityService.ScreenshotResult) {
+  /** Releases a screenshot the watchdog already abandoned, so no hardware buffer leaks. */
+  private fun closeScreenshot(screenshot: AccessibilityService.ScreenshotResult) {
+    try {
+      screenshot.hardwareBuffer.close()
+    } catch (error: Throwable) {
+      Log.w(TAG, "buffer close failed: ${error.message}")
+    }
+  }
+
+  private fun handleScreenshot(
+    pkg: String,
+    screenshot: AccessibilityService.ScreenshotResult,
+    generation: Int
+  ) {
     var buffer: HardwareBuffer? = null
     var hardware: Bitmap? = null
     var screen: Bitmap? = null
@@ -576,8 +650,12 @@ object AiVisualScanner {
       } catch (error: Throwable) {
         Log.w(TAG, "buffer close failed: ${error.message}")
       }
-      processingSince = 0L
-      isProcessing.set(false)
+      // Only the capture that still owns the lock may release it: a frame the watchdog
+      // abandoned must not clear the in-flight guard of the capture that replaced it.
+      if (generation == captureGeneration.get()) {
+        processingSince = 0L
+        isProcessing.set(false)
+      }
     }
   }
 
@@ -590,15 +668,10 @@ object AiVisualScanner {
     val context = service.applicationContext
 
     // Stage 0, free: a 16x16 grid tells whether the screen still shows the same safe
-    // scene, and then neither model runs at all.
-    //
-    // A positive Frame 1 waiting for its 2nd screen is NEVER skipped, even when the user
-    // keeps looking at a completely static image: the old gate skipped that exact Frame 2
-    // and the streak could never reach 2. Any previous frame with real signal also keeps
-    // the full cascade running.
+    // scene, and then neither model runs at all. Any previous frame with real signal
+    // keeps the full cascade running, so a static explicit image is always re-scored.
     val grid = sampleGrid(screen)
     val staticSkip = hasSafeGrid &&
-      consecutivePositiveFrames.get() == 0 &&
       lastStage1Score < AiCascadeConfig.STATIC_SKIP_MAX_SIGNAL &&
       meanGridDiff(grid, lastSafeGrid) < AiCascadeConfig.STATIC_DIFF_THRESHOLD
     if (staticSkip) {
@@ -660,13 +733,6 @@ object AiVisualScanner {
       val strongest = scores.indices
         .filter { index -> stage1Allowed(index) }
         .maxOfOrNull { index -> scores[index] } ?: 0f
-      // p_porn alone, used by the immediate-block rule: an explicit photo must not wait.
-      // Restricted to tiles with skin in them, for the same reason as the positive rule.
-      val pornMax = scores.indices
-        .filter { index -> stage1Allowed(index) }
-        .maxOfOrNull { index -> probabilities[index]?.let { probability(it, 3) } ?: 0f }
-        ?: 0f
-
       lastStage1Score = strongest
       lastStage2Score = 0f
       lastFrameAt = SystemClock.elapsedRealtime()
@@ -686,9 +752,10 @@ object AiVisualScanner {
       val nudeMax = nudity.maxOfOrNull { it?.score ?: 0f } ?: 0f
       lastStage2Score = nudeMax
 
-      // Strict POSITIVE definition: ANY tile that reaches one of these levels makes this
-      // an 18+ candidate screen. Being positive on Frame 1 only flags it; the block itself
-      // happens on Frame 2 (POSITIVE_CONFIRM_FRAMES), never on the first screen alone.
+      // POSITIVE definition: ANY tile that reaches one of these levels makes this an 18+
+      // frame, and one positive frame blocks on the spot. A fast scroll past a photo or a
+      // two-second clip is the normal case, so waiting for a second confirming screen would
+      // miss exactly the content the scanner exists for.
       //
       // A tile without human skin in it is never positive from stage 1, and `Hentai` alone
       // needs full confidence or NudeNet confirmation. That keeps dark-mode websites and
@@ -709,17 +776,8 @@ object AiVisualScanner {
           nudeScore >= AiCascadeConfig.POSITIVE_NUDE
       }
 
-      // Unmistakably explicit frames block on Frame 1. Everything else uses the strict
-      // 2-screen confirmation so a brief scroll-past never closes the app.
-      val instantBlock =
-        strongest >= AiCascadeConfig.INSTANT_STAGE1_COMBINED ||
-          pornMax >= AiCascadeConfig.INSTANT_PORN ||
-          nudeMax >= AiCascadeConfig.INSTANT_NUDE
-
       // Only a genuinely safe frame may become the reference for the free pixel gate.
-      if (!instantBlock && positiveIndex == null &&
-        strongest < AiCascadeConfig.STATIC_SKIP_MAX_SIGNAL
-      ) {
+      if (positiveIndex == null && strongest < AiCascadeConfig.STATIC_SKIP_MAX_SIGNAL) {
         System.arraycopy(grid, 0, lastSafeGrid, 0, grid.size)
         hasSafeGrid = true
       }
@@ -737,30 +795,12 @@ object AiVisualScanner {
           " skin ${format(skinRatios[index])}"
       }
 
-      if (instantBlock) {
-        consecutivePositiveFrames.set(0)
+      if (positiveIndex != null) {
+        // One positive screen is the verdict: no confirmation frame, no waiting.
         blockCount += 1
-        lastVerdict = "blocked (instant: mob ${format(strongest)}, porn ${format(pornMax)}," +
-          " nude ${format(nudeMax)})"
+        lastVerdict = "blocked (single positive screen: $reason)"
         triggerBlock(pkg, plan.floating)
-      } else if (positiveIndex != null) {
-        val positives = consecutivePositiveFrames.incrementAndGet()
-        if (positives >= AiCascadeConfig.POSITIVE_CONFIRM_FRAMES) {
-          // Frame 2 is positive too: block on the spot and start a fresh streak next time.
-          consecutivePositiveFrames.set(0)
-          blockCount += 1
-          lastVerdict = "blocked (2nd positive screen: $reason)"
-          triggerBlock(pkg, plan.floating)
-        } else {
-          // Frame 1 only flags the screen. The 2nd screen MUST run, so the pixel gate is
-          // bypassed above, the fast 1 s interval is restored and the movie saver resets.
-          captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
-          safeStreak = 0
-          lastVerdict = "flagged 1/${AiCascadeConfig.POSITIVE_CONFIRM_FRAMES} ($reason)"
-        }
       } else {
-        // A safe Frame 2 clears the flag and nothing is blocked.
-        consecutivePositiveFrames.set(0)
         lastVerdict = "safe (stage1 ${format(strongest)}, nudenet ${format(nudeMax)})"
       }
     } finally {

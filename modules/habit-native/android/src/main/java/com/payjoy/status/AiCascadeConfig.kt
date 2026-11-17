@@ -12,9 +12,8 @@ import android.content.Context
  *  - Stage 2 is a 320x320 NudeNet YOLOv8n detector (`.onnx`, ONNX Runtime) and is additive:
  *    it only runs on the tiles stage 1 found suspicious, and it can flag an explicit frame
  *    stage 1 was unsure about.
- *  - a two-screen confirmation governs blocking: a positive frame only flags the screen,
- *    and the block flow runs on the next positive frame. A clearly explicit frame bypasses
- *    the wait and blocks immediately.
+ *  - blocking is single-frame and instant: the first positive frame closes the app, so a
+ *    fast scroll or a short clip can never slip past between two confirmation frames.
  *
  * Power is kept down by three gates:
  *  - a 16x16 pixel-diff check skips the whole cascade when the screen did not change,
@@ -54,8 +53,7 @@ object AiCascadeConfig {
   const val STATIC_DIFF_THRESHOLD = 3.0f
   /**
    * The pixel gate only applies when the previous frame was this safe. A frame with any
-   * real signal (or a positive frame still waiting for its 2nd screen) is always analysed
-   * again, even when the screen is completely static.
+   * real signal is always analysed again, even when the screen is completely static.
    */
   const val STATIC_SKIP_MAX_SIGNAL = 0.08f
 
@@ -87,20 +85,14 @@ object AiCascadeConfig {
   const val MIN_NUDE_BOX_RATIO = 0.06f
 
   /**
-   * Strict 2-screen confirmation: Frame 1 that is positive only flags the screen, and the
-   * block fires on Frame 2 when it is positive as well. A safe Frame 2 clears the flag, so
-   * a brief scroll-past can never close the app.
+   * A tile is a positive (18+) screen when any of these is reached. One positive frame is
+   * enough: waiting for a second screen misses every short clip and fast scroll, because
+   * the next frame is already a normal chat screen by the time it would have confirmed.
    */
-  const val POSITIVE_CONFIRM_FRAMES = 2
-  /** A tile is a positive (18+) candidate when any of these is reached. */
   const val POSITIVE_STAGE1_COMBINED = 0.38f
   const val POSITIVE_STAGE1_EXPLICIT = 0.20f
   const val POSITIVE_STAGE1_SEXY = 0.48f
   const val POSITIVE_NUDE = 0.20f
-  /** A frame this explicit blocks immediately, without waiting for a second screen. */
-  const val INSTANT_STAGE1_COMBINED = 0.65f
-  const val INSTANT_PORN = 0.40f
-  const val INSTANT_NUDE = 0.40f
 
   /**
    * Skin-tone gate (anti-UI false positive). A dark-mode or light-mode text / code /
@@ -117,8 +109,8 @@ object AiCascadeConfig {
   const val HENTAI_NUDE_TRUST = 0.25f
 
   /**
-   * Sensitivity presets. The two-screen confirmation rule and its POSITIVE levels are fixed;
-   * sensitivity only changes how strongly `p_sexy` counts in the combined stage 1 score, so
+   * Sensitivity presets. The one-frame POSITIVE rule and its levels are fixed; sensitivity
+   * only changes how strongly `p_sexy` counts in the combined stage 1 score, so
    * `high` and `balanced` both use the proven 0.80 weight, while `low` waits for stronger
    * explicit signal.
    */
@@ -127,7 +119,7 @@ object AiCascadeConfig {
     val sexyWeight: Float
   )
 
-  /** Default preset; the two-screen rule and its POSITIVE levels are the same in every preset. */
+  /** Default preset; the one-frame rule and its POSITIVE levels are the same in every preset. */
   val BALANCED = Thresholds(sexyWeight = 0.80f)
 
   /** The proven high-sensitivity weight from the 606-frame calibration test. */
