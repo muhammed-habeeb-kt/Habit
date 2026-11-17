@@ -1,6 +1,6 @@
 # Habit — project notes
 
-_Last updated: 2026-11-17 (Part 33: instant single-frame AI blocking, 800 ms frame watchdog)_
+_Last updated: 2026-11-17 (Part 34: fixed 1 s full-screen AI scan, no pixel gate or slow-down)_
 
 ## Product
 
@@ -236,10 +236,11 @@ section lists the surface area and the rules the engine keeps.
 
 1. **`AiVisualScanner.kt`** owns both models (TFLite `Interpreter` with XNNPACK + fp16, and
    ONNX `OrtSession`), one reused input buffer each, and a loop with at most one frame in
-   flight: 1000 ms normally, 2200 ms after 8 fully safe frames (battery saver for normal
-   video), snapped back to 1000 ms by any interaction. Tunables live in
+   flight: one screenshot and one full classification every 1000 ms, never slower (no
+   pixel-diff gate, no adaptive slow-down — both are gone). Tunables live in
    `AiCascadeConfig.kt`. Nothing is written to disk; buffers and bitmaps are closed or
-   recycled in `finally`.
+   recycled in `finally`, and `isProcessing` is always released there so the next tick can
+   never wedge on a stuck frame.
 2. **Hook point** — `HabitAccessibilityService.updateAiScanner(pkg)` runs for every accepted
    event (window state changed, windows changed, content changed, text changed, scrolled),
    because a monitored app can become visible without a window-state change. The router
@@ -255,17 +256,18 @@ section lists the surface area and the rules the engine keeps.
    display while the screen is interactive. The frame is copied from the hardware buffer to
    ARGB_8888 and cut into top, centre and bottom squares. `FLAG_SECURE` windows are the
    honest “protected screens” limit.
-4. **Classification** — full-width top / centre / bottom tiles over the screen, trimming
-   only the top 8% status / app bar. Stage 1 (NSFW MobileNetV2,
+4. **Classification** — three full-width squares (top / centre / bottom) covering the WHOLE
+   screen, from the first pixel row to the last: no status-bar strip and no left avatar
+   gutter is ever cut, so media anywhere on screen is inside a tile. Stage 1 (NSFW MobileNetV2,
    `FLOAT32 [1,224,224,3] -> [1,5]`) scores `Porn + Hentai + sexyWeight*Sexy` (`0.80` high
    and balanced, `0.30` low). A tile is **positive** when it reaches combined `0.38`,
    `Porn + Hentai` `0.20`, `Sexy` `0.48` or NudeNet `s_nude_max` `0.20`; stage 2 (NudeNet
    320n, `FLOAT32 [N,3,H,W] -> [N,22,A]`) is additive only, runs on tiles that crossed the
    0.05 / porn 0.015 gate, and ignores only boxes smaller than 6% of the crop side. Blocking
-   is **single-frame and instant**: the first frame with any positive tile closes the app.
-   There is no confirmation frame, so a fast scroll past a photo or a short clip is never
-   missed. The pixel gate is bypassed whenever the last stage-1 score was `>= 0.08`, so a
-   static explicit image is re-scored on the next frame instead of being skipped.
+   is **single-frame and instant**: stage 1 alone closes the app the millisecond it goes
+   positive (NudeNet only runs when stage 1 is unsure, and a NudeNet-only hit blocks too).
+   There is no confirmation frame and no frame is ever skipped, so a fast scroll past a
+   photo, a short clip or a still image is caught on the first frame that saw it.
 5. **Verdict** — `HabitGuard.onAiMatch(context, "<pkg>:ai-screenshot", appLabel)` keeps the
    5-second dedupe stable, shows `• AI • APP`, presses Back before the overlay takes focus,
    and falls back to Home when the overlay was refused.
@@ -305,13 +307,12 @@ Built for threshold calibration, not for protection:
 
 ### Aggressive accuracy + power gates (Part 10)
 
-12. **Free static gate** — before any model, a 16x16 RGB sample of the screen is compared with
-    the last completely safe frame (mean absolute diff `< 3.0` of 255); with 0 strikes and a
-    last stage-1 score under 0.12 the frame is skipped entirely (0 ms of inference, counted
-    as `skippedFrames` in the status map).
-13. **Battery saver** — 8 consecutive safe frames (`stage1 < 0.06` and NudeNet `< 0.08`)
-    relax the loop to 2200 ms; a scroll, typed text, window change or any score `>= 0.08`
-    snaps it back to 1000 ms via `AiVisualScanner.noteUserActivity()`.
+12. **No static gate (Part 34)** — the 16x16 pixel-diff comparison, `skippedFrames` and
+    `STATIC_*` tunables are deleted. Every tick screenshots and classifies, so a still
+    explicit image is re-scored each second instead of waiting for the screen to change.
+13. **No adaptive timer (Part 34)** — `RELAXED_*` / `ADAPTIVE_*`,
+    `AiVisualScanner.noteUserActivity()` and the 2200 ms slow-down are deleted. The interval
+    is exactly `CAPTURE_INTERVAL_MS` (1000 ms) for as long as a watched app is in front.
 14. **Text/emoji trap** — `HabitAccessibilityService.scanWatchedAppText` reads the visible
     node text of a selected app (no screenshot, no model) and blocks immediately on adult
     indicators (`🔞`, `കാമം`, `kambi`, `mallu hot`, `onlyfans`, `nsfw`, `ullu`, …). It is
@@ -421,7 +422,11 @@ never read.
    browser is in front and the screen is interactive. `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW`
    (Android 14, 6) always blocks; HyperOS / MIUI’s error 2 blocks only after a successful
    capture in the same service session, because error 2 is also the code for a missing
-   `canTakeScreenshot` grant and blocking on it blindly would close normal pages.
+   `canTakeScreenshot` grant and blocking on it blindly would close normal pages. Since
+   Part 34 that proof no longer waits for luck: `proveScreenshotAccess` captures once 800 ms
+   after the service connects (and retries from any non-browser app, at most 30 times), and
+   every frame the AI cascade captures reports through `onScreenshotCaptured()`, so a code 2
+   inside Chrome or Brave is a real private tab and BACK + HOME + `• INCOGNITO BLOCKED` fire.
 4. **Layer 3, browser scope** — every installed browser comes from `PackageManager` (cached,
    refreshed on package changes, `<queries>` intent declared). Firefox Focus and Tor
    Browser have no normal mode, so entering them blocks immediately.
@@ -495,9 +500,9 @@ longer trusts `rootInActiveWindow` alone.
   all three tiles), dry-run logging, one-tap CSV + ZIP export into `Download/` via
   `MediaStore`, and a clear button.
 - [x] Part 10 — accuracy and battery: stage 1 blocks on its own (NudeNet can no longer veto
-  it), NudeNet runs only on gated tiles, a 16x16 pixel gate skips unchanged screens, safe
-  video relaxes to a 2.2 s interval, XNNPACK + fp16 on the TFLite interpreter, and the
-  instant text/emoji trap inside watched apps.
+  it), NudeNet runs only on gated tiles, XNNPACK + fp16 on the TFLite interpreter, and the
+  instant text/emoji trap inside watched apps. (Its 16x16 pixel gate and 2.2 s battery
+  saver were removed again in Part 34: both skipped frames that mattered.)
 - [x] Part 12 — Settings tamper shield: Strict/Aggressive kick the user out of Habit's
   accessibility toggle and app-info / clear-data / uninstall / device-admin screens from the
   node tree only (zero frames), with a 12 s battery/autostart grace window, `• TAMPER SHIELD`
@@ -655,13 +660,22 @@ longer trusts `rootInActiveWindow` alone.
   applied) blocks on the spot, so a scroll-past or a two-second clip can no longer be
   cleared by the next frame. The HyperOS screenshot wedge is cut from 5 s to
   `FRAME_TIMEOUT_MS = 800` via a main-thread `frameWatchdog` that abandons the frame on
-  time even in the relaxed 2.2 s interval, releases the in-flight lock, drops the pixels and
-  puts the loop back on the 1 s rhythm; a capture generation makes every late callback
-  stale, so it can neither be analysed out of order nor clear the next capture's lock, and
-  `start` / `stop` invalidate any frame they inherit. Crops were already wider than the
-  report's 8% / 10% ask (full width, top 8% only), and `INCOGNITO_DIAGNOSTIC_BYPASS` no
-  longer exists — the verified private-tab guard and its `FLAG_SECURE` fallback stay as
-  described in Part 32.
+  time, releases the in-flight lock, drops the pixels and puts the loop back on the 1 s
+  rhythm; a capture generation makes every late callback stale, so it can neither be
+  analysed out of order nor clear the next capture's lock, and `start` / `stop` invalidate
+  any frame they inherit. Crops kept a full-width layout; Part 34 then removed the last 8%
+  trim. `INCOGNITO_DIAGNOSTIC_BYPASS` no longer exists — the verified private-tab guard and
+  its `FLAG_SECURE` fallback stay as described in Part 32.
+- [x] Part 34 — The brutal pipeline is back. The pixel-diff gate, the 2200 ms adaptive
+  interval, `noteUserActivity()` and the 8% top trim are all deleted: every 1000 ms tick
+  takes a screenshot and classifies three full-width squares that together cover the entire
+  screen, and stage 1 alone blocks the moment it goes positive (NudeNet is only the
+  backstop). `handleScreenshot` now releases `isProcessing` and recycles every bitmap in an
+  unconditional `finally`, so a stuck frame can never freeze the loop. The private-tab
+  guard gained a screenshot-capability proof (`proveScreenshotAccess`, plus
+  `onScreenshotCaptured()` from the cascade) because HyperOS error 2 only means "private
+  tab" once a real capture has succeeded — that is what keeps BACK + HOME + `• INCOGNITO
+  BLOCKED` firing on Chrome and Brave.
 
 ## Build & run (Termux, no PC)
 
@@ -757,6 +771,11 @@ XML are unchanged, so the service does not need to be toggled off and on.Part 29
   accessibility, notifications and — for Aggressive — device admin again. The encrypted
   state belongs to the old id, so protection starts from a clean install. The accessibility
   XML is unchanged; a fresh install reconnects the service anyway.
+
+Part 34 changes Kotlin only (the fixed 1 s full-screen loop, the instant stage-1 block, the
+unconditional in-flight release and the screenshot-capability proof), so the development
+APK must be rebuilt. The manifest and the accessibility XML are unchanged, so the service
+does not need to be toggled off and on after installing it.
 
 Part 33 changes Kotlin only (single-frame blocking, the 800 ms frame watchdog and the
 capture generation), so the development APK must be rebuilt. The manifest and the

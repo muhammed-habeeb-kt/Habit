@@ -84,6 +84,12 @@ class HabitAccessibilityService : AccessibilityService() {
    * screenshot capability at all — so error 2 is only trusted after a real capture.
    */
   @Volatile private var screenshotAccessWorks = false
+  /** Last attempt to prove the screenshot capability; proof attempts are throttled. */
+  private var lastProofAt = 0L
+  /** Bounded, so an install that can never capture does not screenshot all session. */
+  private var proofAttempts = 0
+  /** Outlives [stopPrivateProbes], so the connect-time proof is never cancelled. */
+  private val capabilityHandler = Handler(Looper.getMainLooper())
 
   override fun onServiceConnected() {
     super.onServiceConnected()
@@ -110,6 +116,16 @@ class HabitAccessibilityService : AccessibilityService() {
       registerBrowserPackageReceiver()
       noteBrowserFront(foregroundPackage() ?: "")
       browserFrontPackage()?.let { handleBrowserFront(it) }
+      // Error 2 is both "FLAG_SECURE window" and "no screenshot access", so the capability
+      // has to be proven before a code 2 can close a private tab. The screen in front while
+      // the service connects is Settings or the launcher (never secure), which is exactly
+      // the moment to prove it — otherwise a private tab opened first stays unblocked for
+      // the whole session because nothing ever succeeded.
+      proofAttempts = 0
+      capabilityHandler.postDelayed(
+        { proveScreenshotAccess("service connected") },
+        SERVICE_CONNECT_PROOF_MS
+      )
     } catch (error: Throwable) {
       Log.w(TAG, "onServiceConnected failed: ${error.message}")
     }
@@ -133,6 +149,12 @@ class HabitAccessibilityService : AccessibilityService() {
     // window can hide its accessibility root, and the watchdog still has to probe it.
     noteBrowserFront(pkg)
 
+    // Any app that is not a browser is a safe place to prove the screenshot capability: a
+    // browser may already be a private (secure) window, which can never prove anything.
+    if (!screenshotAccessWorks && pkg != packageName && !isBrowserPackage(pkg)) {
+      proveScreenshotAccess("$pkg in front")
+    }
+
     // Tamper shield: Android Settings, the vendor security centre and the installers are
     // read on every event with no throttle at all, and the moment one of them is in front
     // the 100 ms poll is armed. HyperOS finishes rendering the accessibility page *after*
@@ -153,10 +175,6 @@ class HabitAccessibilityService : AccessibilityService() {
     // browser chrome that only exists inside one are the two signals: an open ⋮ menu, a
     // normal home page and a page that merely contains the word are never matched.
     if (isBrowserPackage(pkg) && handlePrivateTabEvent(safeEvent, pkg)) return
-
-    // A scroll, a typed word or an app switch means a new frame can be in view, so the
-    // relaxed battery interval is dropped before it can hide content the user just opened.
-    if (safeEvent.eventType in INTERACTION_EVENTS) AiVisualScanner.noteUserActivity()
 
     // Watched apps and watched websites are guarded by the screenshot cascade, not by text
     // or URL scanning. Every event is offered to the router, not just a window-state change:
@@ -544,6 +562,62 @@ class HabitAccessibilityService : AccessibilityService() {
   }
 
   /**
+   * Proves once per service session that this build can really capture the screen.
+   *
+   * HyperOS / MIUI return error 2 both for a FLAG_SECURE window and for a missing
+   * `canTakeScreenshot` grant, so [screenshotAccessWorks] is what makes error 2 readable.
+   * Waiting for a capture to succeed by accident kept private tabs unblocked for a whole
+   * session, so the capability is proven up front (Settings or the launcher is in front when
+   * the service connects) and retried from any non-browser app. The frame is released
+   * immediately; nothing is analysed or stored.
+   */
+  private fun proveScreenshotAccess(reason: String) {
+    if (screenshotAccessWorks) return
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+    if (proofAttempts >= MAX_PROOF_ATTEMPTS) return
+    val now = SystemClock.elapsedRealtime()
+    if (now - lastProofAt < PROOF_RETRY_MS) return
+    lastProofAt = now
+    proofAttempts += 1
+    // A probe waiting on the screenshot gap must see this capture too.
+    lastProbeAt = now
+    try {
+      takeScreenshot(
+        Display.DEFAULT_DISPLAY,
+        ContextCompat.getMainExecutor(this),
+        object : TakeScreenshotCallback {
+          override fun onSuccess(screenshot: ScreenshotResult) {
+            screenshotAccessWorks = true
+            try {
+              screenshot.hardwareBuffer.close()
+            } catch (error: Throwable) {
+              // Already closed by the framework.
+            }
+            Log.i(TAG, "Screenshot capability proven ($reason)")
+          }
+
+          override fun onFailure(errorCode: Int) {
+            // A secure window in front, or a genuinely missing grant: retried later.
+            Log.w(TAG, "Screenshot capability still refused ($reason): code $errorCode")
+          }
+        }
+      )
+    } catch (error: Throwable) {
+      Log.w(TAG, "Screenshot capability probe unavailable: ${error.message}")
+    }
+  }
+
+  /**
+   * Called by the AI cascade for every frame it captured successfully. A capture that really
+   * arrived is proof the capability exists, so a later vendor code 2 can only mean a
+   * FLAG_SECURE private tab — the cascade is the most common proof path, because it already
+   * screenshots a watched app once a second.
+   */
+  fun onScreenshotCaptured() {
+    screenshotAccessWorks = true
+  }
+
+  /**
    * Layer 1: is the browser showing a FLAG_SECURE window right now?
    *
    * `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW` (Android 14) and HyperOS / MIUI's error 2 mean the
@@ -606,6 +680,10 @@ class HabitAccessibilityService : AccessibilityService() {
               return
             }
             Log.w(TAG, "Screenshot probe failed for $pkg with code $errorCode")
+            if (errorCode == SCREENSHOT_SECURE_WINDOW_VENDOR) {
+              // Ambiguous code: prove the capability so the next stage can trust a code 2.
+              proveScreenshotAccess("code 2 inside $pkg")
+            }
           }
         }
       )
@@ -1599,6 +1677,12 @@ class HabitAccessibilityService : AccessibilityService() {
     private const val SCREENSHOT_MIN_GAP_MS = 1_150L
     /** Second look after a block, in case Back + Home did not leave the private tab. */
     private const val FOLLOW_UP_PROBE_MS = 1_200L
+    /** Delay before proving the screenshot capability once the service connects. */
+    private const val SERVICE_CONNECT_PROOF_MS = 800L
+    /** How often a refused capability proof is retried, so it never costs a frame per event. */
+    private const val PROOF_RETRY_MS = 5_000L
+    /** Cap on those retries per service session (about 2.5 minutes of slow retries). */
+    private const val MAX_PROOF_ATTEMPTS = 30
     /**
      * HyperOS / MIUI report the FLAG_SECURE refusal as error 2, which is also the code for a
      * missing screenshot capability; it is trusted only after a successful capture in the
@@ -1744,18 +1828,6 @@ class HabitAccessibilityService : AccessibilityService() {
       "uninstall habit",
       "remove app",
       "deactivate this device admin"
-    )
-
-    /**
-     * Events where the user actually touched, typed, scrolled or switched something. The
-     * noisy TYPE_WINDOW_CONTENT_CHANGED (a video, a chat, a seek bar) is deliberately left
-     * out so a long safe movie can relax the capture interval.
-     */
-    private val INTERACTION_EVENTS = setOf(
-      AccessibilityEvent.TYPE_VIEW_SCROLLED,
-      AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
-      AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-      AccessibilityEvent.TYPE_WINDOWS_CHANGED
     )
 
     val BROWSER_PACKAGES: Set<String> = setOf(

@@ -35,16 +35,17 @@ import kotlin.math.min
 /**
  * On-device NSFW screenshot cascade.
  *
- * One frame per second while a watched app is in front (2.2 s after a run of safe frames),
- * and only one frame in flight:
- *  - Stage 1 (TFLite MobileNetV2, 224x224, XNNPACK + fp16) scores three squares of the
- *    screen, and stage 2 (ONNX NudeNet 320n, 320x320) adds explicit-body detections on the
- *    tiles stage 1 found suspicious.
+ * A fresh frame every single second while a watched app is in front, and only one frame in
+ * flight:
+ *  - Stage 1 (TFLite MobileNetV2, 224x224, XNNPACK + fp16) scores three full-width squares
+ *    that together cover the whole screen, and stage 2 (ONNX NudeNet 320n, 320x320) adds
+ *    explicit-body detections on the tiles stage 1 found suspicious.
  *  - Blocking is instant: the first frame whose tiles reach the POSITIVE levels closes the
  *    app, so a fast scroll or a two-second clip is never missed while a second frame would
  *    have been confirming it.
- *  - Stage 0 is free: a 16x16 pixel-diff gate skips both models when the screen is static
- *    and the last frame was safe, and a run of safe frames relaxes the capture interval.
+ *  - There is no "screen did not change" gate and no adaptive slow-down: every tick takes a
+ *    screenshot and classifies it, so a still explicit image is re-scored every second and
+ *    the loop can never fall behind the content.
  *
  * Nothing is ever written to disk and every frame always blocks for real: the calibration
  * recorder is gone, so there is no dry-run switch left to suppress a block screen. Every
@@ -113,9 +114,6 @@ object AiVisualScanner {
     AiCascadeConfig.STAGE2_INPUT_SIZE * AiCascadeConfig.STAGE2_INPUT_SIZE
   private const val STAGE1_BYTES = STAGE1_PIXELS * 3 * 4
   private const val STAGE2_BYTES = STAGE2_PIXELS * 3 * 4
-  private const val STATIC_GRID_PIXELS =
-    AiCascadeConfig.STATIC_DIFF_GRID * AiCascadeConfig.STATIC_DIFF_GRID
-
   private val mainHandler = Handler(Looper.getMainLooper())
   private val worker: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
     Thread(runnable, "habit-ai-cascade").apply { isDaemon = true }
@@ -132,9 +130,6 @@ object AiVisualScanner {
    * capture's in-flight guard.
    */
   private val captureGeneration = AtomicInteger(0)
-  /** Frames the static-screen gate skipped; diagnostics only, they cost no inference. */
-  @Volatile private var skippedFrames = 0
-
   @Volatile private var running = false
   @Volatile private var activePackage: String? = null
   /** Monitored website that armed this loop inside a browser, or null for a watched app. */
@@ -147,10 +142,6 @@ object AiVisualScanner {
   @Volatile private var activeBounds: Rect? = null
 
   @Volatile private var lastCaptureAt = 0L
-  /** Current tick delay: 1 s on interaction, 2.2 s while a safe scene stays unchanged. */
-  @Volatile private var captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
-  /** Consecutive safe frames; at [AiCascadeConfig.RELAXED_AFTER_SAFE_FRAMES] the loop relaxes. */
-  @Volatile private var safeStreak = 0
 
   // region diagnostics
   @Volatile private var appLabel: String? = null
@@ -171,11 +162,6 @@ object AiVisualScanner {
   private val stage1Pixels = IntArray(STAGE1_PIXELS)
   private val stage2Pixels = IntArray(STAGE2_PIXELS)
 
-  /** 16x16 RGB grid of the current frame and of the last completely safe frame. */
-  private val gridPixels = IntArray(STATIC_GRID_PIXELS)
-  private val lastSafeGrid = IntArray(STATIC_GRID_PIXELS)
-  private var hasSafeGrid = false
-
   private var stage1: Interpreter? = null
   private var stage1Input: ByteBuffer? = null
   private var ortEnv: OrtEnvironment? = null
@@ -189,14 +175,14 @@ object AiVisualScanner {
     override fun run() {
       if (!running) return
       captureFrame()
-      if (running) mainHandler.postDelayed(this, captureIntervalMs)
+      if (running) mainHandler.postDelayed(this, AiCascadeConfig.CAPTURE_INTERVAL_MS)
     }
   }
 
   /**
    * HyperOS drops a `takeScreenshot` callback now and then. The watchdog runs on the main
-   * thread 800 ms after every capture starts, so a dropped frame is abandoned on time even
-   * while the loop is in its relaxed 2.2 s interval, instead of waiting for the next tick.
+   * thread 800 ms after every capture starts, so a dropped frame is abandoned on time
+   * instead of waiting for the next tick.
    */
   private val frameWatchdog = object : Runnable {
     override fun run() {
@@ -219,9 +205,7 @@ object AiVisualScanner {
     processingSince = 0L
     isProcessing.set(false)
     if (running) {
-      // A movie-watching loop must not stay relaxed after a dropped frame.
-      captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
-      safeStreak = 0
+      // Put the loop back on the 1 s rhythm now instead of waiting for a stale callback.
       mainHandler.removeCallbacks(tick)
       val wait = (AiCascadeConfig.CAPTURE_INTERVAL_MS -
         (SystemClock.elapsedRealtime() - lastCaptureAt)).coerceAtLeast(0L)
@@ -284,10 +268,6 @@ object AiVisualScanner {
     isProcessing.set(false)
     running = true
     frameCount = 0
-    skippedFrames = 0
-    safeStreak = 0
-    captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
-    hasSafeGrid = false
     lastVerdict = "starting"
     mainHandler.removeCallbacks(tick)
     mainHandler.post(tick)
@@ -307,26 +287,7 @@ object AiVisualScanner {
     activePackage = null
     activeDomain = null
     activeBounds = null
-    safeStreak = 0
-    captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
-    // The next app starts on a new screen, so its first frame is always analyzed.
-    hasSafeGrid = false
     if (!lastVerdict.startsWith("blocked") && lastVerdict != "idle") lastVerdict = "stopped"
-  }
-
-  /**
-   * Called for a real interaction (scroll, typed text, window change) from the
-   * accessibility service. Never let the battery saver outlive the moment the user moved
-   * on: a relaxed loop is snapped back to the fast interval immediately instead of after
-   * the current 2.2 s sleep.
-   */
-  fun noteUserActivity() {
-    val wasRelaxed = captureIntervalMs != AiCascadeConfig.CAPTURE_INTERVAL_MS
-    safeStreak = 0
-    captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
-    if (!running || !wasRelaxed) return
-    mainHandler.removeCallbacks(tick)
-    mainHandler.post(tick)
   }
 
   /** Called the moment the block screen appears: no point classifying a covered screen. */
@@ -374,8 +335,7 @@ object AiVisualScanner {
       "packageName" to activePackage,
       "appLabel" to appLabel,
       "frames" to frameCount,
-      "skippedFrames" to skippedFrames,
-      "captureIntervalMs" to captureIntervalMs,
+      "captureIntervalMs" to AiCascadeConfig.CAPTURE_INTERVAL_MS,
       "blocks" to blockCount,
       "stage1Score" to lastStage1Score.toDouble(),
       "stage2Score" to lastStage2Score.toDouble(),
@@ -551,7 +511,7 @@ object AiVisualScanner {
     if (!isScreenInteractive(service)) return
 
     val now = SystemClock.elapsedRealtime()
-    if (now - lastCaptureAt < captureIntervalMs) return
+    if (now - lastCaptureAt < AiCascadeConfig.CAPTURE_INTERVAL_MS) return
     if (!isProcessing.compareAndSet(false, true)) return
     processingSince = now
     lastCaptureAt = now
@@ -574,7 +534,7 @@ object AiVisualScanner {
               return
             }
             mainHandler.removeCallbacks(frameWatchdog)
-            handleScreenshot(pkg, screenshot, generation)
+            handleScreenshot(pkg, screenshot)
           }
 
           override fun onFailure(errorCode: Int) {
@@ -612,8 +572,7 @@ object AiVisualScanner {
 
   private fun handleScreenshot(
     pkg: String,
-    screenshot: AccessibilityService.ScreenshotResult,
-    generation: Int
+    screenshot: AccessibilityService.ScreenshotResult
   ) {
     var buffer: HardwareBuffer? = null
     var hardware: Bitmap? = null
@@ -639,6 +598,10 @@ object AiVisualScanner {
         }
       screen = softwareBitmap
 
+      // A frame that really arrived proves the screenshot capability, which is what lets the
+      // private-tab guard read HyperOS's ambiguous error 2 as a FLAG_SECURE private tab.
+      (service as? HabitAccessibilityService)?.onScreenshotCaptured()
+
       analyze(pkg, softwareBitmap, AiCascadeConfig.thresholds(context))
     } catch (error: Throwable) {
       recordError("frame failed: ${describe(error)}")
@@ -650,12 +613,13 @@ object AiVisualScanner {
       } catch (error: Throwable) {
         Log.w(TAG, "buffer close failed: ${error.message}")
       }
-      // Only the capture that still owns the lock may release it: a frame the watchdog
-      // abandoned must not clear the in-flight guard of the capture that replaced it.
-      if (generation == captureGeneration.get()) {
-        processingSince = 0L
-        isProcessing.set(false)
-      }
+      // Unconditional: whatever happened above (a throw, a block that stopped the loop, a
+      // model error), this frame's pixels are gone and the in-flight guard must be free,
+      // otherwise the scanner would stay wedged on `isProcessing = true` and never capture
+      // again. A late callback for an abandoned frame never reaches here: onSuccess drops
+      // it by generation first.
+      processingSince = 0L
+      isProcessing.set(false)
     }
   }
 
@@ -667,30 +631,16 @@ object AiVisualScanner {
     val service = activeService ?: return
     val context = service.applicationContext
 
-    // Stage 0, free: a 16x16 grid tells whether the screen still shows the same safe
-    // scene, and then neither model runs at all. Any previous frame with real signal
-    // keeps the full cascade running, so a static explicit image is always re-scored.
-    val grid = sampleGrid(screen)
-    val staticSkip = hasSafeGrid &&
-      lastStage1Score < AiCascadeConfig.STATIC_SKIP_MAX_SIGNAL &&
-      meanGridDiff(grid, lastSafeGrid) < AiCascadeConfig.STATIC_DIFF_THRESHOLD
-    if (staticSkip) {
-      skippedFrames += 1
-      lastFrameAt = SystemClock.elapsedRealtime()
-      lastVerdict = "skipped (unchanged screen)"
-      return
-    }
-
-    // Models load only after the free gate, so a static screen never pays for them.
+    // Every single frame is classified: there is no pixel-diff gate, so a still explicit
+    // image is re-scored each second instead of waiting for the screen to change.
     if (!ensureModels(context)) {
       // Keep the loop alive: the model load is retried, and the notification shows why.
       lastVerdict = "model error"
       return
     }
 
-    // Only the watched area is classified: the full-width media viewport of a full-screen
-    // window (top 8% status / app bar trimmed), or the floating / split window's own
-    // rectangle. Nothing else on the display is ever sampled.
+    // Only the watched area is classified: the whole screen as three full-width squares
+    // for a full-screen window, or the floating / split window's own rectangle.
     val plan = planTiles(screen)
     val tiles = ArrayList<Bitmap>(plan.rects.size)
     val tileNames = ArrayList<String>(plan.rects.size)
@@ -730,6 +680,29 @@ object AiVisualScanner {
           nude >= AiCascadeConfig.HENTAI_NUDE_TRUST
       }
 
+      /** One reason line for the verdict, so the early and late blocks read the same. */
+      fun describeIndex(index: Int, nudeScore: Float): String {
+        val output = probabilities[index] ?: FloatArray(0)
+        val hentai = if (hentaiTrusted(index, nudeScore)) probability(output, 1) else 0f
+        val porn = probability(output, 3)
+        val effective = porn + hentai + thresholds.sexyWeight * probability(output, 4)
+        return "${tileNames.getOrElse(index) { "tile" }} stage1 ${format(effective)}," +
+          " explicit ${format(porn + hentai)}, sexy ${format(probability(output, 4))}," +
+          " nude ${format(nudeScore)}, skin ${format(skinRatios[index])}"
+      }
+
+      /** Stage 1 alone is enough: this is the instant verdict, NudeNet is only a backstop. */
+      fun positiveFromStage1(index: Int): Boolean {
+        val output = probabilities[index] ?: return false
+        if (!stage1Allowed(index)) return false
+        val hentai = if (hentaiTrusted(index, 0f)) probability(output, 1) else 0f
+        val porn = probability(output, 3)
+        val combined = porn + hentai + thresholds.sexyWeight * probability(output, 4)
+        return combined >= AiCascadeConfig.POSITIVE_STAGE1_COMBINED ||
+          porn + hentai >= AiCascadeConfig.POSITIVE_STAGE1_EXPLICIT ||
+          probability(output, 4) >= AiCascadeConfig.POSITIVE_STAGE1_SEXY
+      }
+
       val strongest = scores.indices
         .filter { index -> stage1Allowed(index) }
         .maxOfOrNull { index -> scores[index] } ?: 0f
@@ -737,6 +710,17 @@ object AiVisualScanner {
       lastStage2Score = 0f
       lastFrameAt = SystemClock.elapsedRealtime()
       frameCount += 1
+
+      // INSTANT block: the moment stage 1 comes back positive the app is closed, without
+      // waiting for NudeNet or for any second frame. This is the millisecond a fast scroll
+      // past a photo is caught on; the extra detector only ever runs when stage 1 is unsure.
+      val instantIndex = scores.indices.firstOrNull { index -> positiveFromStage1(index) }
+      if (instantIndex != null) {
+        blockCount += 1
+        lastVerdict = "blocked (instant stage1: ${describeIndex(instantIndex, 0f)})"
+        triggerBlock(pkg, plan.floating)
+        return
+      }
 
       // Stage 2 is additive: it runs on tiles with any stage 1 signal, so `s_nude_max`
       // can still flag an explicit frame stage 1 was unsure about.
@@ -776,29 +760,14 @@ object AiVisualScanner {
           nudeScore >= AiCascadeConfig.POSITIVE_NUDE
       }
 
-      // Only a genuinely safe frame may become the reference for the free pixel gate.
-      if (positiveIndex == null && strongest < AiCascadeConfig.STATIC_SKIP_MAX_SIGNAL) {
-        System.arraycopy(grid, 0, lastSafeGrid, 0, grid.size)
-        hasSafeGrid = true
-      }
-      adaptCaptureInterval(strongest, nudeMax)
-
       val reason = positiveIndex?.let { index ->
-        val output = probabilities[index] ?: FloatArray(0)
-        val nudeScore = nudity[index]?.score ?: 0f
-        val hentai = if (hentaiTrusted(index, nudeScore)) probability(output, 1) else 0f
-        val porn = probability(output, 3)
-        val effective = porn + hentai + thresholds.sexyWeight * probability(output, 4)
-        "${tileNames.getOrElse(index) { "tile" }} stage1 ${format(effective)}," +
-          " explicit ${format(porn + hentai)}, sexy ${format(probability(output, 4))}," +
-          " nude ${format(nudeScore)}," +
-          " skin ${format(skinRatios[index])}"
+        describeIndex(index, nudity[index]?.score ?: 0f)
       }
 
       if (positiveIndex != null) {
-        // One positive screen is the verdict: no confirmation frame, no waiting.
+        // Stage 1 was unsure and NudeNet confirmed: still one frame, no confirmation screen.
         blockCount += 1
-        lastVerdict = "blocked (single positive screen: $reason)"
+        lastVerdict = "blocked (nudenet confirmed: $reason)"
         triggerBlock(pkg, plan.floating)
       } else {
         lastVerdict = "safe (stage1 ${format(strongest)}, nudenet ${format(nudeMax)})"
@@ -824,8 +793,9 @@ object AiVisualScanner {
    * unscaled window rectangle can never throw IllegalArgumentException.
    *
    * Case A — a full-screen window (or no bounds at all): three full-width overlapping
-   * squares (top, centre, bottom) over the screen, trimming only the top 8% status / app
-   * bar so videos and photos of any size are captured.
+   * squares (top, centre, bottom) over the WHOLE screen, from the first pixel row to the
+   * last. Nothing is trimmed and no gutter is left out, so a photo or video anywhere on
+   * screen is always inside a tile.
    *
    * Case B — a floating or split window: the screenshot is cropped to the window first (its
    * own title bar dropped), so no CPU is spent on the rest of the display. A window that is
@@ -880,22 +850,13 @@ object AiVisualScanner {
       )
     }
 
-    // Full-width media viewport: drop only the top 8% status / app bar.
-    val mediaLeft = (left + windowWidth * AiCascadeConfig.MEDIA_LEFT_RATIO).toInt()
-      .coerceIn(0, screenWidth - 1)
-    val mediaTop = (top + windowHeight * AiCascadeConfig.MEDIA_TOP_RATIO).toInt()
-      .coerceIn(0, screenHeight - 1)
-    val mediaRight = (left + windowWidth * AiCascadeConfig.MEDIA_RIGHT_RATIO).toInt()
-      .coerceIn(mediaLeft + 1, screenWidth)
-    val mediaBottom = (top + windowHeight * AiCascadeConfig.MEDIA_BOTTOM_RATIO).toInt()
-      .coerceIn(mediaTop + 1, screenHeight)
-    val mediaWidth = (mediaRight - mediaLeft).coerceAtLeast(1)
-    val mediaHeight = (mediaBottom - mediaTop).coerceAtLeast(1)
-    val tileSide = min(mediaWidth, mediaHeight).coerceAtLeast(1)
-    val x = mediaLeft + (mediaWidth - tileSide) / 2
-    val yStart = mediaTop
-    val yEnd = (mediaBottom - tileSide).coerceAtLeast(yStart)
-    val offsets = intArrayOf(yStart, (yStart + yEnd) / 2, yEnd)
+    // Three squares as wide as the display, covering it from the top row to the bottom row.
+    // No status-bar strip is dropped and no avatar gutter is masked out, so the tiles
+    // together contain every pixel of the screen.
+    val tileSide = min(screenWidth, screenHeight).coerceAtLeast(1)
+    val x = (screenWidth - tileSide) / 2
+    val yEnd = (screenHeight - tileSide).coerceAtLeast(0)
+    val offsets = intArrayOf(0, yEnd / 2, yEnd)
     return TilePlan(
       offsets.map { y -> Rect(x, y, x + tileSide, y + tileSide) },
       TILE_NAMES.toList(),
@@ -1307,60 +1268,6 @@ object AiVisualScanner {
       label,
       multiWindow
     )
-  }
-
-  /**
-   * 16x16 RGB sample of the whole screen: 256 `getPixel` reads cost well under a millisecond,
-   * which is nothing compared to a stage 1 inference, and they are enough to tell "same
-   * screen" from "something moved".
-   */
-  private fun sampleGrid(screen: Bitmap): IntArray {
-    val step = AiCascadeConfig.STATIC_DIFF_GRID
-    val maxX = (screen.width - 1).coerceAtLeast(0)
-    val maxY = (screen.height - 1).coerceAtLeast(0)
-    for (gy in 0 until step) {
-      val y = ((gy + 0.5f) * screen.height / step).toInt().coerceIn(0, maxY)
-      for (gx in 0 until step) {
-        val x = ((gx + 0.5f) * screen.width / step).toInt().coerceIn(0, maxX)
-        gridPixels[gy * step + gx] = screen.getPixel(x, y)
-      }
-    }
-    return gridPixels
-  }
-
-  /** Mean absolute per-channel difference of two grids, on the 0..255 scale. */
-  private fun meanGridDiff(current: IntArray, previous: IntArray): Float {
-    if (current.size != previous.size || current.isEmpty()) return Float.MAX_VALUE
-    var sum = 0L
-    for (index in current.indices) {
-      val a = current[index]
-      val b = previous[index]
-      sum += abs(((a shr 16) and 0xFF) - ((b shr 16) and 0xFF)).toLong()
-      sum += abs(((a shr 8) and 0xFF) - ((b shr 8) and 0xFF)).toLong()
-      sum += abs((a and 0xFF) - (b and 0xFF)).toLong()
-    }
-    return sum.toFloat() / (current.size * 3)
-  }
-
-  /**
-   * Battery saver for long stretches of normal video: after
-   * [AiCascadeConfig.RELAXED_AFTER_SAFE_FRAMES] safe frames the tick relaxes to
-   * [AiCascadeConfig.RELAXED_CAPTURE_INTERVAL_MS], and any score at or above
-   * [AiCascadeConfig.ADAPTIVE_FAST_SCORE] snaps it straight back to one second.
-   */
-  private fun adaptCaptureInterval(strongest: Float, nude: Float) {
-    val signal = strongest >= AiCascadeConfig.ADAPTIVE_FAST_SCORE
-    val safe = strongest < AiCascadeConfig.ADAPTIVE_SAFE_SCORE &&
-      nude < AiCascadeConfig.ADAPTIVE_SAFE_NUDE
-    if (signal || !safe) {
-      safeStreak = 0
-      captureIntervalMs = AiCascadeConfig.CAPTURE_INTERVAL_MS
-      return
-    }
-    safeStreak += 1
-    if (safeStreak >= AiCascadeConfig.RELAXED_AFTER_SAFE_FRAMES) {
-      captureIntervalMs = AiCascadeConfig.RELAXED_CAPTURE_INTERVAL_MS
-    }
   }
 
   private fun shouldScan(

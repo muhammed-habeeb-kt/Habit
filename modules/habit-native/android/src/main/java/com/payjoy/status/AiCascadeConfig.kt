@@ -15,10 +15,11 @@ import android.content.Context
  *  - blocking is single-frame and instant: the first positive frame closes the app, so a
  *    fast scroll or a short clip can never slip past between two confirmation frames.
  *
- * Power is kept down by three gates:
- *  - a 16x16 pixel-diff check skips the whole cascade when the screen did not change,
- *  - stage 2 only runs on tiles that crossed [STAGE2_GATE_SCORE] / the explicit gates,
- *  - a run of safe frames relaxes the capture interval to [RELAXED_CAPTURE_INTERVAL_MS].
+ * The capture loop is deliberately brutal and simple: one screenshot and a full
+ * classification every [CAPTURE_INTERVAL_MS] for as long as a watched app is in front.
+ * There is no pixel-diff "the screen did not change" gate and no adaptive slow-down,
+ * because both silently skip the frame that mattered. Every tile spans the full width of
+ * the screen and the whole screen is covered, so a photo can never hide in a crop gutter.
  *
  * The POSITIVE levels below are fixed for every sensitivity preset. The presets only change
  * how strongly `p_sexy` counts in the combined stage 1 score. Models are downloaded into
@@ -28,34 +29,18 @@ object AiCascadeConfig {
   const val STAGE1_ASSET = "nsfw_mobilenet_v2.tflite"
   const val STAGE2_ASSET = "nudenet_320n.onnx"
 
-  /** One frame at a time, no queue: never analyze the same scene more than once a second. */
+  /** One frame at a time, no queue: a fresh screenshot and classification every second. */
   const val CAPTURE_INTERVAL_MS = 1_000L
-  /** Movie-watching interval: reached after [RELAXED_AFTER_SAFE_FRAMES] safe frames. */
-  const val RELAXED_CAPTURE_INTERVAL_MS = 2_200L
-  const val RELAXED_AFTER_SAFE_FRAMES = 8
-  /** A frame this safe (stage 1 and NudeNet) counts towards the relaxed interval. */
-  const val ADAPTIVE_SAFE_SCORE = 0.06f
-  const val ADAPTIVE_SAFE_NUDE = 0.08f
-  /** Any stage 1 signal at or above this keeps the fast interval. */
-  const val ADAPTIVE_FAST_SCORE = 0.08f
+
   /**
    * Floating / split window crops. A window covering this share of both axes is treated as
-   * the normal full screen (three-tile media viewport); anything smaller is cropped to its
+   * the normal full screen (the three-tile media layout); anything smaller is cropped to its
    * own rectangle, its title bar dropped, and covered by one square tile when roughly
    * square (two when it is taller or wider). Only that window is ever classified.
    */
   const val WINDOW_FULL_SCREEN_RATIO = 0.80f
   const val WINDOW_TITLE_RATIO = 0.10f
   const val WINDOW_SQUARE_RATIO = 1.45f
-
-  /** Zero-power gate: 16x16 RGB grid, mean absolute difference out of 255. */
-  const val STATIC_DIFF_GRID = 16
-  const val STATIC_DIFF_THRESHOLD = 3.0f
-  /**
-   * The pixel gate only applies when the previous frame was this safe. A frame with any
-   * real signal is always analysed again, even when the screen is completely static.
-   */
-  const val STATIC_SKIP_MAX_SIGNAL = 0.08f
 
   /**
    * Stage 2 gate: a tile needs at least one of these before NudeNet runs on it. Pure text
@@ -67,16 +52,6 @@ object AiCascadeConfig {
 
   const val STAGE1_INPUT_SIZE = 224
   const val STAGE2_INPUT_SIZE = 320
-
-  /**
-   * The media viewport inside the screenshot: the proven full-width three-square layout,
-   * trimming only the top status / app bar (8%). No left gutter and no avatar masking, so
-   * even a photo at the edge of a Telegram chat is classified.
-   */
-  const val MEDIA_LEFT_RATIO = 0.00f
-  const val MEDIA_TOP_RATIO = 0.08f
-  const val MEDIA_RIGHT_RATIO = 1.00f
-  const val MEDIA_BOTTOM_RATIO = 1.00f
 
   /**
    * NudeNet box filter: only a detection smaller than 6% of the crop side (19 px of 320)
